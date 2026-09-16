@@ -6,8 +6,12 @@ mod time;
 mod waiter;
 
 use limits::{Limits, Work};
-use rustler::{Atom, Binary, Decoder, Encoder, Env, NewBinary, NifMap, ResourceArc, Term};
-use stack::{Effects, ResourceCounts, StackConfig, StackError, StackResource};
+use rustler::{
+    Atom, Binary, Decoder, Encoder, Env, LocalPid, NewBinary, NifMap, Reference, ResourceArc, Term,
+};
+use socket_table::SocketError;
+use stack::{Envelope, ResourceCounts, StackConfig, StackError, StackResource};
+use waiter::{ArmPoint, Direction, Operation, ReadyKey, SocketIdentity};
 
 mod atoms {
     rustler::atoms! {
@@ -21,7 +25,21 @@ mod atoms {
         invalid_packet,
         unsupported_family,
         packet_too_large,
-        running
+        invalid_socket,
+        wrong_socket_kind,
+        invalid_socket_state,
+        invalid_operation,
+        busy,
+        system_limit,
+        running,
+        shutdown,
+        ready,
+        select,
+        abort,
+        closed,
+        already_sent,
+        not_found,
+        smol_socket = "$smol_socket"
     }
 }
 
@@ -56,12 +74,16 @@ fn stack_ingress<'a>(
     let result = catch_operation(|| {
         let now = time::instant_from_millis(now_millis).map_err(|_| atoms::time_overflow())?;
         resource
-            .with_stack(|stack| stack.ingress(packet.as_slice(), now))
+            .with_stack(|stack| {
+                stack
+                    .ingress(packet.as_slice(), now)
+                    .map(|effects| stack.finish_call(env, atoms::ok(), effects, Vec::new()))
+            })
             .map_err(|_| atoms::ownership_invariant_violation())?
             .map_err(stack_error_atom)
     });
 
-    encode_effect_result(env, result)
+    encode_envelope_result(env, result)
 }
 
 #[rustler::nif]
@@ -69,11 +91,43 @@ fn stack_poll<'a>(env: Env<'a>, resource: ResourceArc<StackResource>, now_millis
     let result = catch_operation(|| {
         let now = time::instant_from_millis(now_millis).map_err(|_| atoms::time_overflow())?;
         resource
-            .with_stack(|stack| stack.poll(now))
+            .with_stack(|stack| {
+                let effects = stack.poll(now);
+                stack.finish_call(env, atoms::ok(), effects, Vec::new())
+            })
             .map_err(|_| atoms::ownership_invariant_violation())
     });
 
-    encode_effect_result(env, result)
+    encode_envelope_result(env, result)
+}
+
+#[rustler::nif]
+fn stack_shutdown<'a>(env: Env<'a>, resource: ResourceArc<StackResource>) -> Term<'a> {
+    let result = catch_operation(|| {
+        resource
+            .with_stack(|stack| stack.shutdown(env))
+            .map_err(|_| atoms::ownership_invariant_violation())
+    });
+
+    encode_envelope_result(env, result)
+}
+
+#[rustler::nif]
+fn socket_cancel<'a>(
+    env: Env<'a>,
+    resource: ResourceArc<StackResource>,
+    identity: SocketIdentity,
+    operation: Operation,
+    reference: Reference<'a>,
+) -> Term<'a> {
+    let result = catch_operation(|| {
+        resource
+            .with_stack(|stack| stack.cancel(env, identity, operation, reference))
+            .map_err(|_| atoms::ownership_invariant_violation())?
+            .map_err(socket_error_atom)
+    });
+
+    encode_envelope_result(env, result)
 }
 
 #[rustler::nif]
@@ -119,6 +173,104 @@ fn test_bounded_work<'a>(
     })
 }
 
+#[cfg(debug_assertions)]
+#[rustler::nif]
+fn test_socket_open<'a>(
+    env: Env<'a>,
+    resource: ResourceArc<StackResource>,
+    internal_handle: u64,
+) -> Term<'a> {
+    let result = catch_operation(|| {
+        resource
+            .with_stack(|stack| stack.test_socket_open(env, internal_handle))
+            .map_err(|_| atoms::ownership_invariant_violation())?
+            .map_err(socket_error_atom)
+    });
+
+    encode_envelope_result(env, result)
+}
+
+#[cfg(debug_assertions)]
+#[rustler::nif]
+#[allow(clippy::too_many_arguments)]
+fn test_socket_wait<'a>(
+    env: Env<'a>,
+    resource: ResourceArc<StackResource>,
+    identity: SocketIdentity,
+    wait: TestWait<'a>,
+) -> Term<'a> {
+    let TestWait {
+        direction,
+        operation,
+        pid,
+        reference,
+        arm_point,
+        wake_count,
+        completed,
+    } = wait;
+
+    let result = catch_operation(|| {
+        resource
+            .with_stack(|stack| {
+                stack.test_socket_wait(
+                    env, identity, direction, operation, pid, reference, arm_point, wake_count,
+                    completed,
+                )
+            })
+            .map_err(|_| atoms::ownership_invariant_violation())?
+            .map_err(socket_error_atom)
+    });
+
+    encode_envelope_result(env, result)
+}
+
+#[cfg(debug_assertions)]
+#[derive(NifMap)]
+struct TestWait<'a> {
+    direction: Direction,
+    operation: Operation,
+    pid: LocalPid,
+    reference: Reference<'a>,
+    arm_point: ArmPoint,
+    wake_count: usize,
+    completed: bool,
+}
+
+#[cfg(debug_assertions)]
+#[rustler::nif]
+fn test_socket_ready<'a>(
+    env: Env<'a>,
+    resource: ResourceArc<StackResource>,
+    keys: Vec<ReadyKey>,
+) -> Term<'a> {
+    let result = catch_operation(|| {
+        resource
+            .with_stack(|stack| stack.test_socket_ready(env, keys))
+            .map_err(|_| atoms::ownership_invariant_violation())?
+            .map_err(socket_error_atom)
+    });
+
+    encode_envelope_result(env, result)
+}
+
+#[cfg(debug_assertions)]
+#[rustler::nif]
+fn test_socket_close<'a>(
+    env: Env<'a>,
+    resource: ResourceArc<StackResource>,
+    identity: SocketIdentity,
+    wake_direction: Option<Direction>,
+) -> Term<'a> {
+    let result = catch_operation(|| {
+        resource
+            .with_stack(|stack| stack.test_socket_close(env, identity, wake_direction))
+            .map_err(|_| atoms::ownership_invariant_violation())?
+            .map_err(socket_error_atom)
+    });
+
+    encode_envelope_result(env, result)
+}
+
 fn guarded<'a, T, F>(env: Env<'a>, operation: F) -> Term<'a>
 where
     T: Encoder,
@@ -140,16 +292,22 @@ where
 
 #[derive(NifMap)]
 struct EncodedEnvelope<'a> {
-    result: Atom,
+    result: Term<'a>,
     output: Vec<Term<'a>>,
     poll_at: Option<i64>,
     more: bool,
 }
 
-fn encode_effect_result<'a>(env: Env<'a>, result: Result<Result<Effects, Atom>, ()>) -> Term<'a> {
+fn encode_envelope_result<'a, T>(
+    env: Env<'a>,
+    result: Result<Result<Envelope<T>, Atom>, ()>,
+) -> Term<'a>
+where
+    T: Encoder,
+{
     match result {
-        Ok(Ok(effects)) => {
-            let output = effects
+        Ok(Ok(envelope)) => {
+            let output = envelope
                 .output
                 .into_iter()
                 .map(|packet| NewBinary::from_iter(env, packet.into_iter()).into())
@@ -158,16 +316,28 @@ fn encode_effect_result<'a>(env: Env<'a>, result: Result<Result<Effects, Atom>, 
             (
                 atoms::ok(),
                 EncodedEnvelope {
-                    result: atoms::ok(),
+                    result: envelope.result.encode(env),
                     output,
-                    poll_at: effects.poll_at,
-                    more: effects.more,
+                    poll_at: envelope.poll_at,
+                    more: envelope.more,
                 },
             )
                 .encode(env)
         }
         Ok(Err(reason)) => (atoms::error(), reason).encode(env),
         Err(()) => (atoms::error(), atoms::native_panic()).encode(env),
+    }
+}
+
+fn socket_error_atom(error: SocketError) -> Atom {
+    match error {
+        SocketError::Closed => atoms::closed(),
+        SocketError::InvalidSocket => atoms::invalid_socket(),
+        SocketError::WrongKind => atoms::wrong_socket_kind(),
+        SocketError::InvalidState => atoms::invalid_socket_state(),
+        SocketError::InvalidOperation => atoms::invalid_operation(),
+        SocketError::Busy => atoms::busy(),
+        SocketError::SystemLimit => atoms::system_limit(),
     }
 }
 

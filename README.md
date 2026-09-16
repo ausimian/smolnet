@@ -4,9 +4,10 @@ SmolNet is an Elixir library that embeds the Rust
 [`smoltcp`](https://github.com/smoltcp-rs/smoltcp) TCP/IP stack behind a
 deliberately small Rustler NIF.
 
-The project is under initial development. Phase 2 provides independent raw-IP
-IPv6 stacks; sockets arrive in later phases. TCP over IPv6 is the first socket
-target, followed by TCP over IPv4, then UDP over IPv6 and IPv4.
+The project is under initial development. Phase 3 provides independent raw-IP
+IPv6 stacks plus protocol-neutral socket identity, readiness, and cancellation
+machinery. TCP operations arrive in later phases, beginning with IPv6, followed
+by TCP over IPv4, then UDP over IPv6 and IPv4.
 
 `SmolNet.start_stack/1` creates an independent native stack and returns an
 opaque reference. A transport-neutral link process supplies complete IPv6
@@ -39,6 +40,23 @@ backpressure for its external transport. IPv4 is rejected until its planned
 phase. Link-recipient failure can stop the stack, retain it as marked down, or
 notify another process. `SmolNet.stop_stack/1` stops the complete temporary
 supervision bundle.
+
+Low-level socket values are lightweight `%SmolNet.Socket{}` structs. Native
+socket IDs and generations are globally monotonic, never reused, and capped at
+`2^59 - 1` so they remain immediate integers on the supported 64-bit BEAM
+targets. Each stack also caps live socket entries at its `:ready_events` limit;
+opening beyond that bound returns `{:error, :system_limit}`. A blocked
+nonblocking operation will return a
+`%SmolNet.Socket.SelectInfo{}`; its one-shot message has this shape:
+
+```elixir
+{:"$smol_socket", {socket.id, socket.generation}, :select, select_info.ref}
+```
+
+The message is only a retry hint. `SmolNet.cancel/2` removes the exact waiter
+and returns `:ok`, `:already_sent`, or `:not_found` according to which side of
+the readiness race won. TCP socket creation and I/O are intentionally deferred
+to the next phases.
 
 ## Development
 

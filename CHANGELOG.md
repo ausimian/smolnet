@@ -17,3 +17,5 @@ and this project adheres to
 - Add serialized single-feeder raw IPv6 ingress, transport-neutral egress
   messages, native stack polling, BEAM-owned timer scheduling, link-down
   policies, and stack metrics.
+- Add stable socket identities, bounded one-shot readiness, independent
+  read/write waiters, exact cancellation, and stale-event protection.

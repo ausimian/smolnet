@@ -7,6 +7,7 @@ defmodule SmolNet do
   exchange complete raw IPv6 packets with a caller-provided link process.
   """
 
+  alias SmolNet.Socket
   alias SmolNet.Stack
 
   @doc """
@@ -44,4 +45,9 @@ defmodule SmolNet do
   @doc "Returns ingress, link, timer, and native stack metrics."
   @spec stack_info(Stack.Ref.t()) :: {:ok, map()} | {:error, :closed}
   defdelegate stack_info(stack), to: Stack, as: :info
+
+  @doc "Cancels the exact pending nonblocking operation identified by `select_info`."
+  @spec cancel(Socket.t(), Socket.SelectInfo.t()) ::
+          :ok | :already_sent | :not_found | {:error, :closed | :invalid_socket}
+  defdelegate cancel(socket, select_info), to: Socket
 end

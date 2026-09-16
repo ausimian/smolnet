@@ -49,6 +49,10 @@ defmodule SmolNet.Test.NativeDouble do
     end
   end
 
+  def stack_shutdown(_resource), do: empty_effects()
+
+  def socket_cancel(_resource, _identity, _operation, _reference), do: empty_effects()
+
   def stack_snapshot(_resource) do
     {:ok, %{result: %{test_double: true}, output: [], poll_at: nil, more: false}}
   end
