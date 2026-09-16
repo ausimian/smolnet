@@ -2,9 +2,9 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Mutex, TryLockError};
 
 use rustler::{Atom, NifMap, Resource, ResourceArc};
-use smoltcp::iface::{Config, Interface, SocketSet};
+use smoltcp::iface::{Config, Interface, PollResult, Route, SocketSet};
 use smoltcp::time::Instant;
-use smoltcp::wire::HardwareAddress;
+use smoltcp::wire::{HardwareAddress, IpAddress, IpCidr, Ipv6Address, Ipv6Cidr};
 
 use crate::device::BeamDevice;
 use crate::limits::{Limits, Work};
@@ -24,12 +24,16 @@ pub struct StackResource {
 impl Resource for StackResource {}
 
 impl StackResource {
-    pub fn new(limits: Limits, now: Instant) -> Result<ResourceArc<Self>, ()> {
+    pub fn new(
+        limits: Limits,
+        config: StackConfig,
+        now: Instant,
+    ) -> Result<ResourceArc<Self>, StackError> {
         if !limits.valid() {
-            return Err(());
+            return Err(StackError::InvalidLimits);
         }
 
-        let stack = NativeStack::new(limits, now);
+        let stack = NativeStack::new(limits, config, now)?;
         let resource = ResourceArc::new(Self {
             inner: Mutex::new(stack),
         });
@@ -77,17 +81,36 @@ pub struct NativeStack {
     counters: Counters,
     lifecycle: Lifecycle,
     limits: Limits,
+    mtu: usize,
 }
 
 impl NativeStack {
-    fn new(limits: Limits, now: Instant) -> Self {
-        let mut device = BeamDevice::new(1_500);
-        let mut config = Config::new(HardwareAddress::Ip);
-        config.random_seed = NEXT_STACK_ID.fetch_add(1, Ordering::Relaxed);
-        let id = config.random_seed;
-        let interface = Interface::new(config, &mut device, now);
+    fn new(limits: Limits, stack_config: StackConfig, now: Instant) -> Result<Self, StackError> {
+        stack_config.validate(limits)?;
 
-        Self {
+        let mut device = BeamDevice::new(stack_config.mtu);
+        let mut interface_config = Config::new(HardwareAddress::Ip);
+        interface_config.random_seed = NEXT_STACK_ID.fetch_add(1, Ordering::Relaxed);
+        let id = interface_config.random_seed;
+        let mut interface = Interface::new(interface_config, &mut device, now);
+
+        interface.update_ip_addrs(|addresses| {
+            for address in &stack_config.addresses {
+                addresses
+                    .push(IpCidr::Ipv6(address.to_cidr()))
+                    .expect("validated address capacity");
+            }
+        });
+
+        interface.routes_mut().update(|routes| {
+            for route in &stack_config.routes {
+                routes
+                    .push(route.to_route())
+                    .expect("validated route capacity");
+            }
+        });
+
+        Ok(Self {
             id,
             interface,
             sockets: SocketSet::new(Vec::new()),
@@ -97,7 +120,8 @@ impl NativeStack {
             counters: Counters::default(),
             lifecycle: Lifecycle::Running,
             limits,
-        }
+            mtu: stack_config.mtu,
+        })
     }
 
     pub fn snapshot(&self) -> Envelope<Snapshot> {
@@ -112,6 +136,7 @@ impl NativeStack {
                 ready_count: self.ready.len(),
                 receive_packets,
                 transmit_packets,
+                mtu: self.mtu,
                 ip_address_count: self.interface.ip_addrs().len(),
                 lifecycle: self.lifecycle.as_atom(),
                 counters: self.counters,
@@ -133,6 +158,224 @@ impl NativeStack {
             more,
         }
     }
+
+    pub fn ingress(&mut self, packet: &[u8], now: Instant) -> Result<Effects, StackError> {
+        self.validate_packet(packet)?;
+        self.device
+            .enqueue_receive(packet.to_vec())
+            .map_err(|_| StackError::OwnershipInvariantViolation)?;
+        self.counters.ingress_packets += 1;
+        self.drive(now, Some(packet.len()))
+    }
+
+    pub fn poll(&mut self, now: Instant) -> Effects {
+        self.counters.poll_calls += 1;
+        self.drive(now, None)
+            .expect("poll without ingress cannot fail")
+    }
+
+    fn drive(&mut self, now: Instant, ingress_bytes: Option<usize>) -> Result<Effects, StackError> {
+        self.device.begin_call(self.limits.output_packets);
+        let input_bytes = ingress_bytes.unwrap_or(0);
+        let output_byte_limit = self.limits.bytes_copied.saturating_sub(input_bytes);
+        let mut output = self
+            .device
+            .take_transmit(self.limits.output_packets, output_byte_limit);
+        let mut output_bytes: usize = output.iter().map(Vec::len).sum();
+
+        if self.device.has_receive() {
+            let _ = self
+                .interface
+                .poll_ingress_single(now, &mut self.device, &mut self.sockets);
+        }
+
+        self.interface.poll_maintenance(now);
+
+        let mut maintenance_work = 0usize;
+        let mut egress_may_remain = false;
+
+        while maintenance_work < self.limits.maintenance_work
+            && self.device.queued_packets().1 < self.limits.output_packets
+        {
+            maintenance_work += 1;
+
+            if matches!(
+                self.interface
+                    .poll_egress(now, &mut self.device, &mut self.sockets),
+                PollResult::None
+            ) {
+                egress_may_remain = false;
+                break;
+            }
+
+            egress_may_remain = true;
+        }
+
+        let remaining_packets = self.limits.output_packets.saturating_sub(output.len());
+        let remaining_bytes = output_byte_limit.saturating_sub(output_bytes);
+        let additional_output = self
+            .device
+            .take_transmit(remaining_packets, remaining_bytes);
+        output_bytes += additional_output.iter().map(Vec::len).sum::<usize>();
+        output.extend(additional_output);
+        let output_packets = output.len();
+        let more = self.device.has_receive() || self.device.has_transmit() || egress_may_remain;
+        let poll_at = if more {
+            Some(now.total_millis())
+        } else {
+            self.interface
+                .poll_at(now, &self.sockets)
+                .map(|instant| instant.total_millis())
+        };
+
+        self.counters.observe(Work {
+            bytes_copied: input_bytes + output_bytes,
+            output_packets,
+            ready_events: 0,
+            maintenance_work,
+        });
+        self.counters.emitted_packets += output_packets;
+
+        Ok(Effects {
+            output,
+            poll_at,
+            more,
+        })
+    }
+
+    fn validate_packet(&mut self, packet: &[u8]) -> Result<(), StackError> {
+        if packet.len() < 40 {
+            self.counters.rejected_packets += 1;
+            return Err(StackError::InvalidPacket);
+        }
+
+        match packet[0] >> 4 {
+            4 => {
+                self.counters.rejected_packets += 1;
+                return Err(StackError::UnsupportedFamily);
+            }
+            6 => {}
+            _ => {
+                self.counters.rejected_packets += 1;
+                return Err(StackError::InvalidPacket);
+            }
+        }
+
+        let payload_length = usize::from(u16::from_be_bytes([packet[4], packet[5]]));
+        let declared_length = 40usize
+            .checked_add(payload_length)
+            .ok_or(StackError::InvalidPacket)?;
+
+        if declared_length != packet.len() {
+            self.counters.rejected_packets += 1;
+            return Err(StackError::InvalidPacket);
+        }
+
+        if packet.len() > self.mtu || packet.len() > self.limits.bytes_copied {
+            self.counters.rejected_packets += 1;
+            return Err(StackError::PacketTooLarge);
+        }
+
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, NifMap)]
+pub struct StackConfig {
+    mtu: usize,
+    addresses: Vec<AddressConfig>,
+    routes: Vec<RouteConfig>,
+}
+
+impl StackConfig {
+    fn validate(&self, limits: Limits) -> Result<(), StackError> {
+        if !(1_280..=65_575).contains(&self.mtu)
+            || self.mtu > limits.bytes_copied
+            || self.addresses.len() > 8
+            || self.routes.len() > 4
+            || self.addresses.iter().any(|address| !address.valid())
+            || self.routes.iter().any(|route| !route.valid())
+        {
+            return Err(StackError::InvalidStackConfig);
+        }
+
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, NifMap)]
+struct AddressConfig {
+    address: Vec<u8>,
+    prefix_length: u8,
+}
+
+impl AddressConfig {
+    fn valid(&self) -> bool {
+        self.address.len() == 16 && self.prefix_length <= 128 && !multicast(&self.address)
+    }
+
+    fn to_cidr(&self) -> Ipv6Cidr {
+        Ipv6Cidr::new(ipv6_address(&self.address), self.prefix_length)
+    }
+}
+
+#[derive(Clone, Debug, NifMap)]
+struct RouteConfig {
+    destination: Vec<u8>,
+    prefix_length: u8,
+    gateway: Vec<u8>,
+}
+
+impl RouteConfig {
+    fn valid(&self) -> bool {
+        self.destination.len() == 16
+            && self.gateway.len() == 16
+            && self.prefix_length <= 128
+            && !multicast(&self.destination)
+            && !multicast(&self.gateway)
+            && !unspecified(&self.gateway)
+    }
+
+    fn to_route(&self) -> Route {
+        Route {
+            cidr: IpCidr::Ipv6(Ipv6Cidr::new(
+                ipv6_address(&self.destination),
+                self.prefix_length,
+            )),
+            via_router: IpAddress::Ipv6(ipv6_address(&self.gateway)),
+            preferred_until: None,
+            expires_at: None,
+        }
+    }
+}
+
+fn ipv6_address(bytes: &[u8]) -> Ipv6Address {
+    let octets: [u8; 16] = bytes.try_into().expect("validated IPv6 address length");
+    Ipv6Address::from_octets(octets)
+}
+
+fn multicast(bytes: &[u8]) -> bool {
+    bytes.first() == Some(&0xff)
+}
+
+fn unspecified(bytes: &[u8]) -> bool {
+    bytes.iter().all(|byte| *byte == 0)
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum StackError {
+    InvalidLimits,
+    InvalidStackConfig,
+    InvalidPacket,
+    UnsupportedFamily,
+    PacketTooLarge,
+    OwnershipInvariantViolation,
+}
+
+pub struct Effects {
+    pub output: Vec<Vec<u8>>,
+    pub poll_at: Option<i64>,
+    pub more: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -152,6 +395,10 @@ pub struct Counters {
     max_output_packets: usize,
     max_ready_events: usize,
     max_maintenance_work: usize,
+    ingress_packets: usize,
+    rejected_packets: usize,
+    emitted_packets: usize,
+    poll_calls: usize,
 }
 
 impl Counters {
@@ -191,6 +438,7 @@ pub struct Snapshot {
     ready_count: usize,
     receive_packets: usize,
     transmit_packets: usize,
+    mtu: usize,
     ip_address_count: usize,
     lifecycle: Atom,
     counters: Counters,
@@ -209,28 +457,36 @@ mod tests {
 
     use smoltcp::time::Instant;
 
-    use super::{NativeStack, StackResource};
+    use super::{NativeStack, StackConfig, StackResource};
     use crate::limits::Limits;
 
     const LIMITS: Limits = Limits {
-        bytes_copied: 1,
+        bytes_copied: 1_280,
         output_packets: 1,
         ready_events: 1,
         maintenance_work: 1,
     };
 
+    fn config() -> StackConfig {
+        StackConfig {
+            mtu: 1_280,
+            addresses: Vec::new(),
+            routes: Vec::new(),
+        }
+    }
+
     #[test]
     fn contention_never_waits_for_the_mutex() {
         let resource = StackResource {
-            inner: Mutex::new(NativeStack::new(LIMITS, Instant::ZERO)),
+            inner: Mutex::new(NativeStack::new(LIMITS, config(), Instant::ZERO).unwrap()),
         };
         assert_eq!(resource.test_contention(), Err(()));
     }
 
     #[test]
     fn separate_resources_have_separate_stack_ids() {
-        let first = NativeStack::new(LIMITS, Instant::ZERO);
-        let second = NativeStack::new(LIMITS, Instant::ZERO);
+        let first = NativeStack::new(LIMITS, config(), Instant::ZERO).unwrap();
+        let second = NativeStack::new(LIMITS, config(), Instant::ZERO).unwrap();
 
         assert_ne!(first.id, second.id);
     }

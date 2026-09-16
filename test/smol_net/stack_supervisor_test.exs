@@ -116,10 +116,11 @@ defmodule SmolNet.StackSupervisorTest do
     assert length(children) == 2
     refute_received {:native_stack_new, _pid}
 
-    assert {:stop, {:native_initialization_failed, :not_called_during_init}, _state} =
+    assert {:noreply, _state} =
              Stack.handle_continue(:create_native_stack, state)
 
     assert_receive {:native_stack_new, _pid}
+    assert_receive {:smolnet_stack_error, ^ready_ref, :not_called_during_init}
   end
 
   test "failed handle_continue initialization leaves no child behind" do

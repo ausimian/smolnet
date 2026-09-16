@@ -6,8 +6,14 @@ defmodule SmolNet.Native do
   @spec health() :: :ok
   def health, do: :erlang.nif_error(:nif_not_loaded)
 
-  @spec stack_new(map(), integer()) :: {:ok, map()} | {:error, atom()}
-  def stack_new(_limits, _now), do: :erlang.nif_error(:nif_not_loaded)
+  @spec stack_new(map(), map(), integer()) :: {:ok, map()} | {:error, atom()}
+  def stack_new(_limits, _config, _now), do: :erlang.nif_error(:nif_not_loaded)
+
+  @spec stack_ingress(reference(), binary(), integer()) :: {:ok, map()} | {:error, atom()}
+  def stack_ingress(_stack, _packet, _now), do: :erlang.nif_error(:nif_not_loaded)
+
+  @spec stack_poll(reference(), integer()) :: {:ok, map()} | {:error, atom()}
+  def stack_poll(_stack, _now), do: :erlang.nif_error(:nif_not_loaded)
 
   @spec stack_snapshot(reference()) :: {:ok, map()} | {:error, atom()}
   def stack_snapshot(_stack), do: :erlang.nif_error(:nif_not_loaded)

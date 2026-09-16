@@ -38,7 +38,7 @@ defmodule SmolNet.NativeTest do
 
   test "bounds every ABI work dimension and reports a continuation" do
     limits = %{
-      bytes_copied: 10,
+      bytes_copied: 1_500,
       output_packets: 2,
       ready_events: 3,
       maintenance_work: 4
@@ -55,14 +55,14 @@ defmodule SmolNet.NativeTest do
               more: true
             }} =
              Stack.test_bounded_work(stack, %{
-               bytes_copied: 100,
+               bytes_copied: 10_000,
                output_packets: 100,
                ready_events: 100,
                maintenance_work: 100
              })
 
     assert {:ok, %{result: %{counters: counters}}} = Stack.native_snapshot(stack)
-    assert counters.max_bytes_copied == 10
+    assert counters.max_bytes_copied == 1_500
     assert counters.max_output_packets == 2
     assert counters.max_ready_events == 3
     assert counters.max_maintenance_work == 4
@@ -82,14 +82,54 @@ defmodule SmolNet.NativeTest do
            ) == {:error, :time_overflow}
 
     valid_millis = div(9_223_372_036_854_775_807, 1_000)
-    assert {:ok, _envelope} = Native.stack_new(Stack.default_limits(), valid_millis)
+    config = %{mtu: 1_500, addresses: [], routes: []}
+    assert {:ok, _envelope} = Native.stack_new(Stack.default_limits(), config, valid_millis)
 
-    assert Native.stack_new(Stack.default_limits(), valid_millis + 1) ==
+    assert Native.stack_new(Stack.default_limits(), config, valid_millis + 1) ==
              {:error, :time_overflow}
   end
 
   test "malformed native input is contained without destabilizing the VM" do
-    assert Native.stack_new(%{}, 0) == {:error, :invalid_limits}
+    assert Native.stack_new(%{}, %{mtu: 1_500, addresses: [], routes: []}, 0) ==
+             {:error, :invalid_limits}
+
+    assert Native.health() == :ok
+  end
+
+  test "native ingress defensively rejects invalid and non-IPv6 packets" do
+    config = %{mtu: 1_280, addresses: [], routes: []}
+    {:ok, %{result: resource}} = Native.stack_new(Stack.default_limits(), config, 0)
+
+    assert Native.stack_ingress(resource, <<6::4, 0::308>>, 0) ==
+             {:error, :invalid_packet}
+
+    assert Native.stack_ingress(resource, <<4::4, 0::316>>, 0) ==
+             {:error, :unsupported_family}
+
+    assert Native.stack_ingress(resource, <<6::4, 0::28, 1::16, 59, 64, 0::256>>, 0) ==
+             {:error, :invalid_packet}
+
+    oversized = <<6::4, 0::28, 1_241::16, 59, 64, 0::256, 0::size(1_241 * 8)>>
+    assert Native.stack_ingress(resource, oversized, 0) == {:error, :packet_too_large}
+
+    assert {:ok, %{result: %{counters: counters}}} = Native.stack_snapshot(resource)
+    assert counters.ingress_packets == 0
+    assert counters.rejected_packets == 4
+    assert Native.health() == :ok
+  end
+
+  test "native configuration rejects multicast interface addresses without panicking" do
+    multicast = [0xFF, 2] ++ List.duplicate(0, 14)
+
+    config = %{
+      mtu: 1_280,
+      addresses: [%{address: multicast, prefix_length: 64}],
+      routes: []
+    }
+
+    assert Native.stack_new(Stack.default_limits(), config, 0) ==
+             {:error, :invalid_stack_config}
+
     assert Native.health() == :ok
   end
 

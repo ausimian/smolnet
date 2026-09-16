@@ -12,7 +12,9 @@ Accepted for the project skeleton.
   its minimum because both Rustler 0.38 and smoltcp 0.14 require it.
 - Rustler 0.38.0 provides the Elixir/NIF boundary.
 - smoltcp 0.14.0 is built with default features disabled. Only `std`,
-  `medium-ip`, `proto-ipv6`, and `socket-tcp` are enabled initially.
+  `medium-ip`, `proto-ipv6`, `auto-icmp-echo-reply`, and `socket-tcp` are
+  enabled. Automatic ICMPv6 echo replies provide the Phase 2 packet-path
+  integration probe without exposing an ICMP socket API.
 - Credo, Dialyxir, ExDoc, ExCoveralls, and Publisho provide local quality,
   documentation, coverage, and eventual release tooling.
 
