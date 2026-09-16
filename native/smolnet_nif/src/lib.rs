@@ -25,7 +25,6 @@ mod atoms {
         invalid_limits,
         invalid_stack_config,
         invalid_packet,
-        unsupported_family,
         packet_too_large,
         invalid_socket,
         wrong_socket_kind,
@@ -169,10 +168,14 @@ fn socket_validate<'a>(
 }
 
 #[rustler::nif]
-fn tcp_open<'a>(env: Env<'a>, resource: ResourceArc<StackResource>) -> Term<'a> {
+fn tcp_open<'a>(
+    env: Env<'a>,
+    resource: ResourceArc<StackResource>,
+    family: crate::tcp::AddressFamily,
+) -> Term<'a> {
     let result = catch_operation(|| {
         resource
-            .with_stack(|stack| stack.tcp_open(env))
+            .with_stack(|stack| stack.tcp_open(env, family))
             .map_err(|_| atoms::ownership_invariant_violation())?
             .map_err(socket_error_atom)
     });
@@ -623,7 +626,6 @@ fn stack_error_atom(error: StackError) -> Atom {
         StackError::InvalidLimits => atoms::invalid_limits(),
         StackError::InvalidStackConfig => atoms::invalid_stack_config(),
         StackError::InvalidPacket => atoms::invalid_packet(),
-        StackError::UnsupportedFamily => atoms::unsupported_family(),
         StackError::PacketTooLarge => atoms::packet_too_large(),
         StackError::OwnershipInvariantViolation => atoms::ownership_invariant_violation(),
     }

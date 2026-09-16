@@ -17,13 +17,22 @@ defmodule SmolNet.Socket do
   @max_timeout 4_294_967_295
   @max_backlog 128
 
-  @enforce_keys [:stack, :id, :generation]
-  defstruct [:stack, :id, :generation]
+  @enforce_keys [:stack, :id, :generation, :family]
+  defstruct [:stack, :id, :generation, :family]
 
   @type t :: %__MODULE__{
           stack: pid(),
           id: pos_integer(),
-          generation: pos_integer()
+          generation: pos_integer(),
+          family: :inet | :inet6
+        }
+
+  @type ipv4_address :: {0..255, 0..255, 0..255, 0..255}
+
+  @type sockaddr_in :: %{
+          required(:family) => :inet,
+          required(:addr) => ipv4_address(),
+          required(:port) => 0..65_535
         }
 
   @type ipv6_address ::
@@ -41,13 +50,14 @@ defmodule SmolNet.Socket do
   @spec open(atom(), atom(), atom(), keyword()) ::
           {:ok, t()}
           | {:error, :unsupported_family | :unsupported_socket | :invalid_options | atom()}
-  def open(:inet6, :stream, :tcp, stack: stack), do: Stack.socket_open(stack)
+  def open(family, :stream, :tcp, stack: stack) when family in [:inet, :inet6],
+    do: Stack.socket_open(stack, family)
 
-  def open(:inet6, :stream, :tcp, _options), do: {:error, :invalid_options}
+  def open(family, :stream, :tcp, _options) when family in [:inet, :inet6],
+    do: {:error, :invalid_options}
 
-  def open(:inet, :stream, :tcp, _options), do: {:error, :unsupported_family}
-
-  def open(:inet6, _type, _protocol, _options), do: {:error, :unsupported_socket}
+  def open(family, _type, _protocol, _options) when family in [:inet, :inet6],
+    do: {:error, :unsupported_socket}
 
   def open(_domain, _type, _protocol, options) when is_list(options) do
     {:error, :unsupported_family}
@@ -56,10 +66,10 @@ defmodule SmolNet.Socket do
   def open(_domain, _type, _protocol, _options), do: {:error, :invalid_options}
 
   @doc false
-  @spec bind(t(), sockaddr_in6()) :: :ok | {:error, atom()}
+  @spec bind(t(), sockaddr_in() | sockaddr_in6()) :: :ok | {:error, atom()}
   def bind(%__MODULE__{} = socket, address) do
     with true <- valid?(socket),
-         {:ok, endpoint} <- encode_endpoint(address, :bind) do
+         {:ok, endpoint} <- encode_endpoint(address, :bind, socket.family) do
       Stack.socket_bind(socket, endpoint)
     else
       false -> {:error, :invalid_socket}
@@ -112,15 +122,15 @@ defmodule SmolNet.Socket do
   def accept(_socket, _timeout), do: {:error, :invalid_socket}
 
   @doc false
-  @spec connect(t(), sockaddr_in6()) :: :ok | {:error, atom()}
+  @spec connect(t(), sockaddr_in() | sockaddr_in6()) :: :ok | {:error, atom()}
   def connect(socket, address), do: connect(socket, address, :infinity)
 
   @doc false
-  @spec connect(t(), sockaddr_in6(), :nowait | timeout()) ::
+  @spec connect(t(), sockaddr_in() | sockaddr_in6(), :nowait | timeout()) ::
           :ok | {:select, :socket.select_info()} | {:error, atom()}
   def connect(%__MODULE__{} = socket, address, :nowait) do
     with true <- valid?(socket),
-         {:ok, endpoint} <- encode_endpoint(address, :remote) do
+         {:ok, endpoint} <- encode_endpoint(address, :remote, socket.family) do
       Stack.socket_connect(socket, endpoint)
     else
       false -> {:error, :invalid_socket}
@@ -132,7 +142,7 @@ defmodule SmolNet.Socket do
       when timeout == :infinity or
              (is_integer(timeout) and timeout >= 0 and timeout <= @max_timeout) do
     with true <- valid?(socket),
-         {:ok, endpoint} <- encode_endpoint(address, :remote) do
+         {:ok, endpoint} <- encode_endpoint(address, :remote, socket.family) do
       synchronous(socket, timeout, fn deadline, monitor ->
         connect_loop(socket, endpoint, deadline, monitor, 0)
       end)
@@ -241,7 +251,7 @@ defmodule SmolNet.Socket do
   def shutdown(_socket, _how), do: {:error, :invalid_socket}
 
   @doc false
-  @spec sockname(t()) :: {:ok, sockaddr_in6()} | {:error, atom()}
+  @spec sockname(t()) :: {:ok, sockaddr_in() | sockaddr_in6()} | {:error, atom()}
   def sockname(%__MODULE__{} = socket) do
     if valid?(socket), do: Stack.socket_sockname(socket), else: {:error, :invalid_socket}
   end
@@ -249,7 +259,7 @@ defmodule SmolNet.Socket do
   def sockname(_socket), do: {:error, :invalid_socket}
 
   @doc false
-  @spec peername(t()) :: {:ok, sockaddr_in6()} | {:error, atom()}
+  @spec peername(t()) :: {:ok, sockaddr_in() | sockaddr_in6()} | {:error, atom()}
   def peername(%__MODULE__{} = socket) do
     if valid?(socket), do: Stack.socket_peername(socket), else: {:error, :invalid_socket}
   end
@@ -265,10 +275,13 @@ defmodule SmolNet.Socket do
   def close(_socket), do: {:error, :invalid_socket}
 
   @doc false
-  @spec new(pid(), map()) :: t()
-  def new(stack, %{id: id, generation: generation})
-      when is_pid(stack) and id in 1..@max_identity and generation in 1..@max_identity do
-    %__MODULE__{stack: stack, id: id, generation: generation}
+  @spec new(pid(), map(), :inet | :inet6) :: t()
+  def new(stack, identity, family \\ :inet6)
+
+  def new(stack, %{id: id, generation: generation}, family)
+      when is_pid(stack) and id in 1..@max_identity and generation in 1..@max_identity and
+             family in [:inet, :inet6] do
+    %__MODULE__{stack: stack, id: id, generation: generation, family: family}
   end
 
   @doc """
@@ -299,14 +312,19 @@ defmodule SmolNet.Socket do
 
   @doc false
   @spec valid?(term()) :: boolean()
-  def valid?(%__MODULE__{stack: stack, id: id, generation: generation}) do
-    is_pid(stack) and id in 1..@max_identity and generation in 1..@max_identity
+  def valid?(%__MODULE__{stack: stack, id: id, generation: generation, family: family}) do
+    is_pid(stack) and id in 1..@max_identity and generation in 1..@max_identity and
+      family in [:inet, :inet6]
   end
 
   def valid?(_socket), do: false
 
   @doc false
-  @spec endpoint_from_native(map()) :: sockaddr_in6()
+  @spec endpoint_from_native(map()) :: sockaddr_in() | sockaddr_in6()
+  def endpoint_from_native(%{address: [a, b, c, d], port: port, scope_id: 0}) do
+    %{family: :inet, addr: {a, b, c, d}, port: port}
+  end
+
   def endpoint_from_native(%{address: bytes, port: port, scope_id: scope_id}) do
     address =
       bytes
@@ -640,10 +658,21 @@ defmodule SmolNet.Socket do
       else: {:error, :invalid_socket}
   end
 
-  defp encode_endpoint(%{family: :inet} = _address, _usage),
-    do: {:error, :unsupported_family}
+  defp encode_endpoint(%{family: family}, _usage, expected) when family != expected,
+    do: {:error, :invalid_address}
 
-  defp encode_endpoint(%{family: :inet6, addr: address, port: port} = sockaddr, usage) do
+  defp encode_endpoint(%{family: :inet, addr: address, port: port} = sockaddr, usage, :inet) do
+    with true <- Enum.all?(Map.keys(sockaddr), &(&1 in [:family, :addr, :port])),
+         {:ok, bytes} <- ipv4_bytes(address, usage),
+         :ok <- valid_port(port, usage) do
+      {:ok, %{address: bytes, port: port, scope_id: 0}}
+    else
+      {:error, _reason} = error -> error
+      false -> {:error, :invalid_address}
+    end
+  end
+
+  defp encode_endpoint(%{family: :inet6, addr: address, port: port} = sockaddr, usage, :inet6) do
     with true <-
            Enum.all?(Map.keys(sockaddr), &(&1 in [:family, :addr, :port, :flowinfo, :scope_id])),
          true <- Map.get(sockaddr, :flowinfo, 0) === 0,
@@ -657,7 +686,30 @@ defmodule SmolNet.Socket do
     end
   end
 
-  defp encode_endpoint(_address, _usage), do: {:error, :invalid_address}
+  defp encode_endpoint(_address, _usage, _family), do: {:error, :invalid_address}
+
+  defp ipv4_bytes(address, usage) when is_tuple(address) and tuple_size(address) == 4 do
+    octets = Tuple.to_list(address)
+
+    cond do
+      not Enum.all?(octets, &(is_integer(&1) and &1 in 0..255)) ->
+        {:error, :invalid_address}
+
+      hd(octets) in 224..239 ->
+        {:error, :invalid_address}
+
+      octets == [255, 255, 255, 255] ->
+        {:error, :invalid_address}
+
+      usage == :remote and Enum.all?(octets, &(&1 == 0)) ->
+        {:error, :invalid_address}
+
+      true ->
+        {:ok, octets}
+    end
+  end
+
+  defp ipv4_bytes(_address, _usage), do: {:error, :invalid_address}
 
   defp ipv6_bytes(address, usage) when is_tuple(address) and tuple_size(address) == 8 do
     segments = Tuple.to_list(address)
@@ -667,6 +719,7 @@ defmodule SmolNet.Socket do
 
       cond do
         hd(bytes) == 0xFF -> {:error, :invalid_address}
+        ipv4_mapped?(bytes) -> {:error, :invalid_address}
         usage == :remote and Enum.all?(bytes, &(&1 == 0)) -> {:error, :invalid_address}
         true -> {:ok, bytes}
       end
@@ -676,6 +729,10 @@ defmodule SmolNet.Socket do
   end
 
   defp ipv6_bytes(_address, _usage), do: {:error, :invalid_address}
+
+  defp ipv4_mapped?(bytes) do
+    Enum.take(bytes, 10) == List.duplicate(0, 10) and Enum.slice(bytes, 10, 2) == [0xFF, 0xFF]
+  end
 
   defp valid_port(port, :bind) when is_integer(port) and port in 0..65_535, do: :ok
   defp valid_port(port, :remote) when is_integer(port) and port in 1..65_535, do: :ok

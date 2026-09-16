@@ -26,8 +26,8 @@ defmodule SmolNet.Native do
   @spec socket_validate(reference(), map()) :: {:ok, map()} | {:error, atom()}
   def socket_validate(_stack, _identity), do: :erlang.nif_error(:nif_not_loaded)
 
-  @spec tcp_open(reference()) :: {:ok, map()} | {:error, atom()}
-  def tcp_open(_stack), do: :erlang.nif_error(:nif_not_loaded)
+  @spec tcp_open(reference(), :inet | :inet6) :: {:ok, map()} | {:error, atom()}
+  def tcp_open(_stack, _family), do: :erlang.nif_error(:nif_not_loaded)
 
   @spec tcp_bind(reference(), map(), map()) :: {:ok, map()} | {:error, atom()}
   def tcp_bind(_stack, _identity, _endpoint), do: :erlang.nif_error(:nif_not_loaded)

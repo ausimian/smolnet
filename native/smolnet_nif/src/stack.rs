@@ -11,8 +11,8 @@ use smoltcp::socket::tcp::{self, ConnectError, ListenError};
 use smoltcp::time::Duration;
 use smoltcp::time::Instant;
 use smoltcp::wire::{
-    HardwareAddress, IpAddress, IpCidr, IpEndpoint, IpProtocol, Ipv6Address, Ipv6Cidr,
-    Ipv6ExtHeader, Ipv6Packet, TcpPacket,
+    HardwareAddress, IpAddress, IpCidr, IpEndpoint, IpProtocol, Ipv4Address, Ipv4Cidr, Ipv4Packet,
+    Ipv6Address, Ipv6Cidr, Ipv6ExtHeader, Ipv6Packet, TcpPacket,
 };
 
 use crate::device::BeamDevice;
@@ -22,8 +22,8 @@ use crate::socket_table::{
     WaiterRegistration,
 };
 use crate::tcp::{
-    self as tcp_support, ConnectFailure, ConnectPhase, EncodedEndpoint, ListenerRecord,
-    ShutdownHow, TcpEndpoint, TcpRecord, ValidatedEndpoint,
+    self as tcp_support, AddressFamily, ConnectFailure, ConnectPhase, EncodedEndpoint,
+    ListenerRecord, ShutdownHow, TcpEndpoint, TcpRecord, ValidatedEndpoint,
 };
 use crate::waiter::{
     ArmPoint, Direction, Operation, ReadinessCounters, ReadyKey, ReadyQueue, SocketIdentity, Waiter,
@@ -116,7 +116,7 @@ pub struct NativeStack {
     lifecycle: Lifecycle,
     limits: Limits,
     mtu: usize,
-    route_prefixes: Vec<Ipv6Cidr>,
+    route_prefixes: Vec<IpCidr>,
 }
 
 impl NativeStack {
@@ -137,7 +137,7 @@ impl NativeStack {
         interface.update_ip_addrs(|addresses| {
             for address in &stack_config.addresses {
                 addresses
-                    .push(IpCidr::Ipv6(address.to_cidr()))
+                    .push(address.to_cidr())
                     .expect("validated address capacity");
             }
         });
@@ -250,7 +250,11 @@ impl NativeStack {
         }
     }
 
-    pub fn tcp_open(&mut self, env: Env<'_>) -> Result<Envelope<SocketIdentity>, SocketError> {
+    pub fn tcp_open(
+        &mut self,
+        env: Env<'_>,
+        family: AddressFamily,
+    ) -> Result<Envelope<SocketIdentity>, SocketError> {
         self.ensure_running()?;
 
         if self.tcp_records.len() >= self.limits.ready_events {
@@ -267,7 +271,7 @@ impl NativeStack {
         };
 
         self.tcp_records
-            .insert(identity.id, TcpRecord::new(identity, handle));
+            .insert(identity.id, TcpRecord::new(identity, handle, family));
 
         Ok(self.finish_call(env, identity, Effects::empty(), Vec::new()))
     }
@@ -297,21 +301,25 @@ impl NativeStack {
             return Err(SocketError::InvalidState);
         }
 
-        if !endpoint.address.is_unspecified() && !self.has_ipv6_address(endpoint.address) {
+        if !record.family.matches(endpoint.address) {
+            return Err(SocketError::InvalidAddress);
+        }
+
+        if !endpoint.address.is_unspecified() && !self.has_ip_address(endpoint.address) {
             return Err(SocketError::AddressNotAvailable);
         }
 
         let port = if endpoint.port == 0 {
-            self.allocate_ephemeral_port()?
+            self.allocate_ephemeral_port(record.family)?
         } else {
-            if self.port_in_use(endpoint.port, Some(identity)) {
+            if self.port_in_use(endpoint.port, record.family, Some(identity)) {
                 return Err(SocketError::AddressInUse);
             }
 
             endpoint.port
         };
 
-        let local = IpEndpoint::new(IpAddress::Ipv6(endpoint.address), port);
+        let local = IpEndpoint::new(endpoint.address, port);
         let record = self.tcp_record_mut(identity)?;
         record.phase = ConnectPhase::Bound;
         record.local = Some(local);
@@ -345,12 +353,12 @@ impl NativeStack {
         }
 
         let local = record.local.ok_or(SocketError::NotBound)?;
-        let IpAddress::Ipv6(address) = local.addr;
         let endpoint = ValidatedEndpoint {
-            address,
+            address: local.addr,
             port: local.port,
             scope_id: record.local_scope_id,
         };
+        let listen_endpoint = self.concrete_listener_endpoint(endpoint)?;
         let pool_target = backlog.min(tcp_support::LISTENER_POOL_MAX);
         let mut handles = vec![record.handle];
 
@@ -364,7 +372,7 @@ impl NativeStack {
                 tcp_support::CONNECT_TIMEOUT_MILLIS,
             )));
 
-            match socket.listen(endpoint.listen_endpoint()) {
+            match socket.listen(listen_endpoint) {
                 Ok(()) => {}
                 Err(ListenError::InvalidState) => return Err(SocketError::InvalidState),
                 Err(ListenError::Unaddressable) => return Err(SocketError::InvalidAddress),
@@ -374,7 +382,7 @@ impl NativeStack {
         self.remove_tcp_record(record);
         self.tcp_listeners.insert(
             identity.id,
-            ListenerRecord::new(identity, endpoint, local, backlog, handles),
+            ListenerRecord::new(identity, endpoint, listen_endpoint, local, backlog, handles),
         );
         self.request_listener_scan();
 
@@ -422,7 +430,8 @@ impl NativeStack {
             .and_then(|listener| listener.accepted.pop_front());
 
         let result = if let Some(child) = accepted {
-            (crate::atoms::ok(), child).encode(env)
+            let family = self.tcp_record(child)?.family;
+            (crate::atoms::ok(), child, family).encode(env)
         } else {
             self.arm_listener_waiter(env, identity, pid, reference)?;
             (crate::atoms::select(), Operation::Accept, reference).encode(env)
@@ -449,6 +458,10 @@ impl NativeStack {
 
         let record = *self.tcp_record(identity)?;
 
+        if !record.family.matches(remote.address) {
+            return Err(SocketError::InvalidAddress);
+        }
+
         match record.phase {
             ConnectPhase::Connected => return Err(SocketError::AlreadyConnected),
             ConnectPhase::Failed(failure) => return Err(failure.socket_error()),
@@ -471,19 +484,17 @@ impl NativeStack {
         let local = match record.local {
             Some(local) => local,
             None => IpEndpoint::new(
-                IpAddress::Ipv6(Ipv6Address::UNSPECIFIED),
-                self.allocate_ephemeral_port()?,
+                record.family.unspecified(),
+                self.allocate_ephemeral_port(record.family)?,
             ),
         };
 
-        if self.port_in_use(local.port, Some(identity)) {
+        if self.port_in_use(local.port, record.family, Some(identity)) {
             return Err(SocketError::AddressInUse);
         }
 
         let local_listen = ValidatedEndpoint {
-            address: match local.addr {
-                IpAddress::Ipv6(address) => address,
-            },
+            address: local.addr,
             port: local.port,
             scope_id: record.local_scope_id,
         }
@@ -872,6 +883,7 @@ impl NativeStack {
 
     pub fn ingress(&mut self, packet: &[u8], now: Instant) -> Result<Effects, StackError> {
         self.validate_packet(packet)?;
+        self.retarget_wildcard_listener(packet);
         let reset = self.inbound_reset(packet);
         self.device
             .enqueue_receive(packet.to_vec())
@@ -1578,7 +1590,7 @@ impl NativeStack {
             tcp_support::CONNECT_TIMEOUT_MILLIS,
         )));
         socket
-            .listen(listener.endpoint.listen_endpoint())
+            .listen(listener.listen_endpoint)
             .expect("validated listener endpoint remains listenable");
         listener.pool.insert(handle);
         self.counters.listener_refills += 1;
@@ -1703,45 +1715,110 @@ impl NativeStack {
         }
     }
 
-    fn has_ipv6_address(&self, address: Ipv6Address) -> bool {
+    fn has_ip_address(&self, address: IpAddress) -> bool {
         self.interface
             .ip_addrs()
             .iter()
-            .any(|cidr| cidr.address() == IpAddress::Ipv6(address))
+            .any(|cidr| cidr.address() == address)
     }
 
-    fn reachable(&self, address: Ipv6Address) -> bool {
-        let ip_address = IpAddress::Ipv6(address);
+    fn concrete_listener_endpoint(
+        &self,
+        endpoint: ValidatedEndpoint,
+    ) -> Result<smoltcp::wire::IpListenEndpoint, SocketError> {
+        if !endpoint.address.is_unspecified() {
+            return Ok(endpoint.listen_endpoint());
+        }
 
+        let family = AddressFamily::of(endpoint.address);
+        let address = self
+            .interface
+            .ip_addrs()
+            .iter()
+            .map(IpCidr::address)
+            .find(|address| family.matches(*address) && !address.is_unspecified())
+            .ok_or(SocketError::AddressNotAvailable)?;
+
+        Ok(smoltcp::wire::IpListenEndpoint {
+            addr: Some(address),
+            port: endpoint.port,
+        })
+    }
+
+    fn retarget_wildcard_listener(&mut self, packet: &[u8]) {
+        let Some((destination, port)) = tcp_listener_target(packet) else {
+            return;
+        };
+        let family = AddressFamily::of(destination);
+        let handles = self
+            .tcp_listeners
+            .values()
+            .filter(|listener| {
+                listener.endpoint.address.is_unspecified()
+                    && family.matches(listener.endpoint.address)
+                    && listener.local.port == port
+            })
+            .flat_map(|listener| listener.pool.iter().copied())
+            .collect::<Vec<_>>();
+        let endpoint = smoltcp::wire::IpListenEndpoint {
+            addr: Some(destination),
+            port,
+        };
+
+        for handle in handles {
+            let socket = self.sockets.get_mut::<tcp::Socket<'static>>(handle);
+
+            if socket.state() == tcp::State::Listen && socket.listen_endpoint() != endpoint {
+                socket.abort();
+                socket.set_timeout(Some(Duration::from_millis(
+                    tcp_support::CONNECT_TIMEOUT_MILLIS,
+                )));
+                socket
+                    .listen(endpoint)
+                    .expect("a validated wildcard target remains listenable");
+            }
+        }
+    }
+
+    fn reachable(&self, address: IpAddress) -> bool {
         self.interface
             .ip_addrs()
             .iter()
-            .any(|cidr| cidr.contains_addr(&ip_address))
+            .any(|cidr| cidr.contains_addr(&address))
             || self
                 .route_prefixes
                 .iter()
                 .any(|cidr| cidr.contains_addr(&address))
     }
 
-    fn port_in_use(&self, port: u16, excluding: Option<SocketIdentity>) -> bool {
+    fn port_in_use(
+        &self,
+        port: u16,
+        family: AddressFamily,
+        excluding: Option<SocketIdentity>,
+    ) -> bool {
         self.tcp_records.values().any(|record| {
             Some(record.identity) != excluding
+                && record.family == family
                 && !record.accepted
                 && record.local.is_some_and(|local| local.port == port)
-        }) || self
-            .tcp_listeners
-            .values()
-            .any(|listener| Some(listener.identity) != excluding && listener.local.port == port)
+        }) || self.tcp_listeners.values().any(|listener| {
+            Some(listener.identity) != excluding
+                && family.matches(listener.local.addr)
+                && listener.local.port == port
+        })
     }
 
-    fn allocate_ephemeral_port(&mut self) -> Result<u16, SocketError> {
+    fn allocate_ephemeral_port(&mut self, family: AddressFamily) -> Result<u16, SocketError> {
         let used = self
             .tcp_records
             .values()
+            .filter(|record| record.family == family)
             .filter_map(|record| record.local.map(|local| local.port))
             .chain(
                 self.tcp_listeners
                     .values()
+                    .filter(|listener| family.matches(listener.local.addr))
                     .map(|listener| listener.local.port),
             )
             .collect::<BTreeSet<_>>();
@@ -1772,16 +1849,37 @@ impl NativeStack {
     }
 
     fn inbound_reset(&self, packet: &[u8]) -> Option<(SocketIdentity, ConnectFailure)> {
-        let ipv6 = Ipv6Packet::new_checked(packet).ok()?;
-        let mut next_header = ipv6.next_header();
-        let mut transport = ipv6.payload();
+        let (source, destination, next_header, transport) = match packet.first()? >> 4 {
+            4 => {
+                let ipv4 = Ipv4Packet::new_checked(packet).ok()?;
+                (
+                    IpAddress::Ipv4(ipv4.src_addr()),
+                    IpAddress::Ipv4(ipv4.dst_addr()),
+                    ipv4.next_header(),
+                    ipv4.payload(),
+                )
+            }
+            6 => {
+                let ipv6 = Ipv6Packet::new_checked(packet).ok()?;
+                let mut next_header = ipv6.next_header();
+                let mut transport = ipv6.payload();
 
-        if next_header == IpProtocol::HopByHop {
-            let extension = Ipv6ExtHeader::new_checked(transport).ok()?;
-            next_header = extension.next_header();
-            let header_len = (usize::from(extension.header_len()) + 1) * 8;
-            transport = transport.get(header_len..)?;
-        }
+                if next_header == IpProtocol::HopByHop {
+                    let extension = Ipv6ExtHeader::new_checked(transport).ok()?;
+                    next_header = extension.next_header();
+                    let header_len = (usize::from(extension.header_len()) + 1) * 8;
+                    transport = transport.get(header_len..)?;
+                }
+
+                (
+                    IpAddress::Ipv6(ipv6.src_addr()),
+                    IpAddress::Ipv6(ipv6.dst_addr()),
+                    next_header,
+                    transport,
+                )
+            }
+            _ => return None,
+        };
 
         if next_header != IpProtocol::Tcp {
             return None;
@@ -1793,12 +1891,10 @@ impl NativeStack {
             return None;
         }
 
-        let key = ConnectionKey {
-            local_address: ipv6.dst_addr().octets(),
-            local_port: tcp.dst_port(),
-            remote_address: ipv6.src_addr().octets(),
-            remote_port: tcp.src_port(),
-        };
+        let key = ConnectionKey::new(
+            IpEndpoint::new(destination, tcp.dst_port()),
+            IpEndpoint::new(source, tcp.src_port()),
+        );
         let identity = *self.tcp_connections.get(&key)?;
         let record = self.tcp_record(identity).ok()?;
         let failure = match self
@@ -2045,29 +2141,27 @@ impl NativeStack {
     }
 
     fn validate_packet(&mut self, packet: &[u8]) -> Result<(), StackError> {
-        if packet.len() < 40 {
+        if packet.is_empty() {
             self.counters.rejected_packets += 1;
             return Err(StackError::InvalidPacket);
         }
 
-        match packet[0] >> 4 {
-            4 => {
-                self.counters.rejected_packets += 1;
-                return Err(StackError::UnsupportedFamily);
-            }
-            6 => {}
-            _ => {
-                self.counters.rejected_packets += 1;
-                return Err(StackError::InvalidPacket);
-            }
-        }
+        let valid = match packet[0] >> 4 {
+            4 => Ipv4Packet::new_checked(packet).is_ok_and(|ipv4| {
+                usize::from(ipv4.total_len()) == packet.len()
+                    && ipv4.verify_checksum()
+                    && !ipv4.more_frags()
+                    && ipv4.frag_offset() == 0
+            }),
+            6 => Ipv6Packet::new_checked(packet).is_ok_and(|ipv6| {
+                40usize
+                    .checked_add(usize::from(ipv6.payload_len()))
+                    .is_some_and(|declared| declared == packet.len())
+            }),
+            _ => false,
+        };
 
-        let payload_length = usize::from(u16::from_be_bytes([packet[4], packet[5]]));
-        let declared_length = 40usize
-            .checked_add(payload_length)
-            .ok_or(StackError::InvalidPacket)?;
-
-        if declared_length != packet.len() {
+        if !valid {
             self.counters.rejected_packets += 1;
             return Err(StackError::InvalidPacket);
         }
@@ -2112,11 +2206,17 @@ struct AddressConfig {
 
 impl AddressConfig {
     fn valid(&self) -> bool {
-        self.address.len() == 16 && self.prefix_length <= 128 && !multicast(&self.address)
+        ip_address(&self.address).is_some_and(|address| {
+            self.prefix_length <= prefix_limit(address)
+                && (address.is_unspecified() || address.is_unicast())
+        })
     }
 
-    fn to_cidr(&self) -> Ipv6Cidr {
-        Ipv6Cidr::new(ipv6_address(&self.address), self.prefix_length)
+    fn to_cidr(&self) -> IpCidr {
+        match ip_address(&self.address).expect("validated IP address") {
+            IpAddress::Ipv4(address) => IpCidr::Ipv4(Ipv4Cidr::new(address, self.prefix_length)),
+            IpAddress::Ipv6(address) => IpCidr::Ipv6(Ipv6Cidr::new(address, self.prefix_length)),
+        }
     }
 }
 
@@ -2129,39 +2229,101 @@ struct RouteConfig {
 
 impl RouteConfig {
     fn valid(&self) -> bool {
-        self.destination.len() == 16
-            && self.gateway.len() == 16
-            && self.prefix_length <= 128
-            && !multicast(&self.destination)
-            && !multicast(&self.gateway)
-            && !unspecified(&self.gateway)
+        let Some(destination) = ip_address(&self.destination) else {
+            return false;
+        };
+        let Some(gateway) = ip_address(&self.gateway) else {
+            return false;
+        };
+
+        same_family(destination, gateway)
+            && self.prefix_length <= prefix_limit(destination)
+            && !destination.is_multicast()
+            && gateway.is_unicast()
     }
 
     fn to_route(&self) -> Route {
         Route {
-            cidr: IpCidr::Ipv6(self.to_cidr()),
-            via_router: IpAddress::Ipv6(ipv6_address(&self.gateway)),
+            cidr: self.to_cidr(),
+            via_router: ip_address(&self.gateway).expect("validated route gateway"),
             preferred_until: None,
             expires_at: None,
         }
     }
 
-    fn to_cidr(&self) -> Ipv6Cidr {
-        Ipv6Cidr::new(ipv6_address(&self.destination), self.prefix_length)
+    fn to_cidr(&self) -> IpCidr {
+        match ip_address(&self.destination).expect("validated route destination") {
+            IpAddress::Ipv4(address) => IpCidr::Ipv4(Ipv4Cidr::new(address, self.prefix_length)),
+            IpAddress::Ipv6(address) => IpCidr::Ipv6(Ipv6Cidr::new(address, self.prefix_length)),
+        }
     }
 }
 
-fn ipv6_address(bytes: &[u8]) -> Ipv6Address {
-    let octets: [u8; 16] = bytes.try_into().expect("validated IPv6 address length");
-    Ipv6Address::from_octets(octets)
+fn ip_address(bytes: &[u8]) -> Option<IpAddress> {
+    match bytes {
+        octets if octets.len() == 4 => {
+            let octets: [u8; 4] = octets.try_into().ok()?;
+            Some(IpAddress::Ipv4(Ipv4Address::from_octets(octets)))
+        }
+        octets if octets.len() == 16 => {
+            let octets: [u8; 16] = octets.try_into().ok()?;
+            if octets[..10].iter().all(|byte| *byte == 0) && octets[10..12] == [0xff, 0xff] {
+                None
+            } else {
+                Some(IpAddress::Ipv6(Ipv6Address::from_octets(octets)))
+            }
+        }
+        _ => None,
+    }
 }
 
-fn multicast(bytes: &[u8]) -> bool {
-    bytes.first() == Some(&0xff)
+fn same_family(left: IpAddress, right: IpAddress) -> bool {
+    matches!(
+        (left, right),
+        (IpAddress::Ipv4(_), IpAddress::Ipv4(_)) | (IpAddress::Ipv6(_), IpAddress::Ipv6(_))
+    )
 }
 
-fn unspecified(bytes: &[u8]) -> bool {
-    bytes.iter().all(|byte| *byte == 0)
+fn prefix_limit(address: IpAddress) -> u8 {
+    match address {
+        IpAddress::Ipv4(_) => 32,
+        IpAddress::Ipv6(_) => 128,
+    }
+}
+
+fn tcp_listener_target(packet: &[u8]) -> Option<(IpAddress, u16)> {
+    let (destination, next_header, transport) = match packet.first()? >> 4 {
+        4 => {
+            let ipv4 = Ipv4Packet::new_checked(packet).ok()?;
+            (
+                IpAddress::Ipv4(ipv4.dst_addr()),
+                ipv4.next_header(),
+                ipv4.payload(),
+            )
+        }
+        6 => {
+            let ipv6 = Ipv6Packet::new_checked(packet).ok()?;
+            let mut next_header = ipv6.next_header();
+            let mut transport = ipv6.payload();
+
+            if next_header == IpProtocol::HopByHop {
+                let extension = Ipv6ExtHeader::new_checked(transport).ok()?;
+                next_header = extension.next_header();
+                let header_len = (usize::from(extension.header_len()) + 1) * 8;
+                transport = transport.get(header_len..)?;
+            }
+
+            (IpAddress::Ipv6(ipv6.dst_addr()), next_header, transport)
+        }
+        _ => return None,
+    };
+
+    if next_header != IpProtocol::Tcp {
+        return None;
+    }
+
+    let tcp = TcpPacket::new_checked(transport).ok()?;
+    (tcp.syn() && !tcp.ack()).then_some((destination, tcp.dst_port()))
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -2169,7 +2331,6 @@ pub enum StackError {
     InvalidLimits,
     InvalidStackConfig,
     InvalidPacket,
-    UnsupportedFamily,
     PacketTooLarge,
     OwnershipInvariantViolation,
 }
@@ -2183,6 +2344,7 @@ pub struct Effects {
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 struct ConnectionKey {
+    family: AddressFamily,
     local_address: [u8; 16],
     local_port: u16,
     remote_address: [u8; 16],
@@ -2197,15 +2359,30 @@ struct ListenerMemberKey {
 
 impl ConnectionKey {
     fn new(local: IpEndpoint, remote: IpEndpoint) -> Self {
-        let IpAddress::Ipv6(local_address) = local.addr;
-        let IpAddress::Ipv6(remote_address) = remote.addr;
+        debug_assert!(same_family(local.addr, remote.addr));
+        let family = match local.addr {
+            IpAddress::Ipv4(_) => AddressFamily::Inet,
+            IpAddress::Ipv6(_) => AddressFamily::Inet6,
+        };
 
         Self {
-            local_address: local_address.octets(),
+            family,
+            local_address: address_key(local.addr),
             local_port: local.port,
-            remote_address: remote_address.octets(),
+            remote_address: address_key(remote.addr),
             remote_port: remote.port,
         }
+    }
+}
+
+fn address_key(address: IpAddress) -> [u8; 16] {
+    match address {
+        IpAddress::Ipv4(address) => {
+            let mut key = [0; 16];
+            key[..4].copy_from_slice(&address.octets());
+            key
+        }
+        IpAddress::Ipv6(address) => address.octets(),
     }
 }
 

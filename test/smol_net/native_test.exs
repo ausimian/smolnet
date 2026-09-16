@@ -101,7 +101,7 @@ defmodule SmolNet.NativeTest do
     link_local = [0xFE, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]
     config = %{mtu: 1_280, addresses: [%{address: global, prefix_length: 64}], routes: []}
     {:ok, %{result: resource}} = Native.stack_new(Stack.default_limits(), config, 0)
-    {:ok, %{result: identity}} = Native.tcp_open(resource)
+    {:ok, %{result: identity}} = Native.tcp_open(resource, :inet6)
     huge_integer = 1_267_650_600_228_229_401_496_703_205_376
 
     assert Native.tcp_bind(resource, identity, %{}) == {:error, :invalid_address}
@@ -158,7 +158,7 @@ defmodule SmolNet.NativeTest do
     assert Native.health() == :ok
   end
 
-  test "native ingress defensively rejects invalid and non-IPv6 packets" do
+  test "native ingress defensively rejects malformed IP packets" do
     config = %{mtu: 1_280, addresses: [], routes: []}
     {:ok, %{result: resource}} = Native.stack_new(Stack.default_limits(), config, 0)
 
@@ -166,7 +166,7 @@ defmodule SmolNet.NativeTest do
              {:error, :invalid_packet}
 
     assert Native.stack_ingress(resource, <<4::4, 0::316>>, 0) ==
-             {:error, :unsupported_family}
+             {:error, :invalid_packet}
 
     assert Native.stack_ingress(resource, <<6::4, 0::28, 1::16, 59, 64, 0::256>>, 0) ==
              {:error, :invalid_packet}
@@ -180,7 +180,7 @@ defmodule SmolNet.NativeTest do
     assert Native.health() == :ok
   end
 
-  test "native configuration rejects multicast interface addresses without panicking" do
+  test "native configuration rejects multicast and broadcast addresses without panicking" do
     multicast = [0xFF, 2] ++ List.duplicate(0, 14)
 
     config = %{
@@ -190,6 +190,15 @@ defmodule SmolNet.NativeTest do
     }
 
     assert Native.stack_new(Stack.default_limits(), config, 0) ==
+             {:error, :invalid_stack_config}
+
+    broadcast_config = %{
+      mtu: 1_280,
+      addresses: [%{address: [255, 255, 255, 255], prefix_length: 32}],
+      routes: []
+    }
+
+    assert Native.stack_new(Stack.default_limits(), broadcast_config, 0) ==
              {:error, :invalid_stack_config}
 
     assert Native.health() == :ok

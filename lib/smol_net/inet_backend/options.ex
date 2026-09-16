@@ -11,6 +11,7 @@ defmodule SmolNet.InetBackend.Options do
 
   @enforce_keys [:stack]
   defstruct stack: nil,
+            family: :inet6,
             active: true,
             mode: :list,
             packet: :raw,
@@ -28,6 +29,7 @@ defmodule SmolNet.InetBackend.Options do
 
   @type t :: %__MODULE__{
           stack: Ref.t(),
+          family: :inet | :inet6,
           active: active(),
           mode: :binary | :list,
           packet: packet(),
@@ -35,7 +37,7 @@ defmodule SmolNet.InetBackend.Options do
           buffer: pos_integer(),
           send_timeout: timeout(),
           send_timeout_close: boolean(),
-          bind_address: :inet.ip6_address() | nil,
+          bind_address: :inet.ip_address() | nil,
           bind_port: :inet.port_number(),
           bind_scope_id: non_neg_integer(),
           backlog: pos_integer()
@@ -44,8 +46,11 @@ defmodule SmolNet.InetBackend.Options do
   @spec parse(list()) :: {:ok, t()} | {:error, atom()}
   def parse(options) when is_list(options) do
     case fetch_stack(options) do
-      {:ok, stack} -> reduce(options, %__MODULE__{stack: stack}, :connect)
-      {:error, _reason} = error -> error
+      {:ok, stack} ->
+        reduce(options, %__MODULE__{stack: stack, family: family(options)}, :connect)
+
+      {:error, _reason} = error ->
+        error
     end
   end
 
@@ -55,8 +60,15 @@ defmodule SmolNet.InetBackend.Options do
   def parse_listen(options, port)
       when is_list(options) and is_integer(port) and port in 0..65_535 do
     case fetch_stack(options) do
-      {:ok, stack} -> reduce(options, %__MODULE__{stack: stack, bind_port: port}, :listen)
-      {:error, _reason} = error -> error
+      {:ok, stack} ->
+        reduce(
+          options,
+          %__MODULE__{stack: stack, bind_port: port, family: family(options)},
+          :listen
+        )
+
+      {:error, _reason} = error ->
+        error
     end
   end
 
@@ -95,13 +107,19 @@ defmodule SmolNet.InetBackend.Options do
   def local_endpoint(%__MODULE__{bind_address: nil, bind_port: 0}), do: nil
 
   def local_endpoint(%__MODULE__{} = options) do
-    %{
-      family: :inet6,
-      addr: options.bind_address || {0, 0, 0, 0, 0, 0, 0, 0},
-      port: options.bind_port,
-      flowinfo: 0,
-      scope_id: options.bind_scope_id
+    endpoint = %{
+      family: options.family,
+      addr: options.bind_address || any_address(options.family),
+      port: options.bind_port
     }
+
+    if options.family == :inet6,
+      do: Map.merge(endpoint, %{flowinfo: 0, scope_id: options.bind_scope_id}),
+      else: endpoint
+  end
+
+  defp family(options) do
+    if :inet in options and :inet6 not in options, do: :inet, else: :inet6
   end
 
   defp fetch_stack(options) do
@@ -128,11 +146,13 @@ defmodule SmolNet.InetBackend.Options do
        when context in [:connect, :listen],
        do: {:error, :einval}
 
-  defp put_option(options, :inet6, context) when context in [:connect, :listen],
-    do: {:ok, options}
+  defp put_option(%{family: family} = options, family, context)
+       when family in [:inet, :inet6] and context in [:connect, :listen],
+       do: {:ok, options}
 
-  defp put_option(_options, :inet, context) when context in [:connect, :listen],
-    do: {:error, :eafnosupport}
+  defp put_option(_options, family, context)
+       when family in [:inet, :inet6] and context in [:connect, :listen],
+       do: {:error, :eafnosupport}
 
   defp put_option(options, :binary, _context), do: {:ok, %{options | mode: :binary}}
   defp put_option(options, :list, _context), do: {:ok, %{options | mode: :list}}
@@ -173,7 +193,8 @@ defmodule SmolNet.InetBackend.Options do
     {:ok, %{options | send_timeout_close: close?}}
   end
 
-  defp put_option(options, {:ipv6_v6only, true}, _context), do: {:ok, options}
+  defp put_option(%{family: :inet6} = options, {:ipv6_v6only, true}, _context),
+    do: {:ok, options}
 
   defp put_option(options, {:ip, address}, context) when context in [:connect, :listen] do
     put_bind_address(options, address)
@@ -203,26 +224,30 @@ defmodule SmolNet.InetBackend.Options do
 
   defp put_option(_options, _option, _context), do: {:error, :einval}
 
-  defp put_ifaddr(options, %{family: :inet6, addr: address} = sockaddr) do
+  defp put_ifaddr(%{family: family} = options, %{family: family, addr: address} = sockaddr) do
     with {:ok, options} <- put_bind_address(options, address),
          {:ok, port} <- bind_port(Map.get(sockaddr, :port, options.bind_port)),
-         {:ok, scope_id} <- scope_id(Map.get(sockaddr, :scope_id, 0)) do
+         {:ok, scope_id} <- family_scope(family, Map.get(sockaddr, :scope_id, 0)) do
       {:ok, %{options | bind_port: port, bind_scope_id: scope_id}}
     end
   end
 
-  defp put_ifaddr(_options, %{family: :inet}), do: {:error, :eafnosupport}
+  defp put_ifaddr(_options, %{family: family}) when family in [:inet, :inet6],
+    do: {:error, :eafnosupport}
+
   defp put_ifaddr(options, address), do: put_bind_address(options, address)
 
   defp put_bind_address(options, :any) do
-    {:ok, %{options | bind_address: {0, 0, 0, 0, 0, 0, 0, 0}}}
+    {:ok, %{options | bind_address: any_address(options.family)}}
   end
 
   defp put_bind_address(options, :loopback) do
-    {:ok, %{options | bind_address: {0, 0, 0, 0, 0, 0, 0, 1}}}
+    address = if options.family == :inet, do: {127, 0, 0, 1}, else: {0, 0, 0, 0, 0, 0, 0, 1}
+    {:ok, %{options | bind_address: address}}
   end
 
-  defp put_bind_address(options, address) when is_tuple(address) and tuple_size(address) == 8 do
+  defp put_bind_address(%{family: :inet6} = options, address)
+       when is_tuple(address) and tuple_size(address) == 8 do
     if address |> Tuple.to_list() |> Enum.all?(&(is_integer(&1) and &1 in 0..65_535)) do
       {:ok, %{options | bind_address: address}}
     else
@@ -230,8 +255,18 @@ defmodule SmolNet.InetBackend.Options do
     end
   end
 
-  defp put_bind_address(_options, address) when is_tuple(address) and tuple_size(address) == 4,
-    do: {:error, :eafnosupport}
+  defp put_bind_address(%{family: :inet} = options, address)
+       when is_tuple(address) and tuple_size(address) == 4 do
+    if address |> Tuple.to_list() |> Enum.all?(&(is_integer(&1) and &1 in 0..255)) do
+      {:ok, %{options | bind_address: address, bind_scope_id: 0}}
+    else
+      {:error, :einval}
+    end
+  end
+
+  defp put_bind_address(_options, address)
+       when is_tuple(address) and tuple_size(address) in [4, 8],
+       do: {:error, :eafnosupport}
 
   defp put_bind_address(_options, _address), do: {:error, :einval}
 
@@ -242,6 +277,13 @@ defmodule SmolNet.InetBackend.Options do
     do: {:ok, scope_id}
 
   defp scope_id(_scope_id), do: {:error, :einval}
+
+  defp family_scope(:inet, 0), do: {:ok, 0}
+  defp family_scope(:inet, _scope_id), do: {:error, :einval}
+  defp family_scope(:inet6, scope_id), do: scope_id(scope_id)
+
+  defp any_address(:inet), do: {0, 0, 0, 0}
+  defp any_address(:inet6), do: {0, 0, 0, 0, 0, 0, 0, 0}
 
   defp normalize_active(0), do: {:ok, false}
   defp normalize_active(active) when active in [false, true, :once], do: {:ok, active}
