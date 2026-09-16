@@ -6,6 +6,8 @@ defmodule SmolNet.InetBackend.Options do
   @default_buffer 65_536
   @max_buffer 1_048_576
   @max_timeout 4_294_967_295
+  @default_backlog 5
+  @max_backlog 128
 
   @enforce_keys [:stack]
   defstruct stack: nil,
@@ -18,7 +20,8 @@ defmodule SmolNet.InetBackend.Options do
             send_timeout_close: false,
             bind_address: nil,
             bind_port: 0,
-            bind_scope_id: 0
+            bind_scope_id: 0,
+            backlog: @default_backlog
 
   @type active :: false | true | :once | 1..32_767
   @type packet :: :raw | :line | 1 | 2 | 4
@@ -34,7 +37,8 @@ defmodule SmolNet.InetBackend.Options do
           send_timeout_close: boolean(),
           bind_address: :inet.ip6_address() | nil,
           bind_port: :inet.port_number(),
-          bind_scope_id: non_neg_integer()
+          bind_scope_id: non_neg_integer(),
+          backlog: pos_integer()
         }
 
   @spec parse(list()) :: {:ok, t()} | {:error, atom()}
@@ -46,6 +50,17 @@ defmodule SmolNet.InetBackend.Options do
   end
 
   def parse(_options), do: {:error, :einval}
+
+  @spec parse_listen(list(), :inet.port_number()) :: {:ok, t()} | {:error, atom()}
+  def parse_listen(options, port)
+      when is_list(options) and is_integer(port) and port in 0..65_535 do
+    case fetch_stack(options) do
+      {:ok, stack} -> reduce(options, %__MODULE__{stack: stack, bind_port: port}, :listen)
+      {:error, _reason} = error -> error
+    end
+  end
+
+  def parse_listen(_options, _port), do: {:error, :einval}
 
   @spec update(t(), list()) :: {:ok, t()} | {:error, atom()}
   def update(%__MODULE__{} = current, options) when is_list(options) do
@@ -105,10 +120,20 @@ defmodule SmolNet.InetBackend.Options do
     end)
   end
 
-  defp put_option(options, {:smolnet_stack, %Ref{}}, :connect), do: {:ok, options}
-  defp put_option(_options, {:smolnet_stack, _stack}, :connect), do: {:error, :einval}
-  defp put_option(options, :inet6, :connect), do: {:ok, options}
-  defp put_option(_options, :inet, :connect), do: {:error, :eafnosupport}
+  defp put_option(options, {:smolnet_stack, %Ref{}}, context)
+       when context in [:connect, :listen],
+       do: {:ok, options}
+
+  defp put_option(_options, {:smolnet_stack, _stack}, context)
+       when context in [:connect, :listen],
+       do: {:error, :einval}
+
+  defp put_option(options, :inet6, context) when context in [:connect, :listen],
+    do: {:ok, options}
+
+  defp put_option(_options, :inet, context) when context in [:connect, :listen],
+    do: {:error, :eafnosupport}
+
   defp put_option(options, :binary, _context), do: {:ok, %{options | mode: :binary}}
   defp put_option(options, :list, _context), do: {:ok, %{options | mode: :list}}
   defp put_option(options, {:mode, mode}, context), do: put_option(options, mode, context)
@@ -150,21 +175,29 @@ defmodule SmolNet.InetBackend.Options do
 
   defp put_option(options, {:ipv6_v6only, true}, _context), do: {:ok, options}
 
-  defp put_option(options, {:ip, address}, :connect) do
+  defp put_option(options, {:ip, address}, context) when context in [:connect, :listen] do
     put_bind_address(options, address)
   end
 
-  defp put_option(options, {:ifaddr, address}, :connect) do
+  defp put_option(options, {:ifaddr, address}, context) when context in [:connect, :listen] do
     put_ifaddr(options, address)
   end
 
-  defp put_option(options, {:port, port}, :connect) when is_integer(port) and port in 0..65_535 do
+  defp put_option(options, {:port, port}, context)
+       when context in [:connect, :listen] and is_integer(port) and port in 0..65_535 do
     {:ok, %{options | bind_port: port}}
+  end
+
+  defp put_option(options, {:backlog, backlog}, :listen)
+       when is_integer(backlog) and backlog in 1..@max_backlog do
+    {:ok, %{options | backlog: backlog}}
   end
 
   defp put_option(_options, option, :runtime)
        when option in [:inet, :inet6] or
-              (is_tuple(option) and elem(option, 0) in [:smolnet_stack, :ip, :ifaddr, :port]) do
+              (is_tuple(option) and
+                 tuple_size(option) > 0 and
+                 elem(option, 0) in [:smolnet_stack, :ip, :ifaddr, :port, :backlog]) do
     {:error, :einval}
   end
 
@@ -226,6 +259,7 @@ defmodule SmolNet.InetBackend.Options do
   defp option_value(options, :buffer), do: {:ok, {:buffer, options.buffer}}
   defp option_value(options, :recbuf), do: {:ok, {:recbuf, options.buffer}}
   defp option_value(options, :send_timeout), do: {:ok, {:send_timeout, options.send_timeout}}
+  defp option_value(options, :backlog), do: {:ok, {:backlog, options.backlog}}
 
   defp option_value(options, :send_timeout_close),
     do: {:ok, {:send_timeout_close, options.send_timeout_close}}

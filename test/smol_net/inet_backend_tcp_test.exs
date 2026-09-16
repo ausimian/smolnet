@@ -363,7 +363,7 @@ defmodule SmolNet.InetBackendTcpTest do
     assert IPv6TcpPeer.stats(first_peer).received == ""
   end
 
-  test "shutdown and unsupported family/listener paths return stable errors" do
+  test "shutdown and unsupported family paths return stable errors" do
     {stack, _peer} = stack_and_peer()
     {:ok, socket} = :gen_tcp.connect(@peer, 443, client_options(stack), 1_000)
 
@@ -373,7 +373,8 @@ defmodule SmolNet.InetBackendTcpTest do
     assert {:error, :eafnosupport} =
              :gen_tcp.connect({127, 0, 0, 1}, 443, client_options(stack), 10)
 
-    assert {:error, :enotsup} = :gen_tcp.listen(0, client_options(stack))
+    assert {:ok, listener} = :gen_tcp.listen(0, client_options(stack))
+    assert :ok = :gen_tcp.close(listener)
   end
 
   test "invalid options and socket calls fail explicitly" do

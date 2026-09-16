@@ -6,9 +6,9 @@ defmodule SmolNet.InetBackend.Tcp do
   with the `:smolnet_stack` option. Each returned OTP socket is backed by one
   temporary `:gen_statem` child of that stack's inet supervisor.
 
-  This phase supports outbound IPv6 clients. IPv4, listen/accept, file
-  descriptors, and packet modes other than raw, line, 1, 2, and 4 fail
-  explicitly.
+  This backend supports outbound IPv6 clients and reusable bounded IPv6
+  listeners. IPv4, file descriptors, and packet modes other than raw, line,
+  1, 2, and 4 fail explicitly.
   """
 
   @behaviour :gen_statem
@@ -86,21 +86,23 @@ defmodule SmolNet.InetBackend.Tcp do
 
   def connect(_address, _port, _options, _timeout), do: {:error, :einval}
 
-  @spec listen(term(), list()) :: {:error, :enotsup}
-  def listen(_port, _options), do: {:error, :enotsup}
-
-  @spec accept(socket_term(), timeout()) :: {:error, :enotsup | :closed}
-  def accept(socket, _timeout) do
-    case socket_pid(socket) do
-      pid when is_pid(pid) ->
-        if Process.alive?(pid), do: {:error, :enotsup}, else: {:error, :closed}
-
-      _other ->
-        {:error, :closed}
+  @spec listen(:inet.port_number(), list()) :: {:ok, socket_term()} | {:error, atom()}
+  def listen(port, options) do
+    with {:ok, parsed} <- Options.parse_listen(options, port) do
+      start_listener(parsed)
     end
   end
 
-  @spec accept(socket_term()) :: {:error, :enotsup | :closed}
+  @spec accept(socket_term(), timeout()) :: {:ok, socket_term()} | {:error, atom()}
+  def accept(socket, timeout)
+      when timeout == :infinity or
+             (is_integer(timeout) and timeout >= 0 and timeout <= @max_timeout) do
+    socket_call(socket, {:accept, deadline(timeout)})
+  end
+
+  def accept(_socket, _timeout), do: {:error, :einval}
+
+  @spec accept(socket_term()) :: {:ok, socket_term()} | {:error, atom()}
   def accept(socket), do: accept(socket, :infinity)
 
   @spec fdopen(term(), list()) :: {:error, :enotsup}
@@ -221,33 +223,35 @@ defmodule SmolNet.InetBackend.Tcp do
 
   @impl true
   def init(%{owner: owner, endpoint: endpoint, options: %Options{} = options}) do
-    Process.flag(:trap_exit, true)
-    stack_pid = options.stack.stack
-
-    data = %{
-      owner: owner,
-      owner_monitor: Process.monitor(owner),
-      stack: options.stack,
-      stack_pid: stack_pid,
-      stack_monitor: Process.monitor(stack_pid),
-      options: options,
-      endpoint: endpoint,
-      public_socket: module_socket(self()),
-      low_socket: nil,
-      connect_result: nil,
-      connect_select: nil,
-      connect_from: nil,
-      connect_deadline: nil,
-      connect_timer: nil,
-      read: nil,
-      read_buffer: <<>>,
-      read_scheduled: false,
-      read_closed: false,
-      write: nil,
-      transfer: nil
-    }
+    data = base_data(owner, options, :stream, endpoint, nil)
 
     {:ok, :connecting, data, [{:next_event, :internal, :continue_setup}]}
+  end
+
+  def init(%{owner: owner, role: :listener, options: %Options{} = options}) do
+    data = base_data(owner, options, :listener, nil, nil)
+
+    with {:ok, socket} <- SmolNet.open(:inet6, :stream, :tcp, stack: options.stack),
+         :ok <- Stack.socket_watch_owner(socket, self()),
+         :ok <- SmolNet.bind(socket, listener_endpoint(options)),
+         :ok <- SmolNet.listen(socket, options.backlog) do
+      {:ok, :listening, %{data | low_socket: socket}}
+    else
+      {:error, reason} -> {:stop, translate_reason(reason)}
+    end
+  end
+
+  def init(%{
+        owner: owner,
+        accepted_socket: %Socket{} = socket,
+        options: %Options{} = options
+      }) do
+    data = base_data(owner, options, :stream, nil, socket)
+
+    case Stack.socket_watch_owner(socket, self()) do
+      :ok -> {:ok, :connected, data, [{:next_event, :internal, :drain_active}]}
+      {:error, reason} -> {:stop, translate_reason(reason)}
+    end
   end
 
   @impl true
@@ -295,6 +299,78 @@ defmodule SmolNet.InetBackend.Tcp do
     else
       {:keep_state_and_data, [{:reply, from, {:error, :ealready}}]}
     end
+  end
+
+  def handle_event({:call, from}, {:accept, deadline}, :listening, data) do
+    if data.accept do
+      {:keep_state_and_data, [{:reply, from, {:error, :busy}}]}
+    else
+      {timer, token} = arm_timer(:accept, deadline)
+
+      accept = %{
+        from: from,
+        select: nil,
+        deadline: deadline,
+        timer: {timer, token}
+      }
+
+      data
+      |> Map.put(:accept, accept)
+      |> drive_accept()
+      |> state_return()
+    end
+  end
+
+  def handle_event({:call, from}, :close, :listening, data) do
+    data = fail_accept(data, :closed)
+    _result = close_low_socket(data)
+    {:stop_and_reply, :normal, [{:reply, from, :ok}], %{data | low_socket: nil}}
+  end
+
+  def handle_event({:call, from}, :sockname, :listening, data) do
+    {:keep_state_and_data, [{:reply, from, endpoint_result(SmolNet.sockname(data.low_socket))}]}
+  end
+
+  def handle_event({:call, from}, :peername, :listening, _data) do
+    {:keep_state_and_data, [{:reply, from, {:error, :enotconn}}]}
+  end
+
+  def handle_event({:call, from}, {:setopts, options}, :listening, data) do
+    case Options.update(data.options, options) do
+      {:ok, updated} -> {:keep_state, %{data | options: updated}, [{:reply, from, :ok}]}
+      {:error, reason} -> {:keep_state_and_data, [{:reply, from, {:error, reason}}]}
+    end
+  end
+
+  def handle_event({:call, from}, {:getopts, names}, :listening, data) do
+    {:keep_state_and_data, [{:reply, from, Options.get(data.options, names)}]}
+  end
+
+  def handle_event({:call, from}, {:begin_transfer, new_owner}, :listening, data) do
+    begin_transfer(from, new_owner, data)
+  end
+
+  def handle_event({:call, from}, {:commit_transfer, token, messages}, :listening, data) do
+    commit_transfer(from, token, messages, data)
+  end
+
+  def handle_event({:call, from}, :info, :listening, data) do
+    info = %{
+      owner: data.owner,
+      state: :listening,
+      backlog: data.options.backlog,
+      accept_pending: data.accept != nil
+    }
+
+    {:keep_state_and_data, [{:reply, from, info}]}
+  end
+
+  def handle_event({:call, from}, {:getstat, names}, :listening, _data) do
+    {:keep_state_and_data, [{:reply, from, getstat_reply(names)}]}
+  end
+
+  def handle_event({:call, from}, _request, :listening, _data) do
+    {:keep_state_and_data, [{:reply, from, {:error, :enotsup}}]}
   end
 
   def handle_event({:call, from}, {:send, packet}, :connected, data) do
@@ -409,24 +485,7 @@ defmodule SmolNet.InetBackend.Tcp do
   end
 
   def handle_event({:call, from}, {:getstat, names}, :connected, _data) do
-    supported = [
-      :recv_avg,
-      :recv_cnt,
-      :recv_dvi,
-      :recv_max,
-      :recv_oct,
-      :send_avg,
-      :send_cnt,
-      :send_pend,
-      :send_max,
-      :send_oct
-    ]
-
-    if is_list(names) and Enum.all?(names, &(&1 in supported)) do
-      {:keep_state_and_data, [{:reply, from, {:ok, Enum.map(names, &{&1, 0})}}]}
-    else
-      {:keep_state_and_data, [{:reply, from, {:error, :einval}}]}
-    end
+    {:keep_state_and_data, [{:reply, from, getstat_reply(names)}]}
   end
 
   def handle_event({:call, from}, _request, :connected, _data) do
@@ -478,6 +537,18 @@ defmodule SmolNet.InetBackend.Tcp do
       {_timer, ^token} ->
         data = data |> cancel_connect_select() |> clear_connect_timer()
         complete_connect({:error, :timeout}, data) |> state_return()
+
+      _other ->
+        :keep_state_and_data
+    end
+  end
+
+  def handle_event(:info, {:operation_timeout, :accept, token}, :listening, data) do
+    case data.accept do
+      %{timer: {_timer, ^token}} = accept ->
+        data = cancel_accept_select(data)
+        :gen_statem.reply(accept.from, {:error, :timeout})
+        {:keep_state, %{data | accept: nil}}
 
       _other ->
         :keep_state_and_data
@@ -542,6 +613,27 @@ defmodule SmolNet.InetBackend.Tcp do
     :ok
   end
 
+  defp getstat_reply(names) do
+    supported = [
+      :recv_avg,
+      :recv_cnt,
+      :recv_dvi,
+      :recv_max,
+      :recv_oct,
+      :send_avg,
+      :send_cnt,
+      :send_pend,
+      :send_max,
+      :send_oct
+    ]
+
+    if is_list(names) and Enum.all?(names, &(&1 in supported)) do
+      {:ok, Enum.map(names, &{&1, 0})}
+    else
+      {:error, :einval}
+    end
+  end
+
   defp start_client(endpoint, %Options{} = options, timeout)
        when timeout == :infinity or
               (is_integer(timeout) and timeout >= 0 and timeout <= @max_timeout) do
@@ -558,6 +650,69 @@ defmodule SmolNet.InetBackend.Tcp do
   end
 
   defp start_client(_endpoint, _options, _timeout), do: {:error, :einval}
+
+  defp start_listener(%Options{} = options) do
+    owner = self()
+    child = child_spec(%{owner: owner, role: :listener, options: options})
+
+    case StackSupervisor.start_inet_backend(options.stack, child) do
+      {:ok, pid} -> {:ok, module_socket(pid)}
+      {:error, reason} -> {:error, start_error(reason)}
+    end
+  catch
+    :exit, _reason -> {:error, :closed}
+  end
+
+  defp start_accepted(socket, %Options{} = options, owner) do
+    child = child_spec(%{owner: owner, accepted_socket: socket, options: options})
+
+    case StackSupervisor.start_inet_backend(options.stack, child) do
+      {:ok, pid} -> {:ok, module_socket(pid)}
+      {:error, reason} -> {:error, start_error(reason)}
+    end
+  catch
+    :exit, _reason -> {:error, :closed}
+  end
+
+  defp base_data(owner, options, kind, endpoint, low_socket) do
+    Process.flag(:trap_exit, true)
+    stack_pid = options.stack.stack
+
+    %{
+      kind: kind,
+      owner: owner,
+      owner_monitor: Process.monitor(owner),
+      stack: options.stack,
+      stack_pid: stack_pid,
+      stack_monitor: Process.monitor(stack_pid),
+      options: options,
+      endpoint: endpoint,
+      public_socket: module_socket(self()),
+      low_socket: low_socket,
+      connect_result: nil,
+      connect_select: nil,
+      connect_from: nil,
+      connect_deadline: nil,
+      connect_timer: nil,
+      accept: nil,
+      read: nil,
+      read_buffer: <<>>,
+      read_scheduled: false,
+      read_closed: false,
+      write: nil,
+      transfer: nil
+    }
+  end
+
+  defp listener_endpoint(options) do
+    %{
+      family: :inet6,
+      addr: options.bind_address || {0, 0, 0, 0, 0, 0, 0, 0},
+      port: options.bind_port,
+      flowinfo: 0,
+      scope_id: options.bind_scope_id
+    }
+  end
 
   defp handle_continue(data, :open_and_connect) do
     case SmolNet.open(:inet6, :stream, :tcp, stack: data.stack) do
@@ -578,6 +733,34 @@ defmodule SmolNet.InetBackend.Tcp do
 
   defp maybe_bind(_socket, nil), do: :ok
   defp maybe_bind(socket, endpoint), do: SmolNet.bind(socket, endpoint)
+
+  defp drive_accept(%{accept: nil} = data), do: {:keep, data}
+
+  defp drive_accept(data) do
+    case Stack.socket_accept(data.low_socket, self()) do
+      {:ok, child} ->
+        accept = cancel_op_timer(data.accept)
+
+        case start_accepted(child, data.options, from_pid(accept.from)) do
+          {:ok, socket} ->
+            :gen_statem.reply(accept.from, {:ok, socket})
+            {:keep, %{data | accept: nil}}
+
+          {:error, reason} ->
+            _result = SmolNet.close(child)
+            :gen_statem.reply(accept.from, {:error, reason})
+            {:keep, %{data | accept: nil}}
+        end
+
+      {:select, select_info} ->
+        {:keep, put_in(data, [:accept, :select], select_info)}
+
+      {:error, reason} ->
+        accept = cancel_op_timer(data.accept)
+        :gen_statem.reply(accept.from, {:error, translate_reason(reason)})
+        {:keep, %{data | accept: nil}}
+    end
+  end
 
   defp attempt_connect(data) do
     case SmolNet.connect(data.low_socket, data.endpoint, :nowait) do
@@ -646,6 +829,14 @@ defmodule SmolNet.InetBackend.Tcp do
     end
   end
 
+  defp handle_select(reference, :listening, data) do
+    if accept_reference(data.accept) == reference do
+      data |> put_in([:accept, :select], nil) |> drive_accept() |> state_return()
+    else
+      :keep_state_and_data
+    end
+  end
+
   defp handle_select(reference, :connected, data) do
     cond do
       read_reference(data.read) == reference ->
@@ -666,6 +857,16 @@ defmodule SmolNet.InetBackend.Tcp do
     if select_reference(data.connect_select) == reference do
       data = Map.put(data, :connect_select, nil)
       complete_connect({:error, reason}, data) |> state_return()
+    else
+      :keep_state_and_data
+    end
+  end
+
+  defp handle_abort(reference, reason, :listening, data) do
+    if accept_reference(data.accept) == reference do
+      accept = cancel_op_timer(data.accept)
+      :gen_statem.reply(accept.from, {:error, reason})
+      {:keep_state, %{data | accept: nil}}
     else
       :keep_state_and_data
     end
@@ -749,6 +950,22 @@ defmodule SmolNet.InetBackend.Tcp do
   defp cancel_write_select(data) do
     _cancelled = SmolNet.cancel(data.low_socket, data.write.select)
     put_in(data, [:write, :select], nil)
+  end
+
+  defp cancel_accept_select(%{accept: %{select: nil}} = data), do: data
+
+  defp cancel_accept_select(data) do
+    _cancelled = SmolNet.cancel(data.low_socket, data.accept.select)
+    put_in(data, [:accept, :select], nil)
+  end
+
+  defp fail_accept(%{accept: nil} = data, _reason), do: data
+
+  defp fail_accept(data, reason) do
+    data = cancel_accept_select(data)
+    accept = cancel_op_timer(data.accept)
+    :gen_statem.reply(accept.from, {:error, reason})
+    %{data | accept: nil}
   end
 
   defp drive_read(%{read: nil} = data, _chunks, _deliveries), do: {:keep, data}
@@ -1122,7 +1339,7 @@ defmodule SmolNet.InetBackend.Tcp do
 
       not Process.alive?(transfer.new_owner) ->
         data = %{data | transfer: nil}
-        data = schedule_active_read(data)
+        data = resume_after_transfer(data)
         {:keep_state, data, [{:reply, from, {:error, :badarg}}]}
 
       true ->
@@ -1137,7 +1354,7 @@ defmodule SmolNet.InetBackend.Tcp do
         }
 
         Enum.each(messages, &Kernel.send(transfer.new_owner, &1))
-        data = schedule_active_read(data)
+        data = resume_after_transfer(data)
         {:keep_state, data, [{:reply, from, :ok}]}
     end
   end
@@ -1149,6 +1366,10 @@ defmodule SmolNet.InetBackend.Tcp do
   defp fail_all(data, reason) do
     if data.connect_from do
       :gen_statem.reply(data.connect_from, {:error, reason})
+    end
+
+    if data.accept do
+      :gen_statem.reply(data.accept.from, {:error, reason})
     end
 
     if match?(%{kind: :passive}, data.read) do
@@ -1164,7 +1385,7 @@ defmodule SmolNet.InetBackend.Tcp do
       :gen_statem.reply(data.write.from, {:error, reason})
     end
 
-    %{data | connect_from: nil, read: nil, write: nil}
+    %{data | connect_from: nil, accept: nil, read: nil, write: nil}
   end
 
   defp endpoint(%{family: :inet6, addr: address, port: port} = sockaddr)
@@ -1271,6 +1492,12 @@ defmodule SmolNet.InetBackend.Tcp do
   defp write_reference(%{select: select}), do: select_reference(select)
   defp write_reference(_write), do: nil
 
+  defp accept_reference(%{select: select}), do: select_reference(select)
+  defp accept_reference(_accept), do: nil
+
+  defp resume_after_transfer(%{kind: :listener} = data), do: data
+  defp resume_after_transfer(data), do: schedule_active_read(data)
+
   defp close_low_socket(%{low_socket: %Socket{} = socket}), do: SmolNet.close(socket)
   defp close_low_socket(_data), do: :ok
 
@@ -1293,6 +1520,11 @@ defmodule SmolNet.InetBackend.Tcp do
   defp start_error({:already_started, _pid}), do: :ealready
   defp start_error(:max_children), do: :system_limit
   defp start_error({:shutdown, reason}), do: start_error(reason)
+
+  defp start_error(reason)
+       when reason in [:eaddrinuse, :eaddrnotavail, :eafnosupport, :einval, :system_limit],
+       do: reason
+
   defp start_error(_reason), do: :closed
 
   defp translate_reason(:connection_refused), do: :econnrefused
@@ -1313,6 +1545,7 @@ defmodule SmolNet.InetBackend.Tcp do
   defp translate_reason(:invalid_how), do: :einval
   defp translate_reason(:invalid_address), do: :einval
   defp translate_reason(:invalid_port), do: :einval
+  defp translate_reason(:invalid_backlog), do: :einval
   defp translate_reason(:scope_required), do: :einval
   defp translate_reason(:invalid_scope), do: :einval
   defp translate_reason(:invalid_socket_state), do: :einval

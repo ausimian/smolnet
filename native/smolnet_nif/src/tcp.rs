@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, VecDeque};
 
 use rustler::{NifMap, NifUnitEnum};
 use smoltcp::iface::SocketHandle;
@@ -14,6 +14,8 @@ pub const CONNECT_TIMEOUT_MILLIS: u64 = 30_000;
 pub const CLOSE_TIMEOUT_MILLIS: u64 = 30_000;
 pub const EPHEMERAL_PORT_FIRST: u16 = 49_152;
 pub const EPHEMERAL_PORT_LAST: u16 = 50_175;
+pub const LISTENER_POOL_MAX: usize = 4;
+pub const LISTENER_BACKLOG_MAX: usize = 128;
 
 #[derive(Clone, Debug)]
 pub struct TcpEndpoint {
@@ -151,6 +153,38 @@ pub struct TcpRecord {
     pub read_shutdown: bool,
     pub write_shutdown: bool,
     pub close_deadline: Option<Instant>,
+    pub accepted: bool,
+}
+
+#[derive(Debug)]
+pub struct ListenerRecord {
+    pub identity: SocketIdentity,
+    pub endpoint: ValidatedEndpoint,
+    pub local: IpEndpoint,
+    pub backlog: usize,
+    pub pool_target: usize,
+    pub pool: BTreeSet<SocketHandle>,
+    pub accepted: VecDeque<SocketIdentity>,
+}
+
+impl ListenerRecord {
+    pub fn new(
+        identity: SocketIdentity,
+        endpoint: ValidatedEndpoint,
+        local: IpEndpoint,
+        backlog: usize,
+        handles: impl IntoIterator<Item = SocketHandle>,
+    ) -> Self {
+        Self {
+            identity,
+            endpoint,
+            local,
+            backlog,
+            pool_target: backlog.min(LISTENER_POOL_MAX),
+            pool: handles.into_iter().collect(),
+            accepted: VecDeque::with_capacity(backlog),
+        }
+    }
 }
 
 impl TcpRecord {
@@ -166,6 +200,29 @@ impl TcpRecord {
             read_shutdown: false,
             write_shutdown: false,
             close_deadline: None,
+            accepted: false,
+        }
+    }
+
+    pub fn accepted(
+        identity: SocketIdentity,
+        handle: SocketHandle,
+        local: IpEndpoint,
+        remote: IpEndpoint,
+        scope_id: u32,
+    ) -> Self {
+        Self {
+            identity,
+            handle,
+            phase: ConnectPhase::Connected,
+            local: Some(local),
+            local_scope_id: scope_id,
+            remote: Some(remote),
+            remote_scope_id: scope_id,
+            read_shutdown: false,
+            write_shutdown: false,
+            close_deadline: None,
+            accepted: true,
         }
     }
 }

@@ -23,11 +23,23 @@ defmodule SmolNet.Native do
   def socket_cancel(_stack, _identity, _operation, _reference),
     do: :erlang.nif_error(:nif_not_loaded)
 
+  @spec socket_validate(reference(), map()) :: {:ok, map()} | {:error, atom()}
+  def socket_validate(_stack, _identity), do: :erlang.nif_error(:nif_not_loaded)
+
   @spec tcp_open(reference()) :: {:ok, map()} | {:error, atom()}
   def tcp_open(_stack), do: :erlang.nif_error(:nif_not_loaded)
 
   @spec tcp_bind(reference(), map(), map()) :: {:ok, map()} | {:error, atom()}
   def tcp_bind(_stack, _identity, _endpoint), do: :erlang.nif_error(:nif_not_loaded)
+
+  @spec tcp_listen(reference(), map(), pos_integer(), integer()) ::
+          {:ok, map()} | {:error, atom()}
+  def tcp_listen(_stack, _identity, _backlog, _now), do: :erlang.nif_error(:nif_not_loaded)
+
+  @spec tcp_accept(reference(), map(), pid(), reference(), integer()) ::
+          {:ok, map()} | {:error, atom()}
+  def tcp_accept(_stack, _identity, _pid, _reference, _now),
+    do: :erlang.nif_error(:nif_not_loaded)
 
   @spec tcp_connect(reference(), map(), map(), pid(), reference(), integer()) ::
           {:ok, map()} | {:error, atom()}

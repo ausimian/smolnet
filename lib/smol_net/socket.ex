@@ -15,6 +15,7 @@ defmodule SmolNet.Socket do
   @max_identity 576_460_752_303_423_487
   @max_immediate_retries 16
   @max_timeout 4_294_967_295
+  @max_backlog 128
 
   @enforce_keys [:stack, :id, :generation]
   defstruct [:stack, :id, :generation]
@@ -67,6 +68,48 @@ defmodule SmolNet.Socket do
   end
 
   def bind(_socket, _address), do: {:error, :invalid_socket}
+
+  @doc false
+  @spec listen(t(), pos_integer()) :: :ok | {:error, atom()}
+  def listen(%__MODULE__{} = socket, backlog)
+      when is_integer(backlog) and backlog in 1..@max_backlog do
+    if valid?(socket), do: Stack.socket_listen(socket, backlog), else: {:error, :invalid_socket}
+  end
+
+  def listen(%__MODULE__{} = socket, _backlog) do
+    if valid?(socket), do: {:error, :invalid_backlog}, else: {:error, :invalid_socket}
+  end
+
+  def listen(_socket, _backlog), do: {:error, :invalid_socket}
+
+  @doc false
+  @spec accept(t()) :: {:ok, t()} | {:error, atom()}
+  def accept(socket), do: accept(socket, :infinity)
+
+  @doc false
+  @spec accept(t(), :nowait | timeout()) ::
+          {:ok, t()} | {:select, :socket.select_info()} | {:error, atom()}
+  def accept(%__MODULE__{} = socket, :nowait) do
+    if valid?(socket), do: Stack.socket_accept(socket), else: {:error, :invalid_socket}
+  end
+
+  def accept(%__MODULE__{} = socket, timeout)
+      when timeout == :infinity or
+             (is_integer(timeout) and timeout >= 0 and timeout <= @max_timeout) do
+    if valid?(socket) do
+      synchronous(socket, timeout, fn deadline, monitor ->
+        accept_loop(socket, deadline, monitor, 0)
+      end)
+    else
+      {:error, :invalid_socket}
+    end
+  end
+
+  def accept(%__MODULE__{} = socket, _timeout) do
+    if valid?(socket), do: {:error, :invalid_timeout}, else: {:error, :invalid_socket}
+  end
+
+  def accept(_socket, _timeout), do: {:error, :invalid_socket}
 
   @doc false
   @spec connect(t(), sockaddr_in6()) :: :ok | {:error, atom()}
@@ -285,6 +328,39 @@ defmodule SmolNet.Socket do
         {:error, :timeout}
     end
   end
+
+  defp accept_loop(socket, deadline, monitor, retries) do
+    case prepare_retry(deadline, retries) do
+      :ok ->
+        socket
+        |> Stack.socket_accept()
+        |> handle_accept_result(socket, deadline, monitor, retries)
+
+      :timeout ->
+        {:error, :timeout}
+    end
+  end
+
+  defp handle_accept_result(
+         {:select, select_info},
+         socket,
+         deadline,
+         monitor,
+         retries
+       ) do
+    socket
+    |> await_select(select_info, deadline, monitor)
+    |> continue_accept(socket, deadline, monitor, retries)
+  end
+
+  defp handle_accept_result(result, _socket, _deadline, _monitor, _retries), do: result
+
+  defp continue_accept(:ready, socket, deadline, monitor, retries) do
+    accept_loop(socket, deadline, monitor, retries + 1)
+  end
+
+  defp continue_accept({:error, reason}, _socket, _deadline, _monitor, _retries),
+    do: {:error, reason}
 
   defp handle_connect_result(
          {:select, select_info},

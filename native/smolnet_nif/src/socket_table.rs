@@ -553,6 +553,7 @@ pub enum SocketError {
     SystemLimit,
     InvalidAddress,
     InvalidPort,
+    InvalidBacklog,
     ScopeRequired,
     InvalidScope,
     AddressInUse,
