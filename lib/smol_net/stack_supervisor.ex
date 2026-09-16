@@ -4,7 +4,6 @@ defmodule SmolNet.StackSupervisor do
   use Supervisor, restart: :temporary, shutdown: :infinity
 
   alias SmolNet.Stack
-  alias SmolNet.Stack.IngressGate
   alias SmolNet.Stack.Options
   alias SmolNet.Stack.Ref
 
@@ -39,29 +38,20 @@ defmodule SmolNet.StackSupervisor do
     with {:ok, config} <- Options.parse(options) do
       ready_ref = make_ref()
       ingress_token = make_ref()
-      gate_status = if config.egress, do: :up, else: :down
-
-      gate =
-        IngressGate.new(
-          config.ingress_queue.packets,
-          config.ingress_queue.bytes,
-          gate_status
-        )
 
       child_options =
         config
-        |> Map.take([:egress, :link_down, :limits, :ingress_queue, :native_config])
+        |> Map.take([:egress, :link_down, :limits, :native_config])
         |> Map.to_list()
         |> Keyword.merge(
           starter: self(),
           ready_ref: ready_ref,
-          ingress_gate: gate,
           ingress_token: ingress_token
         )
 
       case DynamicSupervisor.start_child(SmolNet.Supervisor, {__MODULE__, child_options}) do
         {:ok, bundle} ->
-          await_ready(bundle, ready_ref, gate, ingress_token, config.native_config.mtu)
+          await_ready(bundle, ready_ref, ingress_token)
 
         {:error, reason} ->
           {:error, normalize_start_error(reason)}
@@ -88,7 +78,7 @@ defmodule SmolNet.StackSupervisor do
     |> then(&DynamicSupervisor.start_child(supervisor, &1))
   end
 
-  defp await_ready(bundle, ready_ref, ingress_gate, ingress_token, mtu) do
+  defp await_ready(bundle, ready_ref, ingress_token) do
     bundle_monitor = Process.monitor(bundle)
 
     case resolve_children(bundle) do
@@ -98,9 +88,7 @@ defmodule SmolNet.StackSupervisor do
           bundle_monitor,
           ready_ref,
           children,
-          ingress_gate,
-          ingress_token,
-          mtu
+          ingress_token
         )
 
       {:error, reason} ->
@@ -114,9 +102,7 @@ defmodule SmolNet.StackSupervisor do
          bundle_monitor,
          ready_ref,
          children,
-         ingress_gate,
-         ingress_token,
-         mtu
+         ingress_token
        ) do
     %{stack: stack, inet_backends: inet_backends} = children
     stack_monitor = Process.monitor(stack)
@@ -131,9 +117,7 @@ defmodule SmolNet.StackSupervisor do
            bundle: bundle,
            stack: stack,
            inet_backends: inet_backends,
-           ingress_gate: ingress_gate,
-           ingress_token: ingress_token,
-           mtu: mtu
+           ingress_token: ingress_token
          }}
 
       {:smolnet_stack_error, ^ready_ref, reason} ->

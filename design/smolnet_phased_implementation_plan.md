@@ -96,6 +96,9 @@ These invariants are release blockers, not implementation preferences.
 
 - One `SmolNet.Stack` GenServer owns one native stack resource and is the only
   BEAM process allowed to invoke NIF functions for that resource.
+- One serialized link process feeds ingress to each stack. Its synchronous
+  handoff returns when the stack accepts a packet, and the link owns upstream
+  transport backpressure.
 - Calls for one stack are serialized by its mailbox. Separate stacks can make
   progress independently.
 - A native mutex is defensive only and uses `try_lock`; a normal scheduler must
@@ -107,7 +110,8 @@ These invariants are release blockers, not implementation preferences.
 
 - Every NIF invocation has explicit limits for input packets, output packets,
   copied bytes, readiness events, and protocol polling work.
-- Ingress processes one complete raw IP packet per stack mailbox event.
+- Ingress processes one complete raw IP packet per accepted feeder call. At
+  most one packet is in native processing and one later feeder call is waiting.
 - The NIF never loops until a socket becomes ready and never owns an arbitrary
   unsent application payload.
 - If bounded work remains, it is represented by another BEAM message,
@@ -901,13 +905,12 @@ transport-neutral BEAM boundary.
 - Implement `BeamDevice` receive/transmit tokens for complete raw IP packets.
 - Add `SmolNet.Stack.start_link/1` options for egress `{pid, link_ref}`, MTU,
   IPv6 addresses, routes, limits, and link-down policy.
-- Implement asynchronous `SmolNet.Stack.ingress/2`. Validate type, minimum
-  header, IPv6 version nibble, declared payload length, MTU, and admission
-  limits before native work.
-- Use an explicit bounded ingress queue instead of relying on an unbounded
-  GenServer mailbox. Define overflow behavior and expose rejection metrics.
-- Process one packet per bounded native ingress call and yield through the
-  stack mailbox when more admitted packets remain.
+- Implement a synchronous single-feeder `SmolNet.Stack.ingress/2` handoff.
+  Validate type, minimum header, IPv6 version nibble, declared payload length,
+  and MTU in the stack owner before native work.
+- Reply when the stack accepts the packet, then process one packet per bounded
+  native ingress continuation before accepting another stack message. The
+  serialized feeder and its one outstanding call replace an ingress queue.
 - Emit one `{:smol_stack, link_ref, :egress, packet}` message per returned
   packet. Treat delivery as emission, not transport acknowledgement.
 - Implement native `poll_at`, BEAM `Process.send_after`, timer generations,
@@ -926,7 +929,8 @@ transport-neutral BEAM boundary.
   message with the configured opaque `link_ref`.
 - Invalid, truncated, oversized, and IPv4 packets are rejected without native
   mutation.
-- Queue saturation follows the documented policy and remains memory-bounded.
+- Single-feeder backpressure permits at most one packet in native processing
+  and one subsequent ingress call waiting in the stack mailbox.
 - Retransmission/timer activity advances under a deterministic clock with no
   inbound traffic; stale timer generations have no effect.
 - Egress recipient termination exercises every configured link-down policy.
@@ -938,9 +942,9 @@ transport-neutral BEAM boundary.
 
 #### Regular review focus
 
-The sub-agent reviews mailbox/queue bounds, raw-packet validation, timer races,
-egress attribution, link monitoring, fairness, and transport leakage. Fix lost
-or duplicated packet/timer behavior; defer sockets and IPv4.
+The sub-agent reviews the single-feeder bound, raw-packet validation, timer
+races, egress attribution, link monitoring, fairness, and transport leakage.
+Fix lost or duplicated packet/timer behavior; defer sockets and IPv4.
 
 ---
 
@@ -1338,8 +1342,8 @@ stable.
   pass.
 - TCP IPv6, TCP IPv4, UDP IPv6, and UDP IPv4 sockets coexist on one `SocketSet`
   with correct routing and no readiness cross-talk.
-- Mixed stress tests remain within native buffer, ingress queue, egress batch,
-  adapter drain, and mailbox thresholds.
+- Mixed stress tests remain within native buffer, single-feeder ingress, egress
+  batch, adapter drain, and mailbox thresholds.
 - Wrong-protocol and wrong-family calls return deterministic errors and leave
   the target socket usable.
 - Public `gen_tcp` and `gen_udp` entry-point suites pass for both address
@@ -1466,7 +1470,7 @@ uses `Kernel.send/2` explicitly for process messages.
 | Select/result/message shapes | 0–3 | contract tests and race tests |
 | Stack bundle supervision and readiness handshake | 1 | significant-child teardown and nonblocking-init tests |
 | NIF bytes/packets/readiness bounds | 1 | instrumented maximum-work tests |
-| Ingress queue and overflow policy | 2 | saturation and memory-bound tests |
+| Single-feeder ingress backpressure and bound | 2 | serialized handoff and continuation-order tests |
 | Egress message tag/link-down policy | 2 | adapter substitution and death tests |
 | Socket ID/generation strategy | 3 | stale-handle model and tests |
 | Waiter conflict and cancellation results | 3 | deterministic race matrix |

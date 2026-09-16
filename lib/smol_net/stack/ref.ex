@@ -6,18 +6,14 @@ defmodule SmolNet.Stack.Ref do
   Use the functions on `SmolNet` rather than depending on its fields.
   """
 
-  alias SmolNet.Stack.IngressGate
-
-  @enforce_keys [:bundle, :stack, :inet_backends, :ingress_gate, :ingress_token, :mtu]
-  defstruct [:bundle, :stack, :inet_backends, :ingress_gate, :ingress_token, :mtu]
+  @enforce_keys [:bundle, :stack, :inet_backends, :ingress_token]
+  defstruct [:bundle, :stack, :inet_backends, :ingress_token]
 
   @opaque t :: %__MODULE__{
             bundle: pid(),
             stack: pid(),
             inet_backends: pid(),
-            ingress_gate: IngressGate.t(),
-            ingress_token: reference(),
-            mtu: pos_integer()
+            ingress_token: reference()
           }
 
   @doc false

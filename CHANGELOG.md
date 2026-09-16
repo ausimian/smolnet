@@ -14,5 +14,6 @@ and this project adheres to
 
 - Establish the Elixir application, Rustler NIF workspace, quality tooling, and
   cross-platform compatibility workflow.
-- Add bounded raw IPv6 ingress, transport-neutral egress messages, native stack
-  polling, BEAM-owned timer scheduling, link-down policies, and stack metrics.
+- Add serialized single-feeder raw IPv6 ingress, transport-neutral egress
+  messages, native stack polling, BEAM-owned timer scheduling, link-down
+  policies, and stack metrics.

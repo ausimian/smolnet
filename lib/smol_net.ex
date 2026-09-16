@@ -32,16 +32,16 @@ defmodule SmolNet do
   defdelegate stop_stack(stack), to: SmolNet.StackSupervisor, as: :stop_stack
 
   @doc """
-  Asynchronously admits one complete raw IPv6 packet to a stack.
+  Hands one complete raw IPv6 packet from the stack's link feeder to the stack.
 
-  The packet is validated and counted against the configured bounded ingress
-  queue before this function returns. Queue saturation returns
-  `{:error, :queue_full}` without sending the packet to the stack process.
+  Each stack has one serialized feeder. This call returns after the stack owner
+  validates and accepts the packet, then native processing runs before the
+  stack accepts another message. The feeder must bound its own transport input.
   """
   @spec ingress(Stack.Ref.t(), binary()) :: :ok | {:error, atom()}
   defdelegate ingress(stack, packet), to: Stack
 
-  @doc "Returns bounded-ingress, link, timer, and native stack metrics."
+  @doc "Returns ingress, link, timer, and native stack metrics."
   @spec stack_info(Stack.Ref.t()) :: {:ok, map()} | {:error, :closed}
   defdelegate stack_info(stack), to: Stack, as: :info
 end
