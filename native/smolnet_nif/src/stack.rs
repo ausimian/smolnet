@@ -1,16 +1,26 @@
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Mutex, TryLockError};
 
 use rustler::{Atom, Encoder, Env, LocalPid, NifMap, Reference, Resource, ResourceArc, Term};
 use smoltcp::iface::{Config, Interface, PollResult, Route, SocketSet};
+use smoltcp::socket::tcp::{self, ConnectError};
+use smoltcp::time::Duration;
 use smoltcp::time::Instant;
-use smoltcp::wire::{HardwareAddress, IpAddress, IpCidr, Ipv6Address, Ipv6Cidr};
+use smoltcp::wire::{
+    HardwareAddress, IpAddress, IpCidr, IpEndpoint, IpProtocol, Ipv6Address, Ipv6Cidr,
+    Ipv6ExtHeader, Ipv6Packet, TcpPacket,
+};
 
 use crate::device::BeamDevice;
 use crate::limits::{Limits, Work};
 use crate::socket_table::{
     CancelResult, InstallResult, ReadyResult, SocketError, SocketKind, SocketTable,
     WaiterRegistration,
+};
+use crate::tcp::{
+    self as tcp_support, ConnectFailure, ConnectPhase, EncodedEndpoint, TcpEndpoint, TcpRecord,
+    ValidatedEndpoint,
 };
 use crate::waiter::{
     ArmPoint, Direction, Operation, ReadinessCounters, ReadyKey, ReadyQueue, SocketIdentity, Waiter,
@@ -82,6 +92,9 @@ pub struct NativeStack {
     sockets: SocketSet<'static>,
     device: BeamDevice,
     socket_table: SocketTable,
+    tcp_records: BTreeMap<u64, TcpRecord>,
+    tcp_connections: BTreeMap<ConnectionKey, SocketIdentity>,
+    next_ephemeral_port: u16,
     ready: ReadyQueue,
     ready_sweep: bool,
     ready_sweep_cursor: Option<ReadyKey>,
@@ -89,11 +102,17 @@ pub struct NativeStack {
     lifecycle: Lifecycle,
     limits: Limits,
     mtu: usize,
+    route_prefixes: Vec<Ipv6Cidr>,
 }
 
 impl NativeStack {
     fn new(limits: Limits, stack_config: StackConfig, now: Instant) -> Result<Self, StackError> {
         stack_config.validate(limits)?;
+        let route_prefixes = stack_config
+            .routes
+            .iter()
+            .map(RouteConfig::to_cidr)
+            .collect();
 
         let mut device = BeamDevice::new(stack_config.mtu);
         let mut interface_config = Config::new(HardwareAddress::Ip);
@@ -123,6 +142,9 @@ impl NativeStack {
             sockets: SocketSet::new(Vec::new()),
             device,
             socket_table: SocketTable::new(limits.ready_events, limits.ready_events),
+            tcp_records: BTreeMap::new(),
+            tcp_connections: BTreeMap::new(),
+            next_ephemeral_port: tcp_support::EPHEMERAL_PORT_FIRST,
             ready: ReadyQueue::new((limits.ready_events / 2).max(1)),
             ready_sweep: false,
             ready_sweep_cursor: None,
@@ -130,6 +152,7 @@ impl NativeStack {
             lifecycle: Lifecycle::Running,
             limits,
             mtu: stack_config.mtu,
+            route_prefixes,
         })
     }
 
@@ -143,6 +166,8 @@ impl NativeStack {
                 limits: self.limits,
                 socket_count: self.socket_table.len(),
                 native_socket_count: self.sockets.iter().count(),
+                tcp_socket_count: self.tcp_records.len(),
+                tcp_buffer_bytes: tcp_support::BUFFER_BYTES,
                 waiter_count: self.socket_table.waiter_count(),
                 read_waiter_count: read_waiters,
                 write_waiter_count: write_waiters,
@@ -174,13 +199,235 @@ impl NativeStack {
         }
     }
 
+    pub fn tcp_open(&mut self, env: Env<'_>) -> Result<Envelope<SocketIdentity>, SocketError> {
+        self.ensure_running()?;
+
+        let handle = self.sockets.add(tcp_support::socket());
+        let identity = match self.socket_table.insert(SocketKind::Tcp, 0) {
+            Ok(identity) => identity,
+            Err(error) => {
+                self.sockets.remove(handle);
+                return Err(error);
+            }
+        };
+
+        self.tcp_records
+            .insert(identity.id, TcpRecord::new(identity, handle));
+
+        Ok(self.finish_call(env, identity, Effects::empty(), Vec::new()))
+    }
+
+    pub fn tcp_bind(
+        &mut self,
+        env: Env<'_>,
+        identity: SocketIdentity,
+        endpoint: TcpEndpoint,
+    ) -> Result<Envelope<Atom>, SocketError> {
+        self.ensure_running()?;
+        self.socket_table.validate(identity, SocketKind::Tcp)?;
+        let endpoint = endpoint.bind_endpoint()?;
+        let record = self.tcp_record(identity)?;
+
+        if record.phase != ConnectPhase::Open {
+            return Err(SocketError::InvalidState);
+        }
+
+        if !endpoint.address.is_unspecified() && !self.has_ipv6_address(endpoint.address) {
+            return Err(SocketError::AddressNotAvailable);
+        }
+
+        let port = if endpoint.port == 0 {
+            self.allocate_ephemeral_port()?
+        } else {
+            if self.port_in_use(endpoint.port, Some(identity)) {
+                return Err(SocketError::AddressInUse);
+            }
+
+            endpoint.port
+        };
+
+        let local = IpEndpoint::new(IpAddress::Ipv6(endpoint.address), port);
+        let record = self.tcp_record_mut(identity)?;
+        record.phase = ConnectPhase::Bound;
+        record.local = Some(local);
+        record.local_scope_id = endpoint.scope_id;
+
+        Ok(self.finish_call(env, crate::atoms::ok(), Effects::empty(), Vec::new()))
+    }
+
+    pub fn tcp_connect<'a>(
+        &mut self,
+        env: Env<'a>,
+        identity: SocketIdentity,
+        endpoint: TcpEndpoint,
+        pid: LocalPid,
+        reference: Reference<'a>,
+        now: Instant,
+    ) -> Result<Envelope<Term<'a>>, SocketError> {
+        self.ensure_running()?;
+        self.socket_table.validate(identity, SocketKind::Tcp)?;
+        let remote = endpoint.remote_endpoint()?;
+
+        let record = *self.tcp_record(identity)?;
+
+        match record.phase {
+            ConnectPhase::Connected => return Err(SocketError::AlreadyConnected),
+            ConnectPhase::Failed(failure) => return Err(failure.socket_error()),
+            ConnectPhase::Connecting => {
+                if record.remote != Some(remote.ip_endpoint())
+                    || record.remote_scope_id != remote.scope_id
+                {
+                    return Err(SocketError::InvalidState);
+                }
+
+                return self.finalize_or_arm_connect(env, identity, pid, reference, now);
+            }
+            ConnectPhase::Open | ConnectPhase::Bound => {}
+        }
+
+        if !self.reachable(remote.address) {
+            return Err(SocketError::NetworkUnreachable);
+        }
+
+        let local = match record.local {
+            Some(local) => local,
+            None => IpEndpoint::new(
+                IpAddress::Ipv6(Ipv6Address::UNSPECIFIED),
+                self.allocate_ephemeral_port()?,
+            ),
+        };
+
+        if self.port_in_use(local.port, Some(identity)) {
+            return Err(SocketError::AddressInUse);
+        }
+
+        let local_listen = ValidatedEndpoint {
+            address: match local.addr {
+                IpAddress::Ipv6(address) => address,
+            },
+            port: local.port,
+            scope_id: record.local_scope_id,
+        }
+        .listen_endpoint();
+
+        let connect_result = {
+            let socket = self.sockets.get_mut::<tcp::Socket<'static>>(record.handle);
+            socket.set_timeout(Some(Duration::from_millis(
+                tcp_support::CONNECT_TIMEOUT_MILLIS,
+            )));
+            socket.connect(self.interface.context(), remote.ip_endpoint(), local_listen)
+        };
+
+        match connect_result {
+            Ok(()) => {}
+            Err(ConnectError::InvalidState) => return Err(SocketError::InvalidState),
+            Err(ConnectError::Unaddressable) => return Err(SocketError::NetworkUnreachable),
+        }
+
+        let selected_local = self
+            .sockets
+            .get::<tcp::Socket<'static>>(record.handle)
+            .local_endpoint()
+            .expect("a connecting TCP socket has a local endpoint");
+        let remote_endpoint = remote.ip_endpoint();
+        let connection_key = ConnectionKey::new(selected_local, remote_endpoint);
+
+        {
+            let record = self.tcp_record_mut(identity)?;
+            record.phase = ConnectPhase::Connecting;
+            record.local = Some(selected_local);
+            record.remote = Some(remote_endpoint);
+            record.remote_scope_id = remote.scope_id;
+        }
+
+        self.tcp_connections.insert(connection_key, identity);
+        self.arm_connect(env, identity, record.handle, pid, reference)?;
+        let effects = self
+            .drive(now, None)
+            .expect("TCP connect without ingress cannot fail");
+        let result = (crate::atoms::select(), Operation::Connect, reference).encode(env);
+
+        Ok(self.finish_call(env, result, effects, Vec::new()))
+    }
+
+    pub fn tcp_sockname(
+        &mut self,
+        env: Env<'_>,
+        identity: SocketIdentity,
+    ) -> Result<Envelope<EncodedEndpoint>, SocketError> {
+        self.ensure_running()?;
+        self.socket_table.validate(identity, SocketKind::Tcp)?;
+        let record = self.tcp_record(identity)?;
+        let local = record.local.ok_or(SocketError::NotBound)?;
+        let result = EncodedEndpoint::new(local, record.local_scope_id);
+
+        Ok(self.finish_call(env, result, Effects::empty(), Vec::new()))
+    }
+
+    pub fn tcp_peername(
+        &mut self,
+        env: Env<'_>,
+        identity: SocketIdentity,
+    ) -> Result<Envelope<EncodedEndpoint>, SocketError> {
+        self.ensure_running()?;
+        self.socket_table.validate(identity, SocketKind::Tcp)?;
+        let record = self.tcp_record(identity)?;
+
+        if !matches!(
+            record.phase,
+            ConnectPhase::Connecting | ConnectPhase::Connected
+        ) {
+            return Err(SocketError::NotConnected);
+        }
+
+        let remote = record.remote.ok_or(SocketError::NotConnected)?;
+        let result = EncodedEndpoint::new(remote, record.remote_scope_id);
+
+        Ok(self.finish_call(env, result, Effects::empty(), Vec::new()))
+    }
+
+    pub fn tcp_close(
+        &mut self,
+        env: Env<'_>,
+        identity: SocketIdentity,
+        now: Instant,
+    ) -> Result<Envelope<Atom>, SocketError> {
+        self.ensure_running()?;
+        self.socket_table.validate(identity, SocketKind::Tcp)?;
+        let record = *self.tcp_record(identity)?;
+
+        self.sockets
+            .get_mut::<tcp::Socket<'static>>(record.handle)
+            .abort();
+        let effects = self
+            .drive(now, None)
+            .expect("TCP close without ingress cannot fail");
+        self.sockets.remove(record.handle);
+        self.remove_tcp_record(record);
+
+        let waiters = self.socket_table.close(identity)?;
+        let aborts = waiters
+            .into_iter()
+            .map(|(direction, waiter)| PendingNotification {
+                identity,
+                direction,
+                waiter,
+            })
+            .collect();
+
+        Ok(self.finish_call(env, crate::atoms::ok(), effects, aborts))
+    }
+
     pub fn ingress(&mut self, packet: &[u8], now: Instant) -> Result<Effects, StackError> {
         self.validate_packet(packet)?;
+        let reset = self.inbound_reset(packet);
         self.device
             .enqueue_receive(packet.to_vec())
             .map_err(|_| StackError::OwnershipInvariantViolation)?;
         self.counters.ingress_packets += 1;
-        self.drive(now, Some(packet.len()))
+        let effects = self.drive(now, Some(packet.len()))?;
+        self.record_inbound_reset(reset);
+        Ok(effects)
     }
 
     pub fn poll(&mut self, now: Instant) -> Effects {
@@ -257,6 +504,12 @@ impl NativeStack {
         // Linearize shutdown before draining the bounded table. Any socket
         // operation serialized after this point is rejected as closed.
         self.lifecycle = Lifecycle::Shutdown;
+
+        for record in std::mem::take(&mut self.tcp_records).into_values() {
+            self.sockets.remove(record.handle);
+        }
+        self.tcp_connections.clear();
+
         let waiters = self.socket_table.close_all();
         debug_assert!(waiters.len() <= self.limits.ready_events);
 
@@ -434,6 +687,230 @@ impl NativeStack {
         };
 
         Ok(self.finish_call(env, result, Effects::empty(), Vec::new()))
+    }
+
+    fn finalize_or_arm_connect<'a>(
+        &mut self,
+        env: Env<'a>,
+        identity: SocketIdentity,
+        pid: LocalPid,
+        reference: Reference<'a>,
+        now: Instant,
+    ) -> Result<Envelope<Term<'a>>, SocketError> {
+        let record = *self.tcp_record(identity)?;
+        let state = self
+            .sockets
+            .get::<tcp::Socket<'static>>(record.handle)
+            .state();
+
+        match state {
+            tcp::State::Established => {
+                self.sockets
+                    .get_mut::<tcp::Socket<'static>>(record.handle)
+                    .set_timeout(None);
+                self.tcp_record_mut(identity)?.phase = ConnectPhase::Connected;
+                let result = crate::atoms::ok().encode(env);
+                let effects = self.current_effects(now);
+                Ok(self.finish_call(env, result, effects, Vec::new()))
+            }
+            tcp::State::SynSent | tcp::State::SynReceived => {
+                self.arm_connect(env, identity, record.handle, pid, reference)?;
+                let effects = self
+                    .drive(now, None)
+                    .expect("TCP connect retry without ingress cannot fail");
+                let result = (crate::atoms::select(), Operation::Connect, reference).encode(env);
+                Ok(self.finish_call(env, result, effects, Vec::new()))
+            }
+            tcp::State::Closed => {
+                let failure = match record.phase {
+                    ConnectPhase::Failed(failure) => failure,
+                    _ => ConnectFailure::TimedOut,
+                };
+                self.tcp_record_mut(identity)?.phase = ConnectPhase::Failed(failure);
+                Err(failure.socket_error())
+            }
+            _ => Err(SocketError::InvalidState),
+        }
+    }
+
+    fn arm_connect<'a>(
+        &mut self,
+        env: Env<'a>,
+        identity: SocketIdentity,
+        handle: smoltcp::iface::SocketHandle,
+        pid: LocalPid,
+        reference: Reference<'a>,
+    ) -> Result<(), SocketError> {
+        let flag = self
+            .socket_table
+            .ready_flag(identity, SocketKind::Tcp, Direction::Write)?;
+        self.socket_table.install_waiter(
+            env,
+            WaiterRegistration {
+                identity,
+                expected_kind: SocketKind::Tcp,
+                direction: Direction::Write,
+                pid,
+                operation: Operation::Connect,
+                reference,
+            },
+        )?;
+
+        let waker = self.ready.waker(
+            ReadyKey {
+                identity,
+                direction: Direction::Write,
+            },
+            flag,
+        );
+        self.sockets
+            .get_mut::<tcp::Socket<'static>>(handle)
+            .register_send_waker(&waker);
+        Ok(())
+    }
+
+    fn tcp_record(&self, identity: SocketIdentity) -> Result<&TcpRecord, SocketError> {
+        self.tcp_records
+            .get(&identity.id)
+            .filter(|record| record.identity == identity)
+            .ok_or(SocketError::InvalidSocket)
+    }
+
+    fn tcp_record_mut(&mut self, identity: SocketIdentity) -> Result<&mut TcpRecord, SocketError> {
+        self.tcp_records
+            .get_mut(&identity.id)
+            .filter(|record| record.identity == identity)
+            .ok_or(SocketError::InvalidSocket)
+    }
+
+    fn remove_tcp_record(&mut self, record: TcpRecord) {
+        if let (Some(local), Some(remote)) = (record.local, record.remote) {
+            self.tcp_connections
+                .remove(&ConnectionKey::new(local, remote));
+        }
+
+        self.tcp_records.remove(&record.identity.id);
+    }
+
+    fn has_ipv6_address(&self, address: Ipv6Address) -> bool {
+        self.interface
+            .ip_addrs()
+            .iter()
+            .any(|cidr| cidr.address() == IpAddress::Ipv6(address))
+    }
+
+    fn reachable(&self, address: Ipv6Address) -> bool {
+        let ip_address = IpAddress::Ipv6(address);
+
+        self.interface
+            .ip_addrs()
+            .iter()
+            .any(|cidr| cidr.contains_addr(&ip_address))
+            || self
+                .route_prefixes
+                .iter()
+                .any(|cidr| cidr.contains_addr(&address))
+    }
+
+    fn port_in_use(&self, port: u16, excluding: Option<SocketIdentity>) -> bool {
+        self.tcp_records.values().any(|record| {
+            Some(record.identity) != excluding
+                && record.local.is_some_and(|local| local.port == port)
+        })
+    }
+
+    fn allocate_ephemeral_port(&mut self) -> Result<u16, SocketError> {
+        let used = self
+            .tcp_records
+            .values()
+            .filter_map(|record| record.local.map(|local| local.port))
+            .collect::<BTreeSet<_>>();
+        let port = tcp_support::allocate_ephemeral(
+            &used,
+            self.next_ephemeral_port,
+            tcp_support::EPHEMERAL_PORT_FIRST,
+            tcp_support::EPHEMERAL_PORT_LAST,
+        )?;
+        self.next_ephemeral_port = if port == tcp_support::EPHEMERAL_PORT_LAST {
+            tcp_support::EPHEMERAL_PORT_FIRST
+        } else {
+            port + 1
+        };
+        Ok(port)
+    }
+
+    fn current_effects(&mut self, now: Instant) -> Effects {
+        Effects {
+            output: Vec::new(),
+            poll_at: self
+                .interface
+                .poll_at(now, &self.sockets)
+                .map(|instant| instant.total_millis()),
+            more: false,
+            maintenance_work: 0,
+        }
+    }
+
+    fn inbound_reset(&self, packet: &[u8]) -> Option<(SocketIdentity, ConnectFailure)> {
+        let ipv6 = Ipv6Packet::new_checked(packet).ok()?;
+        let mut next_header = ipv6.next_header();
+        let mut transport = ipv6.payload();
+
+        if next_header == IpProtocol::HopByHop {
+            let extension = Ipv6ExtHeader::new_checked(transport).ok()?;
+            next_header = extension.next_header();
+            let header_len = (usize::from(extension.header_len()) + 1) * 8;
+            transport = transport.get(header_len..)?;
+        }
+
+        if next_header != IpProtocol::Tcp {
+            return None;
+        }
+
+        let tcp = TcpPacket::new_checked(transport).ok()?;
+
+        if !tcp.rst() {
+            return None;
+        }
+
+        let key = ConnectionKey {
+            local_address: ipv6.dst_addr().octets(),
+            local_port: tcp.dst_port(),
+            remote_address: ipv6.src_addr().octets(),
+            remote_port: tcp.src_port(),
+        };
+        let identity = *self.tcp_connections.get(&key)?;
+        let record = self.tcp_record(identity).ok()?;
+        let failure = match self
+            .sockets
+            .get::<tcp::Socket<'static>>(record.handle)
+            .state()
+        {
+            tcp::State::Established => ConnectFailure::Reset,
+            tcp::State::SynSent | tcp::State::SynReceived => ConnectFailure::Refused,
+            _ => return None,
+        };
+
+        Some((identity, failure))
+    }
+
+    fn record_inbound_reset(&mut self, reset: Option<(SocketIdentity, ConnectFailure)>) {
+        let Some((identity, failure)) = reset else {
+            return;
+        };
+        let Ok(record) = self.tcp_record(identity).copied() else {
+            return;
+        };
+
+        if self
+            .sockets
+            .get::<tcp::Socket<'static>>(record.handle)
+            .state()
+            == tcp::State::Closed
+            && let Ok(record) = self.tcp_record_mut(identity)
+        {
+            record.phase = ConnectPhase::Failed(failure);
+        }
     }
 
     fn ensure_running(&self) -> Result<(), SocketError> {
@@ -658,14 +1135,15 @@ impl RouteConfig {
 
     fn to_route(&self) -> Route {
         Route {
-            cidr: IpCidr::Ipv6(Ipv6Cidr::new(
-                ipv6_address(&self.destination),
-                self.prefix_length,
-            )),
+            cidr: IpCidr::Ipv6(self.to_cidr()),
             via_router: IpAddress::Ipv6(ipv6_address(&self.gateway)),
             preferred_until: None,
             expires_at: None,
         }
+    }
+
+    fn to_cidr(&self) -> Ipv6Cidr {
+        Ipv6Cidr::new(ipv6_address(&self.destination), self.prefix_length)
     }
 }
 
@@ -697,6 +1175,28 @@ pub struct Effects {
     pub poll_at: Option<i64>,
     pub more: bool,
     maintenance_work: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct ConnectionKey {
+    local_address: [u8; 16],
+    local_port: u16,
+    remote_address: [u8; 16],
+    remote_port: u16,
+}
+
+impl ConnectionKey {
+    fn new(local: IpEndpoint, remote: IpEndpoint) -> Self {
+        let IpAddress::Ipv6(local_address) = local.addr;
+        let IpAddress::Ipv6(remote_address) = remote.addr;
+
+        Self {
+            local_address: local_address.octets(),
+            local_port: local.port,
+            remote_address: remote_address.octets(),
+            remote_port: remote.port,
+        }
+    }
 }
 
 impl Effects {
@@ -792,6 +1292,8 @@ pub struct Snapshot {
     limits: Limits,
     socket_count: usize,
     native_socket_count: usize,
+    tcp_socket_count: usize,
+    tcp_buffer_bytes: usize,
     waiter_count: usize,
     read_waiter_count: usize,
     write_waiter_count: usize,

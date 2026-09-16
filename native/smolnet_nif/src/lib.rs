@@ -2,6 +2,7 @@ mod device;
 mod limits;
 mod socket_table;
 mod stack;
+mod tcp;
 mod time;
 mod waiter;
 
@@ -11,6 +12,7 @@ use rustler::{
 };
 use socket_table::SocketError;
 use stack::{Envelope, ResourceCounts, StackConfig, StackError, StackResource};
+use tcp::TcpEndpoint;
 use waiter::{ArmPoint, Direction, Operation, ReadyKey, SocketIdentity};
 
 mod atoms {
@@ -31,6 +33,24 @@ mod atoms {
         invalid_operation,
         busy,
         system_limit,
+        unsupported_socket,
+        invalid_address,
+        invalid_port,
+        scope_required,
+        invalid_scope,
+        address_in_use,
+        address_not_available,
+        ephemeral_ports_exhausted,
+        network_unreachable,
+        already_connected,
+        not_bound,
+        not_connected,
+        connection_refused,
+        connection_reset,
+        connection_timeout,
+        address,
+        port,
+        scope_id,
         running,
         shutdown,
         ready,
@@ -123,6 +143,108 @@ fn socket_cancel<'a>(
     let result = catch_operation(|| {
         resource
             .with_stack(|stack| stack.cancel(env, identity, operation, reference))
+            .map_err(|_| atoms::ownership_invariant_violation())?
+            .map_err(socket_error_atom)
+    });
+
+    encode_envelope_result(env, result)
+}
+
+#[rustler::nif]
+fn tcp_open<'a>(env: Env<'a>, resource: ResourceArc<StackResource>) -> Term<'a> {
+    let result = catch_operation(|| {
+        resource
+            .with_stack(|stack| stack.tcp_open(env))
+            .map_err(|_| atoms::ownership_invariant_violation())?
+            .map_err(socket_error_atom)
+    });
+
+    encode_envelope_result(env, result)
+}
+
+#[rustler::nif]
+fn tcp_bind<'a>(
+    env: Env<'a>,
+    resource: ResourceArc<StackResource>,
+    identity: SocketIdentity,
+    endpoint_term: Term<'a>,
+) -> Term<'a> {
+    let result = catch_operation(|| {
+        let endpoint = decode_tcp_endpoint(endpoint_term).map_err(socket_error_atom)?;
+        resource
+            .with_stack(|stack| stack.tcp_bind(env, identity, endpoint))
+            .map_err(|_| atoms::ownership_invariant_violation())?
+            .map_err(socket_error_atom)
+    });
+
+    encode_envelope_result(env, result)
+}
+
+#[rustler::nif]
+fn tcp_connect<'a>(
+    env: Env<'a>,
+    resource: ResourceArc<StackResource>,
+    identity: SocketIdentity,
+    endpoint_term: Term<'a>,
+    pid: LocalPid,
+    reference: Reference<'a>,
+    now_millis: i64,
+) -> Term<'a> {
+    let result = catch_operation(|| {
+        let endpoint = decode_tcp_endpoint(endpoint_term).map_err(socket_error_atom)?;
+        let now = time::instant_from_millis(now_millis).map_err(|_| atoms::time_overflow())?;
+        resource
+            .with_stack(|stack| stack.tcp_connect(env, identity, endpoint, pid, reference, now))
+            .map_err(|_| atoms::ownership_invariant_violation())?
+            .map_err(socket_error_atom)
+    });
+
+    encode_envelope_result(env, result)
+}
+
+#[rustler::nif]
+fn tcp_sockname<'a>(
+    env: Env<'a>,
+    resource: ResourceArc<StackResource>,
+    identity: SocketIdentity,
+) -> Term<'a> {
+    let result = catch_operation(|| {
+        resource
+            .with_stack(|stack| stack.tcp_sockname(env, identity))
+            .map_err(|_| atoms::ownership_invariant_violation())?
+            .map_err(socket_error_atom)
+    });
+
+    encode_envelope_result(env, result)
+}
+
+#[rustler::nif]
+fn tcp_peername<'a>(
+    env: Env<'a>,
+    resource: ResourceArc<StackResource>,
+    identity: SocketIdentity,
+) -> Term<'a> {
+    let result = catch_operation(|| {
+        resource
+            .with_stack(|stack| stack.tcp_peername(env, identity))
+            .map_err(|_| atoms::ownership_invariant_violation())?
+            .map_err(socket_error_atom)
+    });
+
+    encode_envelope_result(env, result)
+}
+
+#[rustler::nif]
+fn tcp_close<'a>(
+    env: Env<'a>,
+    resource: ResourceArc<StackResource>,
+    identity: SocketIdentity,
+    now_millis: i64,
+) -> Term<'a> {
+    let result = catch_operation(|| {
+        let now = time::instant_from_millis(now_millis).map_err(|_| atoms::time_overflow())?;
+        resource
+            .with_stack(|stack| stack.tcp_close(env, identity, now))
             .map_err(|_| atoms::ownership_invariant_violation())?
             .map_err(socket_error_atom)
     });
@@ -338,7 +460,42 @@ fn socket_error_atom(error: SocketError) -> Atom {
         SocketError::InvalidOperation => atoms::invalid_operation(),
         SocketError::Busy => atoms::busy(),
         SocketError::SystemLimit => atoms::system_limit(),
+        SocketError::InvalidAddress => atoms::invalid_address(),
+        SocketError::InvalidPort => atoms::invalid_port(),
+        SocketError::ScopeRequired => atoms::scope_required(),
+        SocketError::InvalidScope => atoms::invalid_scope(),
+        SocketError::AddressInUse => atoms::address_in_use(),
+        SocketError::AddressNotAvailable => atoms::address_not_available(),
+        SocketError::EphemeralPortsExhausted => atoms::ephemeral_ports_exhausted(),
+        SocketError::NetworkUnreachable => atoms::network_unreachable(),
+        SocketError::AlreadyConnected => atoms::already_connected(),
+        SocketError::NotBound => atoms::not_bound(),
+        SocketError::NotConnected => atoms::not_connected(),
+        SocketError::ConnectionRefused => atoms::connection_refused(),
+        SocketError::ConnectionReset => atoms::connection_reset(),
+        SocketError::ConnectionTimeout => atoms::connection_timeout(),
     }
+}
+
+fn decode_tcp_endpoint(term: Term<'_>) -> Result<TcpEndpoint, SocketError> {
+    let address = term
+        .map_get(atoms::address())
+        .and_then(|value| value.decode::<Vec<u8>>())
+        .map_err(|_| SocketError::InvalidAddress)?;
+    let port = term
+        .map_get(atoms::port())
+        .and_then(|value| value.decode::<i64>())
+        .map_err(|_| SocketError::InvalidPort)?;
+    let scope_id = term
+        .map_get(atoms::scope_id())
+        .and_then(|value| value.decode::<i64>())
+        .map_err(|_| SocketError::InvalidScope)?;
+
+    Ok(TcpEndpoint {
+        address,
+        port,
+        scope_id,
+    })
 }
 
 fn stack_error_atom(error: StackError) -> Atom {

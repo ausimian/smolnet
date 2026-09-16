@@ -2,7 +2,6 @@ defmodule SmolNet.StackLinkTest do
   use ExUnit.Case, async: false
 
   alias SmolNet.Socket
-  alias SmolNet.Socket.SelectInfo
   alias SmolNet.Stack.Ref
   alias SmolNet.Test.IPv6Link
   alias SmolNet.Test.ManualClock
@@ -279,7 +278,7 @@ defmodule SmolNet.StackLinkTest do
     {:ok, stack} = SmolNet.start_stack()
     %{stack: stack_pid} = Ref.pids(stack)
     socket = Socket.new(stack_pid, %{id: 1, generation: 1})
-    select_info = SelectInfo.new(:recv, make_ref())
+    select_info = {:select_info, :recv, make_ref()}
     {:ok, before_cancel} = SmolNet.stack_info(stack)
 
     assert :ok = SmolNet.cancel(socket, select_info)
@@ -304,7 +303,7 @@ defmodule SmolNet.StackLinkTest do
     assert_receive {:native_stack_ingress, ^stack_pid, ^packet}
 
     socket = Socket.new(stack_pid, %{id: 1, generation: 1})
-    select_info = SelectInfo.new(:recv, make_ref())
+    select_info = {:select_info, :recv, make_ref()}
     cancel_task = Task.async(fn -> SmolNet.cancel(socket, select_info) end)
     assert_eventually(fn -> message_queue_length(stack_pid) == 1 end)
 

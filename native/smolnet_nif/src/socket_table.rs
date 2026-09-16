@@ -509,6 +509,20 @@ pub enum SocketError {
     InvalidOperation,
     Busy,
     SystemLimit,
+    InvalidAddress,
+    InvalidPort,
+    ScopeRequired,
+    InvalidScope,
+    AddressInUse,
+    AddressNotAvailable,
+    EphemeralPortsExhausted,
+    NetworkUnreachable,
+    AlreadyConnected,
+    NotBound,
+    NotConnected,
+    ConnectionRefused,
+    ConnectionReset,
+    ConnectionTimeout,
 }
 
 #[cfg(test)]

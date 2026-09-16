@@ -2,7 +2,6 @@ defmodule SmolNet.SocketReadinessTest do
   use ExUnit.Case, async: false
 
   alias SmolNet.Socket
-  alias SmolNet.Socket.SelectInfo
   alias SmolNet.Stack
   alias SmolNet.Test.Readiness
 
@@ -12,11 +11,11 @@ defmodule SmolNet.SocketReadinessTest do
     on_exit(fn -> stop_all_stacks() end)
   end
 
-  test "socket and select-info values validate stable identities" do
+  test "socket values validate stable identities and malformed select info crashes" do
     {:ok, stack} = SmolNet.start_stack()
     socket = Readiness.open(stack)
     reference = make_ref()
-    select_info = SelectInfo.new(:recv, reference)
+    select_info = {:select_info, :recv, reference}
 
     assert %Socket{stack: stack_pid, id: id, generation: generation} = socket
     assert is_pid(stack_pid)
@@ -24,11 +23,12 @@ defmodule SmolNet.SocketReadinessTest do
     assert generation in 1..@max_small_integer
     assert Socket.valid?(socket)
     assert Socket.identity(socket) == {id, generation}
-    assert select_info == %SelectInfo{operation: :recv, ref: reference}
-    assert SelectInfo.valid?(select_info)
-
+    assert select_info == {:select_info, :recv, reference}
     refute Socket.valid?(%{socket | generation: 0})
-    refute SelectInfo.valid?(%{select_info | operation: :unknown})
+
+    assert_raise FunctionClauseError, fn ->
+      SmolNet.cancel(socket, {:select_info, :unknown, reference})
+    end
   end
 
   test "try-and-arm cannot lose readiness at any instrumented point" do
@@ -66,7 +66,9 @@ defmodule SmolNet.SocketReadinessTest do
     refute_select(socket, first)
 
     assert {:select, second} = Readiness.wait(socket, :read, :recv)
-    refute first.ref == second.ref
+    assert {:select_info, :recv, first_reference} = first
+    assert {:select_info, :recv, second_reference} = second
+    refute first_reference == second_reference
     refute_select(socket, second)
 
     assert :ok = Readiness.ready(socket, :read)
@@ -277,19 +279,19 @@ defmodule SmolNet.SocketReadinessTest do
 
   defp assert_select(socket, select_info) do
     identity = Socket.identity(socket)
-    reference = select_info.ref
+    {:select_info, _operation, reference} = select_info
     assert_receive {:"$smol_socket", ^identity, :select, ^reference}
   end
 
   defp assert_abort(socket, select_info, reason) do
     identity = Socket.identity(socket)
-    reference = select_info.ref
+    {:select_info, _operation, reference} = select_info
     assert_receive {:"$smol_socket", ^identity, :abort, ^reference, ^reason}
   end
 
   defp refute_select(socket, select_info) do
     identity = Socket.identity(socket)
-    reference = select_info.ref
+    {:select_info, _operation, reference} = select_info
     refute_receive {:"$smol_socket", ^identity, :select, ^reference}
   end
 
