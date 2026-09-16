@@ -22,8 +22,10 @@ BEAM scheduler may wait for another thread.
   positive 64-bit BEAM small integer, so encoding an identity never allocates a
   heap bignum. Exhaustion returns :system_limit.
 - Represent a public socket as a SmolNet.Socket struct containing the stack PID,
-  ID, and generation. Native table lookup validates ID, generation, kind, and
-  lifecycle before touching socket state.
+  ID, and generation. Represent select information as the `:socket`-style
+  `{:select_info, operation, reference}` tagged tuple rather than a map. Native
+  table lookup validates ID, generation, kind, and lifecycle before touching
+  socket state.
 - Permit one read-direction and one write-direction waiter per socket. A
   competing waiter in the same direction returns :busy; the native table
   globally caps outstanding waiters at the configured per-call :ready_events

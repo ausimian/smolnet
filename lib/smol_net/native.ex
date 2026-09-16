@@ -23,6 +23,26 @@ defmodule SmolNet.Native do
   def socket_cancel(_stack, _identity, _operation, _reference),
     do: :erlang.nif_error(:nif_not_loaded)
 
+  @spec tcp_open(reference()) :: {:ok, map()} | {:error, atom()}
+  def tcp_open(_stack), do: :erlang.nif_error(:nif_not_loaded)
+
+  @spec tcp_bind(reference(), map(), map()) :: {:ok, map()} | {:error, atom()}
+  def tcp_bind(_stack, _identity, _endpoint), do: :erlang.nif_error(:nif_not_loaded)
+
+  @spec tcp_connect(reference(), map(), map(), pid(), reference(), integer()) ::
+          {:ok, map()} | {:error, atom()}
+  def tcp_connect(_stack, _identity, _endpoint, _pid, _reference, _now),
+    do: :erlang.nif_error(:nif_not_loaded)
+
+  @spec tcp_sockname(reference(), map()) :: {:ok, map()} | {:error, atom()}
+  def tcp_sockname(_stack, _identity), do: :erlang.nif_error(:nif_not_loaded)
+
+  @spec tcp_peername(reference(), map()) :: {:ok, map()} | {:error, atom()}
+  def tcp_peername(_stack, _identity), do: :erlang.nif_error(:nif_not_loaded)
+
+  @spec tcp_close(reference(), map(), integer()) :: {:ok, map()} | {:error, atom()}
+  def tcp_close(_stack, _identity, _now), do: :erlang.nif_error(:nif_not_loaded)
+
   @spec stack_snapshot(reference()) :: {:ok, map()} | {:error, atom()}
   def stack_snapshot(_stack), do: :erlang.nif_error(:nif_not_loaded)
 

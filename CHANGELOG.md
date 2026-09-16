@@ -19,3 +19,6 @@ and this project adheres to
   policies, and stack metrics.
 - Add stable socket identities, bounded one-shot readiness, independent
   read/write waiters, exact cancellation, and stale-event protection.
+- Add bounded IPv6 TCP sockets with bind and ephemeral ports, nonblocking
+  connect/finalize readiness, stable connection errors, endpoint queries,
+  timer-driven retransmission and timeout, and abortive close.

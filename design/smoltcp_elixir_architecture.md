@@ -476,7 +476,7 @@ try operation
     └─ would block
          ├─ install native waiter
          ├─ register the matching smoltcp one-shot waker
-         └─ return SelectInfo
+         └─ return {:select_info, operation, reference}
 ```
 
 This prevents the classic lost-wakeup race where readiness appears after a
@@ -959,7 +959,6 @@ lib/
   smol_net/
     stack.ex
     socket.ex
-    socket/select_info.ex
   smol_net/inet/
     socket.ex
     options.ex

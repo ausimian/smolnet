@@ -5,7 +5,6 @@ defmodule SmolNet.Stack do
 
   alias SmolNet.Native
   alias SmolNet.Socket
-  alias SmolNet.Socket.SelectInfo
   alias SmolNet.Stack.Clock.System, as: SystemClock
   alias SmolNet.Stack.Options
   alias SmolNet.Stack.Ref
@@ -49,13 +48,65 @@ defmodule SmolNet.Stack do
   end
 
   @doc false
-  @spec cancel(Socket.t(), SelectInfo.t()) ::
+  @spec cancel(Socket.t(), :socket.select_info()) ::
           :ok | :already_sent | :not_found | {:error, :closed | :invalid_socket}
   def cancel(
         %Socket{stack: stack, id: id, generation: generation},
-        %SelectInfo{operation: operation, ref: reference}
+        {:select_info, operation, reference}
       ) do
     GenServer.call(stack, {:socket_cancel, id, generation, operation, reference})
+  catch
+    :exit, _reason -> {:error, :closed}
+  end
+
+  @doc false
+  @spec socket_open(term()) :: {:ok, Socket.t()} | {:error, atom()}
+  def socket_open(%Ref{stack: stack}) do
+    GenServer.call(stack, :socket_open)
+  catch
+    :exit, _reason -> {:error, :closed}
+  end
+
+  def socket_open(_stack), do: {:error, :invalid_options}
+
+  @doc false
+  @spec socket_bind(Socket.t(), map()) :: :ok | {:error, atom()}
+  def socket_bind(%Socket{stack: stack, id: id, generation: generation}, endpoint) do
+    GenServer.call(stack, {:socket_bind, id, generation, endpoint})
+  catch
+    :exit, _reason -> {:error, :closed}
+  end
+
+  @doc false
+  @spec socket_connect(Socket.t(), map()) ::
+          :ok | {:select, :socket.select_info()} | {:error, atom()}
+  def socket_connect(%Socket{stack: stack, id: id, generation: generation}, endpoint) do
+    reference = make_ref()
+    GenServer.call(stack, {:socket_connect, id, generation, endpoint, reference})
+  catch
+    :exit, _reason -> {:error, :closed}
+  end
+
+  @doc false
+  @spec socket_sockname(Socket.t()) :: {:ok, Socket.sockaddr_in6()} | {:error, atom()}
+  def socket_sockname(%Socket{stack: stack, id: id, generation: generation}) do
+    GenServer.call(stack, {:socket_sockname, id, generation})
+  catch
+    :exit, _reason -> {:error, :closed}
+  end
+
+  @doc false
+  @spec socket_peername(Socket.t()) :: {:ok, Socket.sockaddr_in6()} | {:error, atom()}
+  def socket_peername(%Socket{stack: stack, id: id, generation: generation}) do
+    GenServer.call(stack, {:socket_peername, id, generation})
+  catch
+    :exit, _reason -> {:error, :closed}
+  end
+
+  @doc false
+  @spec socket_close(Socket.t()) :: :ok | {:error, atom()}
+  def socket_close(%Socket{stack: stack, id: id, generation: generation}) do
+    GenServer.call(stack, {:socket_close, id, generation})
   catch
     :exit, _reason -> {:error, :closed}
   end
@@ -301,6 +352,55 @@ defmodule SmolNet.Stack do
       reference
     )
     |> reply_native(state, &Function.identity/1, :preserve_timer)
+  end
+
+  def handle_call(:socket_open, _from, state) do
+    state.native_module.tcp_open(state.native)
+    |> reply_native(
+      state,
+      fn identity -> {:ok, Socket.new(self(), identity)} end,
+      :preserve_timer
+    )
+  end
+
+  def handle_call({:socket_bind, id, generation, endpoint}, _from, state) do
+    state.native_module.tcp_bind(state.native, %{id: id, generation: generation}, endpoint)
+    |> reply_native(state, &Function.identity/1, :preserve_timer)
+  end
+
+  def handle_call(
+        {:socket_connect, id, generation, endpoint, reference},
+        {caller, _tag},
+        state
+      ) do
+    state.native_module.tcp_connect(
+      state.native,
+      %{id: id, generation: generation},
+      endpoint,
+      caller,
+      reference,
+      state.clock.now()
+    )
+    |> reply_native(state, &normalize_wait_result/1)
+  end
+
+  def handle_call({:socket_sockname, id, generation}, _from, state) do
+    state.native_module.tcp_sockname(state.native, %{id: id, generation: generation})
+    |> reply_native(state, &normalize_endpoint/1, :preserve_timer)
+  end
+
+  def handle_call({:socket_peername, id, generation}, _from, state) do
+    state.native_module.tcp_peername(state.native, %{id: id, generation: generation})
+    |> reply_native(state, &normalize_endpoint/1, :preserve_timer)
+  end
+
+  def handle_call({:socket_close, id, generation}, _from, state) do
+    state.native_module.tcp_close(
+      state.native,
+      %{id: id, generation: generation},
+      state.clock.now()
+    )
+    |> reply_native(state)
   end
 
   def handle_call({:test_socket_open, internal_handle}, _from, state) do
@@ -560,8 +660,11 @@ defmodule SmolNet.Stack do
   end
 
   defp normalize_wait_result(:ready), do: :ready
+  defp normalize_wait_result(:ok), do: :ok
 
   defp normalize_wait_result({:select, operation, reference}) do
-    {:select, SelectInfo.new(operation, reference)}
+    {:select, {:select_info, operation, reference}}
   end
+
+  defp normalize_endpoint(endpoint), do: {:ok, Socket.endpoint_from_native(endpoint)}
 end

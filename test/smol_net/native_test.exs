@@ -96,6 +96,68 @@ defmodule SmolNet.NativeTest do
     assert Native.health() == :ok
   end
 
+  test "native TCP endpoint decoding returns stable validation errors" do
+    global = [0xFD, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]
+    link_local = [0xFE, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]
+    config = %{mtu: 1_280, addresses: [%{address: global, prefix_length: 64}], routes: []}
+    {:ok, %{result: resource}} = Native.stack_new(Stack.default_limits(), config, 0)
+    {:ok, %{result: identity}} = Native.tcp_open(resource)
+    huge_integer = 1_267_650_600_228_229_401_496_703_205_376
+
+    assert Native.tcp_bind(resource, identity, %{}) == {:error, :invalid_address}
+
+    assert Native.tcp_bind(resource, identity, %{address: global, scope_id: 0}) ==
+             {:error, :invalid_port}
+
+    assert Native.tcp_bind(resource, identity, %{address: global, port: 80}) ==
+             {:error, :invalid_scope}
+
+    assert Native.tcp_bind(resource, identity, %{
+             address: Enum.take(global, 15),
+             port: 80,
+             scope_id: 0
+           }) == {:error, :invalid_address}
+
+    assert Native.tcp_bind(resource, identity, %{address: [256 | global], port: 80, scope_id: 0}) ==
+             {:error, :invalid_address}
+
+    assert Native.tcp_bind(resource, identity, %{address: global, port: :http, scope_id: 0}) ==
+             {:error, :invalid_port}
+
+    assert Native.tcp_bind(resource, identity, %{
+             address: global,
+             port: huge_integer,
+             scope_id: 0
+           }) == {:error, :invalid_port}
+
+    assert Native.tcp_bind(resource, identity, %{
+             address: global,
+             port: 80,
+             scope_id: huge_integer
+           }) == {:error, :invalid_scope}
+
+    assert Native.tcp_bind(resource, identity, %{address: global, port: 80, scope_id: 0.0}) ==
+             {:error, :invalid_scope}
+
+    assert Native.tcp_bind(resource, identity, %{address: link_local, port: 80, scope_id: 0}) ==
+             {:error, :scope_required}
+
+    assert Native.tcp_bind(resource, identity, %{address: link_local, port: 80, scope_id: -1}) ==
+             {:error, :invalid_scope}
+
+    assert Native.tcp_connect(
+             resource,
+             identity,
+             %{address: :bad, port: 80, scope_id: 0},
+             self(),
+             make_ref(),
+             0
+           ) ==
+             {:error, :invalid_address}
+
+    assert Native.health() == :ok
+  end
+
   test "native ingress defensively rejects invalid and non-IPv6 packets" do
     config = %{mtu: 1_280, addresses: [], routes: []}
     {:ok, %{result: resource}} = Native.stack_new(Stack.default_limits(), config, 0)

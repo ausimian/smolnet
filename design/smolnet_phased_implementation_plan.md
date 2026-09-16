@@ -252,7 +252,6 @@ lib/
     stack/
       ref.ex                     # opaque stack runtime reference
     socket.ex
-    socket/select_info.ex
     inet_backend/
       tcp.ex                     # gen_tcp backend and TCP inet gen_statem
       udp.ex                     # gen_udp backend and UDP inet gen_statem
@@ -960,8 +959,8 @@ before TCP operations.
 - Implement `SocketEntry` validation by ID, generation, kind, and lifecycle.
 - Add one read waiter slot and one write waiter slot per socket, holding only
   PID, select reference, operation class, and stable socket identity.
-- Define the final `%SmolNet.Socket{stack, id, generation}` and
-  `%SmolNet.Socket.SelectInfo{operation, ref}` values.
+- Define the final `%SmolNet.Socket{stack, id, generation}` value and the
+  `{:select_info, operation, reference}` tagged tuple used by `:socket`.
 - Implement atomic try-and-arm support inside the native exclusive section.
 - Connect `smoltcp` one-shot wakers to a coalescing ready queue. Wakers must not
   allocate BEAM terms or send messages directly.
