@@ -47,11 +47,11 @@ jobs:
         with:
           workspaces: native -> target
 
+      # Keep project build artifacts fresh so Rustler always copies the NIF
+      # into priv/native during compilation.
       - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
-          path: |
-            deps
-            _build
+          path: deps
           key: >-
             mix-${{ runner.os }}-${{ matrix.elixir }}-${{ matrix.otp }}-
             ${{ hashFiles('mix.lock', 'native/Cargo.lock') }}
@@ -84,11 +84,12 @@ jobs:
         with:
           workspaces: native -> target
 
+      # Keep project build artifacts fresh so Rustler always copies the NIF
+      # into priv/native during compilation.
       - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: |
             deps
-            _build
             priv/plts
           key: >-
             quality-${{ runner.os }}-1.19.5-28.3-
