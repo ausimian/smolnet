@@ -335,7 +335,7 @@ defmodule SmolNet.Test.IPv6TcpPeer do
 
   defp chunk_binary(binary, size) do
     chunk_size = min(byte_size(binary), size)
-    <<chunk::binary-size(chunk_size), rest::binary>> = binary
+    <<chunk::binary-size(^chunk_size), rest::binary>> = binary
     [chunk | chunk_binary(rest, size)]
   end
 end

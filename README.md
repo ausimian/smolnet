@@ -4,11 +4,12 @@ SmolNet is an Elixir library that embeds the Rust
 [`smoltcp`](https://github.com/smoltcp-rs/smoltcp) TCP/IP stack behind a
 deliberately small Rustler NIF.
 
-The project is under initial development. Phase 5 provides independent raw-IP
+The project is under initial development. Phase 6 provides independent raw-IP
 IPv6 stacks plus low-level IPv6 TCP open, bind, connect, bounded stream I/O,
-half-close, endpoint queries, cancellation, and graceful close. The same
-operations support finite, infinite, and nonblocking caller-owned waits.
-Listening, the inet adapter, IPv4, and UDP arrive in later phases.
+half-close, endpoint queries, cancellation, and graceful close. Outbound IPv6
+TCP is also available through `:gen_tcp` with passive and active delivery,
+bounded packet framing, and normal controlling-process ownership. Listening,
+IPv4, and UDP arrive in later phases.
 
 `SmolNet.start_stack/1` creates an independent native stack and returns an
 opaque reference. A transport-neutral link process supplies complete IPv6
@@ -119,6 +120,50 @@ enough to drive FIN and retransmission, with a 30-second deadline measured from
 the close call; closing records continue to count against the socket limit.
 The public module documentation lists the stable validation, timeout,
 connection, stream, lifecycle, and handle errors.
+
+## `gen_tcp` IPv6 clients
+
+Select the SmolNet backend with `{:tcp_module, SmolNet.InetBackend.Tcp}` and
+identify the target stack with `{:smolnet_stack, stack}`. The returned socket
+works with the standard `:gen_tcp` and `:inet` client operations implemented by
+this phase:
+
+```elixir
+options = [
+  {:tcp_module, SmolNet.InetBackend.Tcp},
+  {:smolnet_stack, stack},
+  :inet6,
+  :binary,
+  {:active, false},
+  {:packet, :raw}
+]
+
+{:ok, socket} = :gen_tcp.connect(remote, 443, options, 5_000)
+:ok = :gen_tcp.send(socket, "request")
+{:ok, response} = :gen_tcp.recv(socket, 0, 5_000)
+:ok = :gen_tcp.shutdown(socket, :write)
+:ok = :gen_tcp.close(socket)
+```
+
+The adapter supports `:binary` and `:list`, packet modes `:raw`, `:line`, `1`,
+`2`, and `4`, and `active: false | true | :once | N` for `N` in
+`1..32_767`. Counted active mode counts complete logical packets and emits
+`{:tcp_passive, socket}` when exhausted. Active delivery is limited to 16
+native reads or logical packets per mailbox turn.
+
+The receive buffer and `packet_size` default to 65,536 bytes and each is capped
+at 1 MiB. Oversized frames return `:emsgsize` and close the socket because the
+stream cannot be resynchronized. Passive raw receives larger than the current
+receive bound also return `:emsgsize`. One read and one write may proceed at
+the same time; a second operation in the same direction returns `:busy`.
+`send_timeout` and `send_timeout_close` control a blocked adapter send.
+
+Each OTP socket is a temporary process under its stack bundle. The controlling
+process owns active messages, and `:gen_tcp.controlling_process/2` transfers
+queued and future messages in order. Owner death, adapter death, or stack
+failure closes the low-level socket without affecting independent stack
+bundles. This phase deliberately reports IPv4 as `:eafnosupport` and
+listen/accept as `:enotsup`.
 
 ## Development
 

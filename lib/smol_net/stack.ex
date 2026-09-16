@@ -144,6 +144,15 @@ defmodule SmolNet.Stack do
   end
 
   @doc false
+  @spec socket_watch_owner(Socket.t(), pid()) :: :ok | {:error, :closed}
+  def socket_watch_owner(%Socket{stack: stack, id: id, generation: generation}, owner)
+      when is_pid(owner) do
+    GenServer.call(stack, {:socket_watch_owner, id, generation, owner})
+  catch
+    :exit, _reason -> {:error, :closed}
+  end
+
+  @doc false
   def test_socket_open(%Ref{stack: stack}, internal_handle) do
     GenServer.call(stack, {:test_socket_open, internal_handle})
   end
@@ -248,7 +257,8 @@ defmodule SmolNet.Stack do
       rejected_ingress: 0,
       dropped_egress: 0,
       native_continuation: false,
-      pending_ingress: nil
+      pending_ingress: nil,
+      socket_owner_monitors: %{}
     }
 
     {:ok, state, {:continue, :create_native_stack}}
@@ -329,6 +339,17 @@ defmodule SmolNet.Stack do
       when is_reference(monitor) do
     Process.demonitor(monitor, [:flush])
     {:noreply, %{state | starter_monitor: nil}}
+  end
+
+  def handle_info({:DOWN, monitor, :process, _owner, _reason}, state) do
+    case Map.pop(state.socket_owner_monitors, monitor) do
+      {nil, _monitors} ->
+        {:noreply, state}
+
+      {identity, monitors} ->
+        state = %{state | socket_owner_monitors: monitors}
+        close_owned_socket(state, identity)
+    end
   end
 
   def handle_info(_message, state), do: {:noreply, state}
@@ -475,6 +496,13 @@ defmodule SmolNet.Stack do
       state.clock.now()
     )
     |> reply_native(state)
+  end
+
+  def handle_call({:socket_watch_owner, id, generation, owner}, _from, state) do
+    monitor = Process.monitor(owner)
+    identity = %{id: id, generation: generation}
+    monitors = Map.put(state.socket_owner_monitors, monitor, identity)
+    {:reply, :ok, %{state | socket_owner_monitors: monitors}}
   end
 
   def handle_call({:test_socket_open, internal_handle}, _from, state) do
@@ -639,6 +667,13 @@ defmodule SmolNet.Stack do
       true ->
         state = Map.put(state, :native_continuation, false)
         replace_timer(state, poll_at)
+    end
+  end
+
+  defp close_owned_socket(state, identity) do
+    case state.native_module.tcp_close(state.native, identity, state.clock.now()) do
+      {:ok, envelope} -> {:noreply, apply_effects(state, envelope)}
+      {:error, _reason} -> {:noreply, state}
     end
   end
 

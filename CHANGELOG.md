@@ -25,3 +25,6 @@ and this project adheres to
 - Add bounded IPv6 TCP stream send and receive, finite and infinite caller-side
   deadline loops, half-close behavior, EOF and reset handling, and graceful
   close with bounded native FIN retention.
+- Add an outbound IPv6 `gen_tcp` backend with passive and bounded active modes,
+  raw, line, and length-prefixed framing, binary/list representation, socket
+  ownership transfer, adapter deadlines, and isolated lifecycle cleanup.
