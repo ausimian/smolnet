@@ -4,6 +4,7 @@ mod socket_table;
 mod stack;
 mod tcp;
 mod time;
+mod udp;
 mod waiter;
 
 use limits::{Limits, Work};
@@ -33,6 +34,8 @@ mod atoms {
         busy,
         system_limit,
         unsupported_socket,
+        unsupported_family,
+        message_too_large,
         invalid_address,
         invalid_port,
         invalid_backlog,
@@ -374,6 +377,163 @@ fn tcp_close<'a>(
 }
 
 #[rustler::nif]
+fn udp_open<'a>(
+    env: Env<'a>,
+    resource: ResourceArc<StackResource>,
+    family: crate::tcp::AddressFamily,
+) -> Term<'a> {
+    let result = catch_operation(|| {
+        resource
+            .with_stack(|stack| stack.udp_open(env, family))
+            .map_err(|_| atoms::ownership_invariant_violation())?
+            .map_err(socket_error_atom)
+    });
+
+    encode_envelope_result(env, result)
+}
+
+#[rustler::nif]
+fn udp_bind<'a>(
+    env: Env<'a>,
+    resource: ResourceArc<StackResource>,
+    identity: SocketIdentity,
+    endpoint_term: Term<'a>,
+) -> Term<'a> {
+    let result = catch_operation(|| {
+        let endpoint = decode_tcp_endpoint(endpoint_term).map_err(socket_error_atom)?;
+        resource
+            .with_stack(|stack| stack.udp_bind(env, identity, endpoint))
+            .map_err(|_| atoms::ownership_invariant_violation())?
+            .map_err(socket_error_atom)
+    });
+
+    encode_envelope_result(env, result)
+}
+
+#[rustler::nif]
+fn udp_connect<'a>(
+    env: Env<'a>,
+    resource: ResourceArc<StackResource>,
+    identity: SocketIdentity,
+    endpoint_term: Term<'a>,
+) -> Term<'a> {
+    let result = catch_operation(|| {
+        let endpoint = decode_tcp_endpoint(endpoint_term).map_err(socket_error_atom)?;
+        resource
+            .with_stack(|stack| stack.udp_connect(env, identity, endpoint))
+            .map_err(|_| atoms::ownership_invariant_violation())?
+            .map_err(socket_error_atom)
+    });
+
+    encode_envelope_result(env, result)
+}
+
+#[rustler::nif]
+#[allow(clippy::too_many_arguments)]
+fn udp_sendto<'a>(
+    env: Env<'a>,
+    resource: ResourceArc<StackResource>,
+    identity: SocketIdentity,
+    endpoint_term: Term<'a>,
+    data: Binary<'a>,
+    pid: LocalPid,
+    reference: Reference<'a>,
+    now_millis: i64,
+) -> Term<'a> {
+    let result = catch_operation(|| {
+        let endpoint = decode_tcp_endpoint(endpoint_term).map_err(socket_error_atom)?;
+        let now = time::instant_from_millis(now_millis).map_err(|_| atoms::time_overflow())?;
+        resource
+            .with_stack(|stack| {
+                stack.udp_sendto(
+                    env,
+                    identity,
+                    endpoint,
+                    data.as_slice(),
+                    pid,
+                    reference,
+                    now,
+                )
+            })
+            .map_err(|_| atoms::ownership_invariant_violation())?
+            .map_err(socket_error_atom)
+    });
+
+    encode_envelope_result(env, result)
+}
+
+#[rustler::nif]
+fn udp_recvfrom<'a>(
+    env: Env<'a>,
+    resource: ResourceArc<StackResource>,
+    identity: SocketIdentity,
+    length: usize,
+    pid: LocalPid,
+    reference: Reference<'a>,
+    now_millis: i64,
+) -> Term<'a> {
+    let result: Result<Result<Envelope<Term<'a>>, Atom>, ()> = catch_operation(|| {
+        let now = time::instant_from_millis(now_millis).map_err(|_| atoms::time_overflow())?;
+        resource
+            .with_stack(|stack| stack.udp_recvfrom(env, identity, length, pid, reference, now))
+            .map_err(|_| atoms::ownership_invariant_violation())?
+            .map_err(socket_error_atom)
+    });
+
+    encode_envelope_result(env, result)
+}
+
+#[rustler::nif]
+fn udp_sockname<'a>(
+    env: Env<'a>,
+    resource: ResourceArc<StackResource>,
+    identity: SocketIdentity,
+) -> Term<'a> {
+    let result = catch_operation(|| {
+        resource
+            .with_stack(|stack| stack.udp_sockname(env, identity))
+            .map_err(|_| atoms::ownership_invariant_violation())?
+            .map_err(socket_error_atom)
+    });
+
+    encode_envelope_result(env, result)
+}
+
+#[rustler::nif]
+fn udp_peername<'a>(
+    env: Env<'a>,
+    resource: ResourceArc<StackResource>,
+    identity: SocketIdentity,
+) -> Term<'a> {
+    let result = catch_operation(|| {
+        resource
+            .with_stack(|stack| stack.udp_peername(env, identity))
+            .map_err(|_| atoms::ownership_invariant_violation())?
+            .map_err(socket_error_atom)
+    });
+
+    encode_envelope_result(env, result)
+}
+
+#[rustler::nif]
+fn udp_close<'a>(
+    env: Env<'a>,
+    resource: ResourceArc<StackResource>,
+    identity: SocketIdentity,
+    now_millis: i64,
+) -> Term<'a> {
+    let result = catch_operation(|| {
+        let now = time::instant_from_millis(now_millis).map_err(|_| atoms::time_overflow())?;
+        resource
+            .with_stack(|stack| stack.udp_close(env, identity, now))
+            .map_err(|_| atoms::ownership_invariant_violation())?
+            .map_err(socket_error_atom)
+    });
+
+    encode_envelope_result(env, result)
+}
+
+#[rustler::nif]
 fn stack_snapshot<'a>(env: Env<'a>, resource: ResourceArc<StackResource>) -> Term<'a> {
     guarded(env, || {
         resource
@@ -582,6 +742,8 @@ fn socket_error_atom(error: SocketError) -> Atom {
         SocketError::InvalidOperation => atoms::invalid_operation(),
         SocketError::Busy => atoms::busy(),
         SocketError::SystemLimit => atoms::system_limit(),
+        SocketError::UnsupportedFamily => atoms::unsupported_family(),
+        SocketError::MessageTooLarge => atoms::message_too_large(),
         SocketError::InvalidAddress => atoms::invalid_address(),
         SocketError::InvalidPort => atoms::invalid_port(),
         SocketError::InvalidBacklog => atoms::invalid_backlog(),

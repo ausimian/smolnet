@@ -4,11 +4,11 @@ SmolNet is an Elixir library that embeds the Rust
 [`smoltcp`](https://github.com/smoltcp-rs/smoltcp) TCP/IP stack behind a
 deliberately small Rustler NIF.
 
-The project is under initial development. Phase 8 provides independent raw-IP
-dual-family stacks plus complete low-level IPv4 and IPv6 TCP client/server
-operation. Both families are also available through `:gen_tcp` with passive
-and active delivery, bounded packet framing, and normal controlling-process
-ownership. UDP arrives in later phases.
+The project is under initial development. Phase 9 provides independent raw-IP
+dual-family stacks, complete low-level IPv4 and IPv6 TCP client/server
+operation, and bounded IPv6 UDP. TCP is available through `:gen_tcp`; IPv6 UDP
+is available through `:gen_udp`, with passive and active delivery and normal
+controlling-process ownership. IPv4 UDP arrives in Phase 10.
 
 `SmolNet.start_stack/1` creates an independent native stack and returns an
 opaque reference. A transport-neutral link process supplies complete IPv4 or IPv6
@@ -176,6 +176,46 @@ children and listening or half-open pool members. Already-returned children are
 independent and remain usable. Stack shutdown releases both listener and child
 state.
 
+## Low-level IPv6 UDP
+
+Open IPv6 UDP with `SmolNet.open(:inet6, :dgram, :udp, stack: stack)`. IPv4 UDP
+is explicitly unsupported until Phase 10. UDP and TCP have independent port
+namespaces, so one IPv6 stack may bind both protocols to the same numeric port.
+
+```elixir
+local = %{family: :inet6, addr: local_address, port: 0}
+peer = %{family: :inet6, addr: peer_address, port: 53}
+
+{:ok, socket} = SmolNet.open(:inet6, :dgram, :udp, stack: stack)
+:ok = SmolNet.bind(socket, local)
+:ok = SmolNet.sendto(socket, <<0, 1, "query">>, peer, 5_000)
+
+{:ok, datagram} = SmolNet.recvfrom(socket, 0, 5_000)
+%{source: source, destination: destination, data: payload, truncated: false} = datagram
+```
+
+Each native UDP socket has fixed receive and transmit rings of 16 packet
+metadata entries and 16 KiB of payload. The maximum accepted IPv6 datagram
+payload is `min(stack_mtu - 48, 16_384)` bytes: 48 bytes reserve the IPv6 and
+UDP headers. A larger send returns `:message_too_large`; the `gen_udp` adapter
+translates that error to `:emsgsize`. A send is accepted in full or not at all.
+When the transmit ring is full, `:nowait` returns a write-direction select hint
+and a retry uses the original complete datagram—there is no partial progress.
+
+`recvfrom(socket, 0, timeout)` returns one complete datagram, including a
+zero-length datagram. A positive length returns at most that many bytes,
+discards the remainder of that datagram, and reports `truncated: true`. Source
+and the packet's actual local destination are retained. Invalid UDP checksums
+are discarded by the native stack; an unreachable destination fails before
+queueing with `:network_unreachable`.
+
+UDP uses the same one-shot read/write waiter table, cancellation result, caller
+deadline loop, ready-event sweep, timer propagation, and output bounds as TCP.
+One read and one write waiter may coexist. Closing a UDP socket invalidates it
+immediately and aborts both waiters; UDP has no retained graceful-close state.
+`SmolNet.connect/2` stores a default peer, restricts later sends to that peer,
+and discards incoming datagrams from other peers.
+
 ## `gen_tcp` IPv4 and IPv6 clients and servers
 
 Select the SmolNet backend with `{:tcp_module, SmolNet.InetBackend.Tcp}` and
@@ -248,6 +288,47 @@ failure closes the low-level socket without affecting independent stack
 bundles. A listener has its own adapter state, while each accepted child gets a
 separate connected-stream adapter owned by the process that called
 `:gen_tcp.accept/2`.
+
+## `gen_udp` IPv6 sockets
+
+Select the IPv6 backend with `{:udp_module, SmolNet.InetBackend.Udp}` and pass
+the target stack with `{:smolnet_stack, stack}`:
+
+```elixir
+options = [
+  {:udp_module, SmolNet.InetBackend.Udp},
+  {:smolnet_stack, stack},
+  :inet6,
+  :binary,
+  {:active, false}
+]
+
+{:ok, socket} = :gen_udp.open(0, options)
+:ok = :gen_udp.send(socket, peer_address, 53, "query")
+{:ok, {source_address, source_port, response}} = :gen_udp.recv(socket, 0, 5_000)
+:ok = :gen_udp.connect(socket, peer_address, 53)
+:ok = :gen_udp.send(socket, "connected query")
+:ok = :gen_udp.close(socket)
+```
+
+Supported UDP socket policy is `:binary` or `:list`,
+`active: false | true | :once | N` for `N` in `1..32_767`, and bounded
+`buffer`/`recbuf` values from 1 byte through 1 MiB. The buffer caps the payload
+returned for both passive and active receives; a larger datagram is truncated
+and its remainder discarded, as with the standard callback's unreported receive
+truncation. Active messages have the standard
+`{:udp, socket, source_address, source_port, packet}` shape; counted mode emits
+`{:udp_passive, socket}` when exhausted. Each adapter mailbox turn delivers at
+most 16 datagrams before yielding. Packet framing, send timeouts, ancillary
+data, multicast, broadcast, raw options, and file descriptors are unsupported
+and fail explicitly.
+
+Every UDP socket is a temporary state-machine child under its stack bundle.
+Read and write continuations are independent, competing operations in one
+direction return `:busy`, controlling-process transfer moves queued and future
+active messages, and owner or adapter death closes only that socket. Stack
+failure terminates its adapters with `:enetdown` without affecting another
+stack bundle.
 
 ## Development
 

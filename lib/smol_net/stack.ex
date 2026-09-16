@@ -62,19 +62,21 @@ defmodule SmolNet.Stack do
   end
 
   @doc false
-  @spec socket_open(term(), :inet | :inet6) :: {:ok, Socket.t()} | {:error, atom()}
-  def socket_open(%Ref{stack: stack}, family) when family in [:inet, :inet6] do
-    GenServer.call(stack, {:socket_open, family})
+  @spec socket_open(term(), :inet | :inet6, :stream | :datagram) ::
+          {:ok, Socket.t()} | {:error, atom()}
+  def socket_open(%Ref{stack: stack}, family, kind)
+      when family in [:inet, :inet6] and kind in [:stream, :datagram] do
+    GenServer.call(stack, {:socket_open, family, kind})
   catch
     :exit, _reason -> {:error, :closed}
   end
 
-  def socket_open(_stack, _family), do: {:error, :invalid_options}
+  def socket_open(_stack, _family, _kind), do: {:error, :invalid_options}
 
   @doc false
   @spec socket_bind(Socket.t(), map()) :: :ok | {:error, atom()}
-  def socket_bind(%Socket{stack: stack, id: id, generation: generation}, endpoint) do
-    GenServer.call(stack, {:socket_bind, id, generation, endpoint})
+  def socket_bind(%Socket{stack: stack, id: id, generation: generation, kind: kind}, endpoint) do
+    GenServer.call(stack, {:socket_bind, id, generation, kind, endpoint})
   catch
     :exit, _reason -> {:error, :closed}
   end
@@ -114,9 +116,12 @@ defmodule SmolNet.Stack do
   @doc false
   @spec socket_connect(Socket.t(), map()) ::
           :ok | {:select, :socket.select_info()} | {:error, atom()}
-  def socket_connect(%Socket{stack: stack, id: id, generation: generation}, endpoint) do
+  def socket_connect(
+        %Socket{stack: stack, id: id, generation: generation, kind: kind},
+        endpoint
+      ) do
     reference = make_ref()
-    GenServer.call(stack, {:socket_connect, id, generation, endpoint, reference})
+    GenServer.call(stack, {:socket_connect, id, generation, kind, endpoint, reference})
   catch
     :exit, _reason -> {:error, :closed}
   end
@@ -145,6 +150,30 @@ defmodule SmolNet.Stack do
   end
 
   @doc false
+  @spec socket_sendto(Socket.t(), map(), binary()) ::
+          :ok | {:select, :socket.select_info()} | {:error, atom()}
+  def socket_sendto(
+        %Socket{stack: stack, id: id, generation: generation},
+        endpoint,
+        data
+      ) do
+    reference = make_ref()
+    GenServer.call(stack, {:socket_sendto, id, generation, endpoint, data, reference})
+  catch
+    :exit, _reason -> {:error, :closed}
+  end
+
+  @doc false
+  @spec socket_recvfrom(Socket.t(), non_neg_integer()) ::
+          {:ok, Socket.datagram()} | {:select, :socket.select_info()} | {:error, atom()}
+  def socket_recvfrom(%Socket{stack: stack, id: id, generation: generation}, length) do
+    reference = make_ref()
+    GenServer.call(stack, {:socket_recvfrom, id, generation, length, reference})
+  catch
+    :exit, _reason -> {:error, :closed}
+  end
+
+  @doc false
   @spec socket_shutdown(Socket.t(), :read | :write | :read_write) ::
           :ok | {:error, atom()}
   def socket_shutdown(%Socket{stack: stack, id: id, generation: generation}, how) do
@@ -156,8 +185,8 @@ defmodule SmolNet.Stack do
   @doc false
   @spec socket_sockname(Socket.t()) ::
           {:ok, Socket.sockaddr_in() | Socket.sockaddr_in6()} | {:error, atom()}
-  def socket_sockname(%Socket{stack: stack, id: id, generation: generation}) do
-    GenServer.call(stack, {:socket_sockname, id, generation})
+  def socket_sockname(%Socket{stack: stack, id: id, generation: generation, kind: kind}) do
+    GenServer.call(stack, {:socket_sockname, id, generation, kind})
   catch
     :exit, _reason -> {:error, :closed}
   end
@@ -165,16 +194,16 @@ defmodule SmolNet.Stack do
   @doc false
   @spec socket_peername(Socket.t()) ::
           {:ok, Socket.sockaddr_in() | Socket.sockaddr_in6()} | {:error, atom()}
-  def socket_peername(%Socket{stack: stack, id: id, generation: generation}) do
-    GenServer.call(stack, {:socket_peername, id, generation})
+  def socket_peername(%Socket{stack: stack, id: id, generation: generation, kind: kind}) do
+    GenServer.call(stack, {:socket_peername, id, generation, kind})
   catch
     :exit, _reason -> {:error, :closed}
   end
 
   @doc false
   @spec socket_close(Socket.t()) :: :ok | {:error, atom()}
-  def socket_close(%Socket{stack: stack, id: id, generation: generation}) do
-    GenServer.call(stack, {:socket_close, id, generation})
+  def socket_close(%Socket{stack: stack, id: id, generation: generation, kind: kind}) do
+    GenServer.call(stack, {:socket_close, id, generation, kind})
   catch
     :exit, _reason -> {:error, :closed}
   end
@@ -383,7 +412,7 @@ defmodule SmolNet.Stack do
       {nil, _monitors} ->
         {:noreply, state}
 
-      {identity, monitors} ->
+      {{identity, kind}, monitors} ->
         state = %{
           state
           | socket_owner_monitors: monitors,
@@ -391,7 +420,7 @@ defmodule SmolNet.Stack do
               Map.delete(state.socket_owner_monitors_by_identity, identity_key(identity))
         }
 
-        close_owned_socket(state, identity)
+        close_owned_socket(state, identity, kind)
     end
   end
 
@@ -450,17 +479,31 @@ defmodule SmolNet.Stack do
     |> reply_native(state, &Function.identity/1, :preserve_timer)
   end
 
-  def handle_call({:socket_open, family}, _from, state) do
-    state.native_module.tcp_open(state.native, family)
+  def handle_call({:socket_open, family, kind}, _from, state) do
+    result =
+      case kind do
+        :stream -> state.native_module.tcp_open(state.native, family)
+        :datagram -> state.native_module.udp_open(state.native, family)
+      end
+
+    result
     |> reply_native(
       state,
-      fn identity -> {:ok, Socket.new(self(), identity, family)} end,
+      fn identity -> {:ok, Socket.new(self(), identity, family, kind)} end,
       :preserve_timer
     )
   end
 
-  def handle_call({:socket_bind, id, generation, endpoint}, _from, state) do
-    state.native_module.tcp_bind(state.native, %{id: id, generation: generation}, endpoint)
+  def handle_call({:socket_bind, id, generation, kind, endpoint}, _from, state) do
+    identity = %{id: id, generation: generation}
+
+    result =
+      case kind do
+        :stream -> state.native_module.tcp_bind(state.native, identity, endpoint)
+        :datagram -> state.native_module.udp_bind(state.native, identity, endpoint)
+      end
+
+    result
     |> reply_native(state, &Function.identity/1, :preserve_timer)
   end
 
@@ -505,7 +548,7 @@ defmodule SmolNet.Stack do
   end
 
   def handle_call(
-        {:socket_connect, id, generation, endpoint, reference},
+        {:socket_connect, id, generation, :stream, endpoint, reference},
         {caller, _tag},
         state
       ) do
@@ -518,6 +561,19 @@ defmodule SmolNet.Stack do
       state.clock.now()
     )
     |> reply_native(state, &normalize_wait_result/1)
+  end
+
+  def handle_call(
+        {:socket_connect, id, generation, :datagram, endpoint, _reference},
+        _from,
+        state
+      ) do
+    state.native_module.udp_connect(
+      state.native,
+      %{id: id, generation: generation},
+      endpoint
+    )
+    |> reply_native(state, &Function.identity/1, :preserve_timer)
   end
 
   def handle_call(
@@ -552,6 +608,39 @@ defmodule SmolNet.Stack do
     |> reply_native(state, &normalize_recv_result/1)
   end
 
+  def handle_call(
+        {:socket_sendto, id, generation, endpoint, data, reference},
+        {caller, _tag},
+        state
+      ) do
+    state.native_module.udp_sendto(
+      state.native,
+      %{id: id, generation: generation},
+      endpoint,
+      data,
+      caller,
+      reference,
+      state.clock.now()
+    )
+    |> reply_native(state, &normalize_datagram_wait_result/1)
+  end
+
+  def handle_call(
+        {:socket_recvfrom, id, generation, length, reference},
+        {caller, _tag},
+        state
+      ) do
+    state.native_module.udp_recvfrom(
+      state.native,
+      %{id: id, generation: generation},
+      length,
+      caller,
+      reference,
+      state.clock.now()
+    )
+    |> reply_native(state, &normalize_recvfrom_result/1)
+  end
+
   def handle_call({:socket_shutdown, id, generation, how}, _from, state) do
     state.native_module.tcp_shutdown(
       state.native,
@@ -562,20 +651,28 @@ defmodule SmolNet.Stack do
     |> reply_native(state)
   end
 
-  def handle_call({:socket_sockname, id, generation}, _from, state) do
-    state.native_module.tcp_sockname(state.native, %{id: id, generation: generation})
+  def handle_call({:socket_sockname, id, generation, kind}, _from, state) do
+    identity = %{id: id, generation: generation}
+    result = socket_name_call(state, kind, :sockname, identity)
+
+    result
     |> reply_native(state, &normalize_endpoint/1, :preserve_timer)
   end
 
-  def handle_call({:socket_peername, id, generation}, _from, state) do
-    state.native_module.tcp_peername(state.native, %{id: id, generation: generation})
+  def handle_call({:socket_peername, id, generation, kind}, _from, state) do
+    identity = %{id: id, generation: generation}
+    result = socket_name_call(state, kind, :peername, identity)
+
+    result
     |> reply_native(state, &normalize_endpoint/1, :preserve_timer)
   end
 
-  def handle_call({:socket_close, id, generation}, _from, state) do
+  def handle_call({:socket_close, id, generation, kind}, _from, state) do
     identity = %{id: id, generation: generation}
 
-    case state.native_module.tcp_close(state.native, identity, state.clock.now()) do
+    result = close_socket_call(state, kind, identity)
+
+    case result do
       {:ok, envelope} ->
         state = state |> unwatch_socket_owner(identity) |> apply_effects(envelope)
         {:reply, Map.fetch!(envelope, :result), state}
@@ -589,9 +686,11 @@ defmodule SmolNet.Stack do
     identity = %{id: id, generation: generation}
 
     case state.native_module.socket_validate(state.native, identity) do
-      {:ok, envelope} ->
+      {:ok, %{result: native_kind} = envelope} ->
         state =
-          state |> apply_effects(envelope, :preserve_timer) |> watch_socket_owner(identity, owner)
+          state
+          |> apply_effects(envelope, :preserve_timer)
+          |> watch_socket_owner(identity, native_kind, owner)
 
         {:reply, :ok, state}
 
@@ -802,12 +901,35 @@ defmodule SmolNet.Stack do
     end
   end
 
-  defp close_owned_socket(state, identity) do
-    case state.native_module.tcp_close(state.native, identity, state.clock.now()) do
+  defp close_owned_socket(state, identity, kind) do
+    case close_socket_call(state, native_socket_kind(kind), identity) do
       {:ok, envelope} -> {:noreply, apply_effects(state, envelope)}
       {:error, _reason} -> {:noreply, state}
     end
   end
+
+  defp close_socket_call(state, :stream, identity) do
+    state.native_module.tcp_close(state.native, identity, state.clock.now())
+  end
+
+  defp close_socket_call(state, :datagram, identity) do
+    state.native_module.udp_close(state.native, identity, state.clock.now())
+  end
+
+  defp socket_name_call(state, :stream, :sockname, identity),
+    do: state.native_module.tcp_sockname(state.native, identity)
+
+  defp socket_name_call(state, :stream, :peername, identity),
+    do: state.native_module.tcp_peername(state.native, identity)
+
+  defp socket_name_call(state, :datagram, :sockname, identity),
+    do: state.native_module.udp_sockname(state.native, identity)
+
+  defp socket_name_call(state, :datagram, :peername, identity),
+    do: state.native_module.udp_peername(state.native, identity)
+
+  defp native_socket_kind(:tcp), do: :stream
+  defp native_socket_kind(:udp), do: :datagram
 
   defp emit_packets(%{link_status: :up} = state, packets) do
     Enum.each(packets, fn packet ->
@@ -903,7 +1025,7 @@ defmodule SmolNet.Stack do
   defp reply_owned_accept({:ok, envelope}, state, owner) do
     case Map.fetch!(envelope, :result) do
       {:ok, identity, family} ->
-        state = state |> apply_effects(envelope) |> watch_socket_owner(identity, owner)
+        state = state |> apply_effects(envelope) |> watch_socket_owner(identity, :tcp, owner)
         {:reply, {:ok, Socket.new(self(), identity, family)}, state}
 
       result ->
@@ -920,6 +1042,27 @@ defmodule SmolNet.Stack do
 
   defp normalize_wait_result({:select, operation, reference}) do
     {:select, {:select_info, operation, reference}}
+  end
+
+  defp normalize_datagram_wait_result(:ok), do: :ok
+
+  defp normalize_datagram_wait_result({:select, :sendto, reference}) do
+    {:select, {:select_info, :sendto, reference}}
+  end
+
+  defp normalize_recvfrom_result({:ok, source, destination, data, truncated})
+       when is_binary(data) and is_boolean(truncated) do
+    {:ok,
+     %{
+       source: Socket.endpoint_from_native(source),
+       destination: Socket.endpoint_from_native(destination),
+       data: data,
+       truncated: truncated
+     }}
+  end
+
+  defp normalize_recvfrom_result({:select, :recvfrom, reference}) do
+    {:select, {:select_info, :recvfrom, reference}}
   end
 
   defp normalize_accept_result({:ok, identity, family}, stack) do
@@ -950,14 +1093,15 @@ defmodule SmolNet.Stack do
 
   defp normalize_endpoint(endpoint), do: {:ok, Socket.endpoint_from_native(endpoint)}
 
-  defp watch_socket_owner(state, identity, owner) do
+  defp watch_socket_owner(state, identity, native_kind, owner) do
     state = unwatch_socket_owner(state, identity)
     key = identity_key(identity)
     monitor = Process.monitor(owner)
 
     %{
       state
-      | socket_owner_monitors: Map.put(state.socket_owner_monitors, monitor, identity),
+      | socket_owner_monitors:
+          Map.put(state.socket_owner_monitors, monitor, {identity, native_kind}),
         socket_owner_monitors_by_identity:
           Map.put(state.socket_owner_monitors_by_identity, key, monitor)
     }

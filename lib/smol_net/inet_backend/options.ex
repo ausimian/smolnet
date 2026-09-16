@@ -74,12 +74,37 @@ defmodule SmolNet.InetBackend.Options do
 
   def parse_listen(_options, _port), do: {:error, :einval}
 
+  @spec parse_udp(list(), :inet.port_number()) :: {:ok, t()} | {:error, atom()}
+  def parse_udp(options, port)
+      when is_list(options) and is_integer(port) and port in 0..65_535 do
+    case fetch_stack(options) do
+      {:ok, stack} ->
+        reduce(
+          options,
+          %__MODULE__{stack: stack, bind_port: port, family: family(options)},
+          :udp_open
+        )
+
+      {:error, _reason} = error ->
+        error
+    end
+  end
+
+  def parse_udp(_options, _port), do: {:error, :einval}
+
   @spec update(t(), list()) :: {:ok, t()} | {:error, atom()}
   def update(%__MODULE__{} = current, options) when is_list(options) do
     reduce(options, current, :runtime)
   end
 
   def update(%__MODULE__{}, _options), do: {:error, :einval}
+
+  @spec update_udp(t(), list()) :: {:ok, t()} | {:error, atom()}
+  def update_udp(%__MODULE__{} = current, options) when is_list(options) do
+    reduce(options, current, :udp_runtime)
+  end
+
+  def update_udp(%__MODULE__{}, _options), do: {:error, :einval}
 
   @spec get(t(), list()) :: {:ok, list()} | {:error, atom()}
   def get(%__MODULE__{} = options, names) when is_list(names) do
@@ -97,6 +122,17 @@ defmodule SmolNet.InetBackend.Options do
   end
 
   def get(%__MODULE__{}, _names), do: {:error, :einval}
+
+  @spec get_udp(t(), list()) :: {:ok, list()} | {:error, atom()}
+  def get_udp(%__MODULE__{} = options, names) when is_list(names) do
+    if Enum.all?(names, &(&1 in [:active, :mode, :buffer, :recbuf])) do
+      get(options, names)
+    else
+      {:error, :einval}
+    end
+  end
+
+  def get_udp(%__MODULE__{}, _names), do: {:error, :einval}
 
   @spec receive_limit(t()) :: pos_integer()
   def receive_limit(%__MODULE__{buffer: buffer, packet_size: packet_size}) do
@@ -139,19 +175,19 @@ defmodule SmolNet.InetBackend.Options do
   end
 
   defp put_option(options, {:smolnet_stack, %Ref{}}, context)
-       when context in [:connect, :listen],
+       when context in [:connect, :listen, :udp_open],
        do: {:ok, options}
 
   defp put_option(_options, {:smolnet_stack, _stack}, context)
-       when context in [:connect, :listen],
+       when context in [:connect, :listen, :udp_open],
        do: {:error, :einval}
 
   defp put_option(%{family: family} = options, family, context)
-       when family in [:inet, :inet6] and context in [:connect, :listen],
+       when family in [:inet, :inet6] and context in [:connect, :listen, :udp_open],
        do: {:ok, options}
 
   defp put_option(_options, family, context)
-       when family in [:inet, :inet6] and context in [:connect, :listen],
+       when family in [:inet, :inet6] and context in [:connect, :listen, :udp_open],
        do: {:error, :eafnosupport}
 
   defp put_option(options, :binary, _context), do: {:ok, %{options | mode: :binary}}
@@ -164,6 +200,14 @@ defmodule SmolNet.InetBackend.Options do
       :error -> {:error, :einval}
     end
   end
+
+  defp put_option(_options, {:packet, _packet}, context)
+       when context in [:udp_open, :udp_runtime],
+       do: {:error, :einval}
+
+  defp put_option(_options, {:packet_size, _size}, context)
+       when context in [:udp_open, :udp_runtime],
+       do: {:error, :einval}
 
   defp put_option(options, {:packet, packet}, _context) do
     case normalize_packet(packet) do
@@ -183,29 +227,47 @@ defmodule SmolNet.InetBackend.Options do
     {:ok, %{options | buffer: size}}
   end
 
+  defp put_option(_options, {:send_timeout, _timeout}, context)
+       when context in [:udp_open, :udp_runtime],
+       do: {:error, :einval}
+
   defp put_option(options, {:send_timeout, timeout}, _context)
        when timeout == :infinity or
               (is_integer(timeout) and timeout >= 0 and timeout <= @max_timeout) do
     {:ok, %{options | send_timeout: timeout}}
   end
 
+  defp put_option(_options, {:send_timeout, _timeout}, _context), do: {:error, :einval}
+
+  defp put_option(_options, {:send_timeout_close, _close?}, context)
+       when context in [:udp_open, :udp_runtime],
+       do: {:error, :einval}
+
   defp put_option(options, {:send_timeout_close, close?}, _context) when is_boolean(close?) do
     {:ok, %{options | send_timeout_close: close?}}
   end
 
+  defp put_option(_options, {:send_timeout_close, _close?}, _context), do: {:error, :einval}
+
+  defp put_option(_options, {:ipv6_v6only, _enabled}, :udp_runtime),
+    do: {:error, :einval}
+
   defp put_option(%{family: :inet6} = options, {:ipv6_v6only, true}, _context),
     do: {:ok, options}
 
-  defp put_option(options, {:ip, address}, context) when context in [:connect, :listen] do
+  defp put_option(options, {:ip, address}, context)
+       when context in [:connect, :listen, :udp_open] do
     put_bind_address(options, address)
   end
 
-  defp put_option(options, {:ifaddr, address}, context) when context in [:connect, :listen] do
+  defp put_option(options, {:ifaddr, address}, context)
+       when context in [:connect, :listen, :udp_open] do
     put_ifaddr(options, address)
   end
 
   defp put_option(options, {:port, port}, context)
-       when context in [:connect, :listen] and is_integer(port) and port in 0..65_535 do
+       when context in [:connect, :listen, :udp_open] and is_integer(port) and
+              port in 0..65_535 do
     {:ok, %{options | bind_port: port}}
   end
 
@@ -214,11 +276,33 @@ defmodule SmolNet.InetBackend.Options do
     {:ok, %{options | backlog: backlog}}
   end
 
+  defp put_option(_options, {:backlog, _backlog}, context)
+       when context in [:udp_open, :udp_runtime],
+       do: {:error, :einval}
+
   defp put_option(_options, option, :runtime)
        when option in [:inet, :inet6] or
               (is_tuple(option) and
                  tuple_size(option) > 0 and
                  elem(option, 0) in [:smolnet_stack, :ip, :ifaddr, :port, :backlog]) do
+    {:error, :einval}
+  end
+
+  defp put_option(_options, option, :udp_runtime)
+       when option in [:inet, :inet6] or
+              (is_tuple(option) and
+                 tuple_size(option) > 0 and
+                 elem(option, 0) in [
+                   :smolnet_stack,
+                   :ip,
+                   :ifaddr,
+                   :port,
+                   :backlog,
+                   :packet,
+                   :packet_size,
+                   :send_timeout,
+                   :send_timeout_close
+                 ]) do
     {:error, :einval}
   end
 
