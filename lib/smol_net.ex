@@ -17,10 +17,11 @@ defmodule SmolNet do
   global addresses require `scope_id: 0` (the default).
 
   Stable validation and bind errors are `:unsupported_family`,
-  `:unsupported_socket`, `:unsupported_timeout`, `:invalid_options`,
-  `:invalid_address`, `:invalid_port`, `:scope_required`, `:invalid_scope`,
-  `:address_in_use`, `:address_not_available`, and
-  `:ephemeral_ports_exhausted`. Connection lifecycle errors are
+  `:unsupported_socket`, `:invalid_options`, `:invalid_address`,
+  `:invalid_port`, `:invalid_data`, `:invalid_length`, `:invalid_timeout`,
+  `:invalid_how`, `:scope_required`, `:invalid_scope`, `:address_in_use`,
+  `:address_not_available`, and `:ephemeral_ports_exhausted`. Connection and
+  stream lifecycle errors are
   `:network_unreachable`, `:connection_refused`, `:connection_reset`,
   `:connection_timeout`, `:already_connected`, `:not_bound`,
   `:not_connected`, `:busy`, `:closed`, `:invalid_socket`, and
@@ -29,6 +30,8 @@ defmodule SmolNet do
 
   alias SmolNet.Socket
   alias SmolNet.Stack
+
+  import Kernel, except: [send: 2]
 
   @doc """
   Starts an IPv6 raw-IP network stack.
@@ -74,7 +77,7 @@ defmodule SmolNet do
   @doc """
   Opens a bounded low-level IPv6 TCP stream socket on `stack`.
 
-  Phase 4 supports only `open(:inet6, :stream, :tcp, stack: stack)`.
+  The low-level API supports only `open(:inet6, :stream, :tcp, stack: stack)`.
   IPv4 and other socket kinds fail explicitly.
   """
   @spec open(:inet6 | :inet, :stream, :tcp, keyword()) ::
@@ -91,17 +94,66 @@ defmodule SmolNet do
   @spec bind(Socket.t(), Socket.sockaddr_in6()) :: :ok | {:error, atom()}
   defdelegate bind(socket, address), to: Socket
 
-  @doc """
-  Initiates or finalizes an IPv6 TCP connection without waiting for traffic.
+  @doc "Connects an IPv6 TCP socket, waiting indefinitely by default."
+  @spec connect(Socket.t(), Socket.sockaddr_in6()) :: :ok | {:error, atom()}
+  defdelegate connect(socket, address), to: Socket
 
-  A pending handshake returns `{:select, select_info}`. After the matching
-  one-shot socket message arrives, retry this function. The retry returns
-  `:ok`, a stable connection error, or another select hint after a spurious
-  wake. Only `:nowait` is supported until synchronous wrappers land in Phase 5.
+  @doc """
+  Connects an IPv6 TCP socket with a finite, infinite, or nonblocking timeout.
+
+  `:nowait` returns a one-shot `{:select, select_info}` retry hint. Finite and
+  infinite waits run entirely in the caller and monitor the owning stack.
   """
-  @spec connect(Socket.t(), Socket.sockaddr_in6(), :nowait) ::
+  @spec connect(Socket.t(), Socket.sockaddr_in6(), :nowait | timeout()) ::
           :ok | {:select, :socket.select_info()} | {:error, atom()}
   defdelegate connect(socket, address, timeout_or_nowait), to: Socket
+
+  @doc "Sends a complete TCP byte stream, waiting indefinitely by default."
+  @spec send(Socket.t(), iodata()) :: :ok | {:error, atom() | {atom(), binary()}}
+  defdelegate send(socket, data), to: Socket
+
+  @doc """
+  Sends TCP stream data with a finite, infinite, or nonblocking timeout.
+
+  The native stack copies at most one bounded chunk. A nonblocking partial
+  result is `{:select, {select_info, unsent_binary}}`; the caller retains and
+  retries that remainder. A timed synchronous send that made progress returns
+  `{:error, {:timeout, unsent_binary}}`.
+  """
+  @spec send(Socket.t(), iodata(), :nowait | timeout()) ::
+          :ok
+          | {:select, {:socket.select_info(), binary()}}
+          | {:error, atom() | {atom(), binary()}}
+  defdelegate send(socket, data, timeout_or_nowait), to: Socket
+
+  @doc "Receives TCP stream data, waiting indefinitely by default."
+  @spec recv(Socket.t(), non_neg_integer()) ::
+          {:ok, binary()} | {:error, atom() | {atom(), binary()}}
+  defdelegate recv(socket, length), to: Socket
+
+  @doc """
+  Receives TCP stream data with a finite, infinite, or nonblocking timeout.
+
+  Positive lengths are exact for synchronous calls unless peer EOF returns the
+  final shorter buffered value. Length zero returns one bounded currently
+  available chunk. Nonblocking partial exact reads return
+  `{:select, {select_info, partial_binary}}`.
+  """
+  @spec recv(Socket.t(), non_neg_integer(), :nowait | timeout()) ::
+          {:ok, binary()}
+          | {:select, :socket.select_info()}
+          | {:select, {:socket.select_info(), binary()}}
+          | {:error, atom() | {atom(), binary()}}
+  defdelegate recv(socket, length, timeout_or_nowait), to: Socket
+
+  @doc """
+  Shuts down the read half, write half, or both halves of a TCP socket.
+
+  Write shutdown drives a FIN and rejects later sends while preserving allowed
+  reads. Read shutdown rejects later receives.
+  """
+  @spec shutdown(Socket.t(), :read | :write | :read_write) :: :ok | {:error, atom()}
+  defdelegate shutdown(socket, how), to: Socket
 
   @doc "Returns the bound IPv6 endpoint for a TCP socket."
   @spec sockname(Socket.t()) :: {:ok, Socket.sockaddr_in6()} | {:error, atom()}
@@ -111,7 +163,7 @@ defmodule SmolNet do
   @spec peername(Socket.t()) :: {:ok, Socket.sockaddr_in6()} | {:error, atom()}
   defdelegate peername(socket), to: Socket
 
-  @doc "Abortively closes a low-level TCP socket and permanently invalidates its handle."
+  @doc "Gracefully closes a TCP connection and permanently invalidates its public handle."
   @spec close(Socket.t()) :: :ok | {:error, atom()}
   defdelegate close(socket), to: Socket
 end

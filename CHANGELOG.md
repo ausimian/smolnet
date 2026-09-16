@@ -22,3 +22,6 @@ and this project adheres to
 - Add bounded IPv6 TCP sockets with bind and ephemeral ports, nonblocking
   connect/finalize readiness, stable connection errors, endpoint queries,
   timer-driven retransmission and timeout, and abortive close.
+- Add bounded IPv6 TCP stream send and receive, finite and infinite caller-side
+  deadline loops, half-close behavior, EOF and reset handling, and graceful
+  close with bounded native FIN retention.

@@ -1,8 +1,11 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::ops::Bound::{Excluded, Unbounded};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Mutex, TryLockError};
 
-use rustler::{Atom, Encoder, Env, LocalPid, NifMap, Reference, Resource, ResourceArc, Term};
+use rustler::{
+    Atom, Encoder, Env, LocalPid, NewBinary, NifMap, Reference, Resource, ResourceArc, Term,
+};
 use smoltcp::iface::{Config, Interface, PollResult, Route, SocketSet};
 use smoltcp::socket::tcp::{self, ConnectError};
 use smoltcp::time::Duration;
@@ -19,8 +22,8 @@ use crate::socket_table::{
     WaiterRegistration,
 };
 use crate::tcp::{
-    self as tcp_support, ConnectFailure, ConnectPhase, EncodedEndpoint, TcpEndpoint, TcpRecord,
-    ValidatedEndpoint,
+    self as tcp_support, ConnectFailure, ConnectPhase, EncodedEndpoint, ShutdownHow, TcpEndpoint,
+    TcpRecord, ValidatedEndpoint,
 };
 use crate::waiter::{
     ArmPoint, Direction, Operation, ReadinessCounters, ReadyKey, ReadyQueue, SocketIdentity, Waiter,
@@ -94,6 +97,12 @@ pub struct NativeStack {
     socket_table: SocketTable,
     tcp_records: BTreeMap<u64, TcpRecord>,
     tcp_connections: BTreeMap<ConnectionKey, SocketIdentity>,
+    closing_tcp: BTreeSet<u64>,
+    closing_deadlines: BTreeSet<(Instant, u64)>,
+    closing_sweep_cursor: Option<u64>,
+    closing_cleanup_pending: bool,
+    closing_cleanup_resweep: bool,
+    maintenance_cleanup_turn: bool,
     next_ephemeral_port: u16,
     ready: ReadyQueue,
     ready_sweep: bool,
@@ -144,6 +153,12 @@ impl NativeStack {
             socket_table: SocketTable::new(limits.ready_events, limits.ready_events),
             tcp_records: BTreeMap::new(),
             tcp_connections: BTreeMap::new(),
+            closing_tcp: BTreeSet::new(),
+            closing_deadlines: BTreeSet::new(),
+            closing_sweep_cursor: None,
+            closing_cleanup_pending: false,
+            closing_cleanup_resweep: false,
+            maintenance_cleanup_turn: false,
             next_ephemeral_port: tcp_support::EPHEMERAL_PORT_FIRST,
             ready: ReadyQueue::new((limits.ready_events / 2).max(1)),
             ready_sweep: false,
@@ -167,6 +182,7 @@ impl NativeStack {
                 socket_count: self.socket_table.len(),
                 native_socket_count: self.sockets.iter().count(),
                 tcp_socket_count: self.tcp_records.len(),
+                closing_tcp_socket_count: self.closing_tcp.len(),
                 tcp_buffer_bytes: tcp_support::BUFFER_BYTES,
                 waiter_count: self.socket_table.waiter_count(),
                 read_waiter_count: read_waiters,
@@ -201,6 +217,10 @@ impl NativeStack {
 
     pub fn tcp_open(&mut self, env: Env<'_>) -> Result<Envelope<SocketIdentity>, SocketError> {
         self.ensure_running()?;
+
+        if self.tcp_records.len() >= self.limits.ready_events {
+            return Err(SocketError::SystemLimit);
+        }
 
         let handle = self.sockets.add(tcp_support::socket());
         let identity = match self.socket_table.insert(SocketKind::Tcp, 0) {
@@ -386,6 +406,232 @@ impl NativeStack {
         Ok(self.finish_call(env, result, Effects::empty(), Vec::new()))
     }
 
+    pub fn tcp_send<'a>(
+        &mut self,
+        env: Env<'a>,
+        identity: SocketIdentity,
+        data: &[u8],
+        pid: LocalPid,
+        reference: Reference<'a>,
+        now: Instant,
+    ) -> Result<Envelope<Term<'a>>, SocketError> {
+        self.ensure_running()?;
+        self.socket_table.validate(identity, SocketKind::Tcp)?;
+
+        if self
+            .socket_table
+            .has_waiter(identity, SocketKind::Tcp, Direction::Write)?
+        {
+            return Err(SocketError::Busy);
+        }
+
+        let record = *self.tcp_record(identity)?;
+        self.ensure_connected(record)?;
+
+        if record.write_shutdown {
+            return Err(SocketError::Closed);
+        }
+
+        let copy_limit = data.len().min(self.limits.bytes_copied);
+        let needs_waiter = {
+            let socket = self.sockets.get::<tcp::Socket<'static>>(record.handle);
+
+            if !socket.may_send() {
+                return Err(SocketError::Closed);
+            }
+
+            copy_limit.min(socket.send_capacity() - socket.send_queue()) < data.len()
+        };
+
+        if needs_waiter {
+            self.socket_table.ensure_waiter_capacity()?;
+        }
+
+        let (accepted, immediately_writable) = {
+            let socket = self.sockets.get_mut::<tcp::Socket<'static>>(record.handle);
+
+            let accepted = socket
+                .send_slice(&data[..copy_limit])
+                .map_err(|_| SocketError::Closed)?;
+            (accepted, socket.can_send())
+        };
+
+        let result = if accepted == data.len() {
+            crate::atoms::ok().encode(env)
+        } else {
+            self.arm_tcp_waiter(
+                env,
+                identity,
+                record.handle,
+                Direction::Write,
+                Operation::Send,
+                pid,
+                reference,
+                immediately_writable,
+            )?;
+            (crate::atoms::select(), Operation::Send, reference, accepted).encode(env)
+        };
+        let effects = self
+            .drive(now, Some(accepted))
+            .expect("TCP send without ingress cannot fail");
+
+        Ok(self.finish_call(env, result, effects, Vec::new()))
+    }
+
+    pub fn tcp_recv<'a>(
+        &mut self,
+        env: Env<'a>,
+        identity: SocketIdentity,
+        length: usize,
+        pid: LocalPid,
+        reference: Reference<'a>,
+        now: Instant,
+    ) -> Result<Envelope<Term<'a>>, SocketError> {
+        self.ensure_running()?;
+        self.socket_table.validate(identity, SocketKind::Tcp)?;
+
+        if self
+            .socket_table
+            .has_waiter(identity, SocketKind::Tcp, Direction::Read)?
+        {
+            return Err(SocketError::Busy);
+        }
+
+        let record = *self.tcp_record(identity)?;
+        self.ensure_connected(record)?;
+
+        if record.read_shutdown {
+            return Err(SocketError::Closed);
+        }
+
+        let requested = if length == 0 {
+            self.limits.bytes_copied
+        } else {
+            length.min(self.limits.bytes_copied)
+        };
+        let needs_waiter = {
+            let socket = self.sockets.get::<tcp::Socket<'static>>(record.handle);
+            let read_length = requested.min(socket.recv_queue());
+            let remaining_queue = socket.recv_queue() - read_length;
+            let receive_open = matches!(
+                socket.state(),
+                tcp::State::Established | tcp::State::FinWait1 | tcp::State::FinWait2
+            ) || remaining_queue > 0;
+            let complete = if length == 0 {
+                read_length > 0
+            } else {
+                read_length == length || (!receive_open && read_length > 0)
+            };
+
+            !complete && receive_open
+        };
+
+        if needs_waiter {
+            self.socket_table.ensure_waiter_capacity()?;
+        }
+
+        let (data, receive_open, immediately_readable) = {
+            let socket = self.sockets.get_mut::<tcp::Socket<'static>>(record.handle);
+            let read_length = requested.min(socket.recv_queue());
+            let mut data = vec![0; read_length];
+
+            if read_length > 0 {
+                let received = socket
+                    .recv_slice(&mut data)
+                    .map_err(|_| SocketError::Closed)?;
+                data.truncate(received);
+            }
+
+            (data, socket.may_recv(), socket.can_recv())
+        };
+        let copied = data.len();
+        let complete = if length == 0 {
+            copied > 0
+        } else {
+            copied == length || (!receive_open && copied > 0)
+        };
+
+        let result = if complete {
+            let binary: Term<'a> = NewBinary::from_iter(env, data.into_iter()).into();
+            (crate::atoms::ok(), binary).encode(env)
+        } else if !receive_open {
+            return Err(SocketError::EndOfStream);
+        } else {
+            self.arm_tcp_waiter(
+                env,
+                identity,
+                record.handle,
+                Direction::Read,
+                Operation::Recv,
+                pid,
+                reference,
+                immediately_readable,
+            )?;
+
+            if data.is_empty() {
+                (crate::atoms::select(), Operation::Recv, reference).encode(env)
+            } else {
+                let binary: Term<'a> = NewBinary::from_iter(env, data.into_iter()).into();
+                (crate::atoms::select(), Operation::Recv, reference, binary).encode(env)
+            }
+        };
+        let effects = self
+            .drive(now, Some(copied))
+            .expect("TCP receive without ingress cannot fail");
+
+        Ok(self.finish_call(env, result, effects, Vec::new()))
+    }
+
+    pub fn tcp_shutdown(
+        &mut self,
+        env: Env<'_>,
+        identity: SocketIdentity,
+        how: ShutdownHow,
+        now: Instant,
+    ) -> Result<Envelope<Atom>, SocketError> {
+        self.ensure_running()?;
+        self.socket_table.validate(identity, SocketKind::Tcp)?;
+        let record = *self.tcp_record(identity)?;
+        self.ensure_connected(record)?;
+        let shutdown_read = matches!(how, ShutdownHow::Read | ShutdownHow::ReadWrite);
+        let shutdown_write = matches!(how, ShutdownHow::Write | ShutdownHow::ReadWrite);
+        let mut aborts = Vec::with_capacity(2);
+
+        for direction in [Direction::Read, Direction::Write] {
+            let selected = match direction {
+                Direction::Read => shutdown_read,
+                Direction::Write => shutdown_write,
+            };
+
+            if selected
+                && let Some(waiter) =
+                    self.socket_table
+                        .take_waiter(identity, SocketKind::Tcp, direction)?
+            {
+                aborts.push(PendingNotification {
+                    identity,
+                    direction,
+                    waiter,
+                });
+            }
+        }
+
+        if shutdown_write && !record.write_shutdown {
+            self.sockets
+                .get_mut::<tcp::Socket<'static>>(record.handle)
+                .close();
+        }
+
+        let record = self.tcp_record_mut(identity)?;
+        record.read_shutdown |= shutdown_read;
+        record.write_shutdown |= shutdown_write;
+
+        let effects = self
+            .drive(now, None)
+            .expect("TCP shutdown without ingress cannot fail");
+        Ok(self.finish_call(env, crate::atoms::ok(), effects, aborts))
+    }
+
     pub fn tcp_close(
         &mut self,
         env: Env<'_>,
@@ -395,16 +641,6 @@ impl NativeStack {
         self.ensure_running()?;
         self.socket_table.validate(identity, SocketKind::Tcp)?;
         let record = *self.tcp_record(identity)?;
-
-        self.sockets
-            .get_mut::<tcp::Socket<'static>>(record.handle)
-            .abort();
-        let effects = self
-            .drive(now, None)
-            .expect("TCP close without ingress cannot fail");
-        self.sockets.remove(record.handle);
-        self.remove_tcp_record(record);
-
         let waiters = self.socket_table.close(identity)?;
         let aborts = waiters
             .into_iter()
@@ -414,6 +650,34 @@ impl NativeStack {
                 waiter,
             })
             .collect();
+
+        let graceful = record.phase == ConnectPhase::Connected;
+
+        if graceful {
+            self.sockets
+                .get_mut::<tcp::Socket<'static>>(record.handle)
+                .close();
+            let record = self.tcp_record_mut(identity)?;
+            let deadline = now + Duration::from_millis(tcp_support::CLOSE_TIMEOUT_MILLIS);
+            record.close_deadline = Some(deadline);
+            self.closing_tcp.insert(identity.id);
+            self.closing_deadlines.insert((deadline, identity.id));
+            self.closing_sweep_cursor = None;
+            self.request_closing_cleanup();
+            self.maintenance_cleanup_turn = false;
+        } else {
+            self.sockets
+                .get_mut::<tcp::Socket<'static>>(record.handle)
+                .abort();
+        }
+
+        let effects = self
+            .drive(now, None)
+            .expect("TCP close without ingress cannot fail");
+
+        if !graceful {
+            self.remove_tcp_socket(record);
+        }
 
         Ok(self.finish_call(env, crate::atoms::ok(), effects, aborts))
     }
@@ -509,6 +773,11 @@ impl NativeStack {
             self.sockets.remove(record.handle);
         }
         self.tcp_connections.clear();
+        self.closing_tcp.clear();
+        self.closing_deadlines.clear();
+        self.closing_sweep_cursor = None;
+        self.closing_cleanup_pending = false;
+        self.closing_cleanup_resweep = false;
 
         let waiters = self.socket_table.close_all();
         debug_assert!(waiters.len() <= self.limits.ready_events);
@@ -741,17 +1010,41 @@ impl NativeStack {
         pid: LocalPid,
         reference: Reference<'a>,
     ) -> Result<(), SocketError> {
+        self.arm_tcp_waiter(
+            env,
+            identity,
+            handle,
+            Direction::Write,
+            Operation::Connect,
+            pid,
+            reference,
+            false,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn arm_tcp_waiter<'a>(
+        &mut self,
+        env: Env<'a>,
+        identity: SocketIdentity,
+        handle: smoltcp::iface::SocketHandle,
+        direction: Direction,
+        operation: Operation,
+        pid: LocalPid,
+        reference: Reference<'a>,
+        immediately_ready: bool,
+    ) -> Result<(), SocketError> {
         let flag = self
             .socket_table
-            .ready_flag(identity, SocketKind::Tcp, Direction::Write)?;
+            .ready_flag(identity, SocketKind::Tcp, direction)?;
         self.socket_table.install_waiter(
             env,
             WaiterRegistration {
                 identity,
                 expected_kind: SocketKind::Tcp,
-                direction: Direction::Write,
+                direction,
                 pid,
-                operation: Operation::Connect,
+                operation,
                 reference,
             },
         )?;
@@ -759,14 +1052,32 @@ impl NativeStack {
         let waker = self.ready.waker(
             ReadyKey {
                 identity,
-                direction: Direction::Write,
+                direction,
             },
             flag,
         );
-        self.sockets
-            .get_mut::<tcp::Socket<'static>>(handle)
-            .register_send_waker(&waker);
+        let socket = self.sockets.get_mut::<tcp::Socket<'static>>(handle);
+
+        match direction {
+            Direction::Read => socket.register_recv_waker(&waker),
+            Direction::Write => socket.register_send_waker(&waker),
+        }
+
+        if immediately_ready {
+            waker.wake_by_ref();
+        }
+
         Ok(())
+    }
+
+    fn ensure_connected(&self, record: TcpRecord) -> Result<(), SocketError> {
+        match record.phase {
+            ConnectPhase::Connected => Ok(()),
+            ConnectPhase::Failed(failure) => Err(failure.socket_error()),
+            ConnectPhase::Open | ConnectPhase::Bound | ConnectPhase::Connecting => {
+                Err(SocketError::NotConnected)
+            }
+        }
     }
 
     fn tcp_record(&self, identity: SocketIdentity) -> Result<&TcpRecord, SocketError> {
@@ -790,6 +1101,118 @@ impl NativeStack {
         }
 
         self.tcp_records.remove(&record.identity.id);
+    }
+
+    fn remove_tcp_socket(&mut self, record: TcpRecord) {
+        self.sockets.remove(record.handle);
+        self.closing_tcp.remove(&record.identity.id);
+        if let Some(deadline) = record.close_deadline {
+            self.closing_deadlines
+                .remove(&(deadline, record.identity.id));
+        }
+        self.remove_tcp_record(record);
+    }
+
+    fn reap_closing_tcp(&mut self, now: Instant, limit: usize) -> (usize, bool) {
+        if self.closing_tcp.is_empty() {
+            self.closing_sweep_cursor = None;
+            self.closing_cleanup_pending = false;
+            self.closing_cleanup_resweep = false;
+            return (0, false);
+        }
+
+        if limit == 0 || !self.closing_cleanup_pending {
+            return (0, self.closing_cleanup_pending);
+        }
+
+        let start = self.closing_sweep_cursor.map_or(Unbounded, Excluded);
+        let mut ids = self
+            .closing_tcp
+            .range((start, Unbounded))
+            .take(limit + 1)
+            .copied()
+            .collect::<Vec<_>>();
+        let mut more = ids.len() > limit;
+        ids.truncate(limit);
+        let work = ids.len();
+
+        for id in &ids {
+            let Some(record) = self.tcp_records.get(id).copied() else {
+                self.closing_tcp.remove(id);
+                continue;
+            };
+
+            let state = self
+                .sockets
+                .get::<tcp::Socket<'static>>(record.handle)
+                .state();
+            let reset_dispatched = self
+                .sockets
+                .get::<tcp::Socket<'static>>(record.handle)
+                .local_endpoint()
+                .is_none();
+
+            if state == tcp::State::Closed && reset_dispatched {
+                self.remove_tcp_socket(record);
+            } else if record
+                .close_deadline
+                .is_some_and(|deadline| now >= deadline)
+            {
+                if state != tcp::State::Closed {
+                    self.sockets
+                        .get_mut::<tcp::Socket<'static>>(record.handle)
+                        .abort();
+                }
+                let record = self
+                    .tcp_records
+                    .get_mut(id)
+                    .expect("closing TCP record still exists");
+                let deadline = record
+                    .close_deadline
+                    .expect("expired closing TCP record has a deadline");
+                self.closing_deadlines.remove(&(deadline, *id));
+                record.close_deadline = None;
+            }
+        }
+
+        if self.closing_tcp.is_empty() {
+            self.closing_sweep_cursor = None;
+            self.closing_cleanup_pending = false;
+            self.closing_cleanup_resweep = false;
+            return (work, false);
+        }
+
+        if more {
+            self.closing_sweep_cursor = ids.last().copied();
+        } else if self.closing_cleanup_resweep {
+            self.closing_sweep_cursor = None;
+            self.closing_cleanup_resweep = false;
+            more = true;
+        } else {
+            self.closing_sweep_cursor = None;
+            self.closing_cleanup_pending = false;
+        }
+
+        (work, more)
+    }
+
+    fn next_close_deadline(&self) -> Option<Instant> {
+        self.closing_deadlines
+            .first()
+            .map(|(deadline, _id)| *deadline)
+    }
+
+    fn request_closing_cleanup(&mut self) {
+        if self.closing_tcp.is_empty() {
+            return;
+        }
+
+        if self.closing_cleanup_pending {
+            self.closing_cleanup_resweep = true;
+        } else {
+            self.closing_cleanup_pending = true;
+            self.closing_sweep_cursor = None;
+        }
     }
 
     fn has_ipv6_address(&self, address: Ipv6Address) -> bool {
@@ -970,9 +1393,9 @@ impl NativeStack {
         }
     }
 
-    fn drive(&mut self, now: Instant, ingress_bytes: Option<usize>) -> Result<Effects, StackError> {
+    fn drive(&mut self, now: Instant, copied_bytes: Option<usize>) -> Result<Effects, StackError> {
         self.device.begin_call(self.limits.output_packets);
-        let input_bytes = ingress_bytes.unwrap_or(0);
+        let input_bytes = copied_bytes.unwrap_or(0);
         let output_byte_limit = self.limits.bytes_copied.saturating_sub(input_bytes);
         let mut output = self
             .device
@@ -983,28 +1406,49 @@ impl NativeStack {
             let _ = self
                 .interface
                 .poll_ingress_single(now, &mut self.device, &mut self.sockets);
+            self.request_closing_cleanup();
         }
 
         self.interface.poll_maintenance(now);
 
+        if self
+            .next_close_deadline()
+            .is_some_and(|deadline| now >= deadline)
+        {
+            self.request_closing_cleanup();
+        }
+
         let mut maintenance_work = 0usize;
         let mut egress_may_remain = false;
+        let mut cleanup_more = false;
+        let mut cleanup_ran = false;
+
+        if self.maintenance_cleanup_turn && self.closing_cleanup_pending {
+            let cleanup_limit = self.limits.maintenance_work.min(1);
+            let (cleanup_work, more) = self.reap_closing_tcp(now, cleanup_limit);
+            maintenance_work += cleanup_work;
+            cleanup_more = more;
+            cleanup_ran = cleanup_work > 0;
+        }
 
         while maintenance_work < self.limits.maintenance_work
             && self.device.queued_packets().1 < self.limits.output_packets
         {
             maintenance_work += 1;
 
-            if matches!(
-                self.interface
-                    .poll_egress(now, &mut self.device, &mut self.sockets),
-                PollResult::None
-            ) {
-                egress_may_remain = false;
-                break;
+            match self
+                .interface
+                .poll_egress(now, &mut self.device, &mut self.sockets)
+            {
+                PollResult::None => {
+                    egress_may_remain = false;
+                    break;
+                }
+                PollResult::SocketStateChanged => {
+                    egress_may_remain = true;
+                    self.request_closing_cleanup();
+                }
             }
-
-            egress_may_remain = true;
         }
 
         let remaining_packets = self.limits.output_packets.saturating_sub(output.len());
@@ -1014,13 +1458,32 @@ impl NativeStack {
             .take_transmit(remaining_packets, remaining_bytes);
         output_bytes += additional_output.iter().map(Vec::len).sum::<usize>();
         output.extend(additional_output);
+        if !cleanup_ran && self.closing_cleanup_pending {
+            let remaining_maintenance = self
+                .limits
+                .maintenance_work
+                .saturating_sub(maintenance_work);
+            let (cleanup_work, more) = self.reap_closing_tcp(now, remaining_maintenance);
+            maintenance_work += cleanup_work;
+            cleanup_more |= more;
+            cleanup_ran = cleanup_work > 0;
+        }
+
+        self.maintenance_cleanup_turn = !cleanup_ran && self.closing_cleanup_pending;
         let output_packets = output.len();
-        let more = self.device.has_receive() || self.device.has_transmit() || egress_may_remain;
+        let more = self.device.has_receive()
+            || self.device.has_transmit()
+            || egress_may_remain
+            || cleanup_more
+            || self.closing_cleanup_pending;
         let poll_at = if more {
             Some(now.total_millis())
         } else {
             self.interface
                 .poll_at(now, &self.sockets)
+                .into_iter()
+                .chain(self.next_close_deadline())
+                .min()
                 .map(|instant| instant.total_millis())
         };
 
@@ -1293,6 +1756,7 @@ pub struct Snapshot {
     socket_count: usize,
     native_socket_count: usize,
     tcp_socket_count: usize,
+    closing_tcp_socket_count: usize,
     tcp_buffer_bytes: usize,
     waiter_count: usize,
     read_waiter_count: usize,

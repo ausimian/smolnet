@@ -1,8 +1,9 @@
 use std::collections::BTreeSet;
 
-use rustler::NifMap;
+use rustler::{NifMap, NifUnitEnum};
 use smoltcp::iface::SocketHandle;
 use smoltcp::socket::tcp;
+use smoltcp::time::Instant;
 use smoltcp::wire::{IpAddress, IpEndpoint, IpListenEndpoint, Ipv6Address};
 
 use crate::socket_table::SocketError;
@@ -10,6 +11,7 @@ use crate::waiter::SocketIdentity;
 
 pub const BUFFER_BYTES: usize = 4 * 1024;
 pub const CONNECT_TIMEOUT_MILLIS: u64 = 30_000;
+pub const CLOSE_TIMEOUT_MILLIS: u64 = 30_000;
 pub const EPHEMERAL_PORT_FIRST: u16 = 49_152;
 pub const EPHEMERAL_PORT_LAST: u16 = 50_175;
 
@@ -120,6 +122,13 @@ pub enum ConnectFailure {
     TimedOut,
 }
 
+#[derive(Clone, Copy, Debug, Eq, NifUnitEnum, PartialEq)]
+pub enum ShutdownHow {
+    Read,
+    Write,
+    ReadWrite,
+}
+
 impl ConnectFailure {
     pub fn socket_error(self) -> SocketError {
         match self {
@@ -139,6 +148,9 @@ pub struct TcpRecord {
     pub local_scope_id: u32,
     pub remote: Option<IpEndpoint>,
     pub remote_scope_id: u32,
+    pub read_shutdown: bool,
+    pub write_shutdown: bool,
+    pub close_deadline: Option<Instant>,
 }
 
 impl TcpRecord {
@@ -151,6 +163,9 @@ impl TcpRecord {
             local_scope_id: 0,
             remote: None,
             remote_scope_id: 0,
+            read_shutdown: false,
+            write_shutdown: false,
+            close_deadline: None,
         }
     }
 }

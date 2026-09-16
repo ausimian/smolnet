@@ -12,7 +12,7 @@ use rustler::{
 };
 use socket_table::SocketError;
 use stack::{Envelope, ResourceCounts, StackConfig, StackError, StackResource};
-use tcp::TcpEndpoint;
+use tcp::{ShutdownHow, TcpEndpoint};
 use waiter::{ArmPoint, Direction, Operation, ReadyKey, SocketIdentity};
 
 mod atoms {
@@ -57,6 +57,7 @@ mod atoms {
         select,
         abort,
         closed,
+        end_of_stream,
         already_sent,
         not_found,
         smol_socket = "$smol_socket"
@@ -195,6 +196,67 @@ fn tcp_connect<'a>(
         let now = time::instant_from_millis(now_millis).map_err(|_| atoms::time_overflow())?;
         resource
             .with_stack(|stack| stack.tcp_connect(env, identity, endpoint, pid, reference, now))
+            .map_err(|_| atoms::ownership_invariant_violation())?
+            .map_err(socket_error_atom)
+    });
+
+    encode_envelope_result(env, result)
+}
+
+#[rustler::nif]
+fn tcp_send<'a>(
+    env: Env<'a>,
+    resource: ResourceArc<StackResource>,
+    identity: SocketIdentity,
+    data: Binary<'a>,
+    pid: LocalPid,
+    reference: Reference<'a>,
+    now_millis: i64,
+) -> Term<'a> {
+    let result = catch_operation(|| {
+        let now = time::instant_from_millis(now_millis).map_err(|_| atoms::time_overflow())?;
+        resource
+            .with_stack(|stack| stack.tcp_send(env, identity, data.as_slice(), pid, reference, now))
+            .map_err(|_| atoms::ownership_invariant_violation())?
+            .map_err(socket_error_atom)
+    });
+
+    encode_envelope_result(env, result)
+}
+
+#[rustler::nif]
+fn tcp_recv<'a>(
+    env: Env<'a>,
+    resource: ResourceArc<StackResource>,
+    identity: SocketIdentity,
+    length: usize,
+    pid: LocalPid,
+    reference: Reference<'a>,
+    now_millis: i64,
+) -> Term<'a> {
+    let result = catch_operation(|| {
+        let now = time::instant_from_millis(now_millis).map_err(|_| atoms::time_overflow())?;
+        resource
+            .with_stack(|stack| stack.tcp_recv(env, identity, length, pid, reference, now))
+            .map_err(|_| atoms::ownership_invariant_violation())?
+            .map_err(socket_error_atom)
+    });
+
+    encode_envelope_result(env, result)
+}
+
+#[rustler::nif]
+fn tcp_shutdown<'a>(
+    env: Env<'a>,
+    resource: ResourceArc<StackResource>,
+    identity: SocketIdentity,
+    how: ShutdownHow,
+    now_millis: i64,
+) -> Term<'a> {
+    let result = catch_operation(|| {
+        let now = time::instant_from_millis(now_millis).map_err(|_| atoms::time_overflow())?;
+        resource
+            .with_stack(|stack| stack.tcp_shutdown(env, identity, how, now))
             .map_err(|_| atoms::ownership_invariant_violation())?
             .map_err(socket_error_atom)
     });
@@ -454,6 +516,7 @@ where
 fn socket_error_atom(error: SocketError) -> Atom {
     match error {
         SocketError::Closed => atoms::closed(),
+        SocketError::EndOfStream => atoms::end_of_stream(),
         SocketError::InvalidSocket => atoms::invalid_socket(),
         SocketError::WrongKind => atoms::wrong_socket_kind(),
         SocketError::InvalidState => atoms::invalid_socket_state(),

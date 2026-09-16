@@ -171,6 +171,47 @@ impl SocketTable {
         ))
     }
 
+    pub fn has_waiter(
+        &self,
+        identity: SocketIdentity,
+        expected_kind: SocketKind,
+        direction: Direction,
+    ) -> Result<bool, SocketError> {
+        Ok(self
+            .validate(identity, expected_kind)?
+            .waiter(direction)
+            .is_some())
+    }
+
+    pub fn ensure_waiter_capacity(&self) -> Result<(), SocketError> {
+        if self.waiter_count >= self.max_waiters {
+            Err(SocketError::SystemLimit)
+        } else {
+            Ok(())
+        }
+    }
+
+    pub fn take_waiter(
+        &mut self,
+        identity: SocketIdentity,
+        expected_kind: SocketKind,
+        direction: Direction,
+    ) -> Result<Option<Waiter>, SocketError> {
+        self.validate(identity, expected_kind)?;
+        let (_, entry) = self
+            .entries
+            .get_mut(&identity.id)
+            .expect("validated socket entry exists");
+        let waiter = entry.waiter_mut(direction).take();
+
+        if waiter.is_some() {
+            entry.ready_flag(direction).store(false, Ordering::Release);
+            self.waiter_count -= 1;
+        }
+
+        Ok(waiter)
+    }
+
     pub fn install_waiter<'a>(
         &mut self,
         env: Env<'a>,
@@ -503,6 +544,7 @@ pub struct ReadyScan {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SocketError {
     Closed,
+    EndOfStream,
     InvalidSocket,
     WrongKind,
     InvalidState,

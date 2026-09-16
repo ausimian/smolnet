@@ -4,10 +4,11 @@ SmolNet is an Elixir library that embeds the Rust
 [`smoltcp`](https://github.com/smoltcp-rs/smoltcp) TCP/IP stack behind a
 deliberately small Rustler NIF.
 
-The project is under initial development. Phase 4 provides independent raw-IP
-IPv6 stacks plus low-level IPv6 TCP open, bind, nonblocking connect, endpoint
-queries, cancellation, and abortive close. Stream send/receive, synchronous
-wrappers, listening, IPv4, and UDP arrive in later phases.
+The project is under initial development. Phase 5 provides independent raw-IP
+IPv6 stacks plus low-level IPv6 TCP open, bind, connect, bounded stream I/O,
+half-close, endpoint queries, cancellation, and graceful close. The same
+operations support finite, infinite, and nonblocking caller-owned waits.
+Listening, the inet adapter, IPv4, and UDP arrive in later phases.
 
 `SmolNet.start_stack/1` creates an independent native stack and returns an
 opaque reference. A transport-neutral link process supplies complete IPv6
@@ -57,11 +58,13 @@ The message is only a retry hint. `SmolNet.cancel/2` removes the exact waiter
 and returns `:ok`, `:already_sent`, or `:not_found` according to which side of
 the readiness race won.
 
-## Low-level IPv6 TCP connect
+## Low-level IPv6 TCP streams
 
-TCP endpoints use `:socket`-style IPv6 maps. `connect/3` is nonblocking in this
-phase: initiate it with `:nowait`, wait for the matching select message, then
-retry to finalize.
+TCP endpoints use `:socket`-style IPv6 maps. Synchronous calls wait in the
+calling process using one monotonic deadline; the stack owner and native
+scheduler never wait for traffic. Finite timeouts use milliseconds in
+`0..4_294_967_295`. Passing `:nowait` exposes the same one-shot retry primitive
+directly.
 
 ```elixir
 local = {0xFD00, 0, 0, 0, 0, 0, 0, 1}
@@ -77,27 +80,45 @@ remote = {0xFD00, 0, 0, 0, 0, 0, 0, 2}
 :ok = SmolNet.bind(socket, %{family: :inet6, addr: local, port: 0})
 
 peer = %{family: :inet6, addr: remote, port: 443}
-{:select, select_info} = SmolNet.connect(socket, peer, :nowait)
-%SmolNet.Socket{id: id, generation: generation} = socket
-{:select_info, :connect, select_ref} = select_info
-
-receive do
-  {:"$smol_socket", {^id, ^generation}, :select, ^select_ref} ->
-    :ok = SmolNet.connect(socket, peer, :nowait)
-end
+:ok = SmolNet.connect(socket, peer, 5_000)
+:ok = SmolNet.send(socket, ["hello", " world"], 5_000)
+{:ok, response} = SmolNet.recv(socket, 128, 5_000)
+:ok = SmolNet.shutdown(socket, :write)
 
 {:ok, local_endpoint} = SmolNet.sockname(socket)
 {:ok, %{addr: ^remote, port: 443}} = SmolNet.peername(socket)
 :ok = SmolNet.close(socket)
 ```
 
+The nonblocking stream shapes keep every continuation in the caller:
+
+```elixir
+{:select, {send_info, unsent}} = SmolNet.send(socket, large_binary, :nowait)
+{:select, {recv_info, partial}} = SmolNet.recv(socket, exact_length, :nowait)
+
+# After the matching one-shot message, retry only `unsent`, or request the
+# remaining receive length while retaining `partial` in the caller.
+:ok = SmolNet.cancel(socket, send_info)
+:ok = SmolNet.cancel(socket, recv_info)
+```
+
+`recv(socket, 0, timeout)` returns one bounded currently available chunk. A
+positive synchronous length accumulates bounded reads until exact completion,
+timeout, error, or peer EOF. EOF returns buffered data first; the next receive
+returns `{:error, :closed}`. Reset remains `:connection_reset`. If a timeout or
+error follows partial progress, send returns the unsent remainder and receive
+returns accumulated data in `{reason, continuation}`.
+
 Each TCP socket has fixed 4096-byte native RX and TX buffers. Automatic ports
 come from the bounded `49152..50175` range and are unique within one stack.
 Link-local `fe80::/10` endpoints require a positive integer `scope_id`; global
-addresses use scope zero. The public module documentation lists the stable
-validation, bind, connection, lifecycle, and handle errors. A native ignored-
-handshake timeout is 30 seconds; caller-controlled synchronous deadlines remain
-Phase 5 work.
+addresses use scope zero. The native layer never stores arbitrary unsent
+payloads or exact-receive accumulation. Established close invalidates the
+public handle immediately, then retains one bounded native closing record long
+enough to drive FIN and retransmission, with a 30-second deadline measured from
+the close call; closing records continue to count against the socket limit.
+The public module documentation lists the stable validation, timeout,
+connection, stream, lifecycle, and handle errors.
 
 ## Development
 
