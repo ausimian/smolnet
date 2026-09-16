@@ -62,7 +62,9 @@ defmodule SmolNet.StackSupervisor do
   def start_stack(_options), do: {:error, :invalid_options}
 
   @spec stop_stack(Ref.t()) :: :ok | {:error, :closed}
-  def stop_stack(%Ref{bundle: bundle}) do
+  def stop_stack(%Ref{bundle: bundle, stack: stack}) do
+    _shutdown_result = Stack.shutdown_waiters(stack)
+
     case DynamicSupervisor.terminate_child(SmolNet.Supervisor, bundle) do
       :ok -> :ok
       {:error, :not_found} -> {:error, :closed}

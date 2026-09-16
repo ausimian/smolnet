@@ -1,6 +1,8 @@
 defmodule SmolNet.StackLinkTest do
   use ExUnit.Case, async: false
 
+  alias SmolNet.Socket
+  alias SmolNet.Socket.SelectInfo
   alias SmolNet.Stack.Ref
   alias SmolNet.Test.IPv6Link
   alias SmolNet.Test.ManualClock
@@ -268,6 +270,59 @@ defmodule SmolNet.StackLinkTest do
     assert polled.poll_at == nil
   end
 
+  test "non-driving socket calls preserve an existing protocol poll deadline" do
+    {:ok, clock} = ManualClock.start()
+    Application.put_env(:smolnet, :clock_module, ManualClock)
+    Application.put_env(:smolnet, :manual_clock, clock)
+    configure_native_double(:default, poll_at: 10)
+
+    {:ok, stack} = SmolNet.start_stack()
+    %{stack: stack_pid} = Ref.pids(stack)
+    socket = Socket.new(stack_pid, %{id: 1, generation: 1})
+    select_info = SelectInfo.new(:recv, make_ref())
+    {:ok, before_cancel} = SmolNet.stack_info(stack)
+
+    assert :ok = SmolNet.cancel(socket, select_info)
+
+    {:ok, after_cancel} = SmolNet.stack_info(stack)
+    assert after_cancel.poll_at == 10
+    assert after_cancel.timer_generation == before_cancel.timer_generation
+
+    :ok = ManualClock.advance(clock, 10)
+    assert_receive {:native_stack_poll, ^stack_pid, 10}
+  end
+
+  test "non-driving socket calls preserve an in-progress native continuation" do
+    configure_native_double(:wait)
+    Application.put_env(:smolnet, :native_poll_result, :wait)
+
+    {:ok, stack} = SmolNet.start_stack(egress: {self(), :continuation})
+    %{stack: stack_pid} = Ref.pids(stack)
+    packet = empty_ipv6_packet()
+
+    assert :ok = SmolNet.ingress(stack, packet)
+    assert_receive {:native_stack_ingress, ^stack_pid, ^packet}
+
+    socket = Socket.new(stack_pid, %{id: 1, generation: 1})
+    select_info = SelectInfo.new(:recv, make_ref())
+    cancel_task = Task.async(fn -> SmolNet.cancel(socket, select_info) end)
+    assert_eventually(fn -> message_queue_length(stack_pid) == 1 end)
+
+    second_ingress = Task.async(fn -> SmolNet.ingress(stack, packet) end)
+    assert_eventually(fn -> message_queue_length(stack_pid) == 2 end)
+
+    send(stack_pid, {:native_ingress_reply, empty_effects(more: true)})
+    assert Task.await(cancel_task) == :ok
+    assert_receive {:native_stack_poll, ^stack_pid, _now}
+    assert Task.yield(second_ingress, 0) == nil
+    refute_receive {:native_stack_ingress, ^stack_pid, ^packet}, 50
+
+    send(stack_pid, {:native_poll_reply, empty_effects()})
+    assert Task.await(second_ingress) == :ok
+    assert_receive {:native_stack_ingress, ^stack_pid, ^packet}
+    send(stack_pid, {:native_ingress_reply, empty_effects()})
+  end
+
   test "two stacks on independent links progress when one link is held" do
     {:ok, link_a} = IPv6Link.start_link(self())
     {:ok, link_b} = IPv6Link.start_link(self())
@@ -433,6 +488,11 @@ defmodule SmolNet.StackLinkTest do
        poll_at: Keyword.get(options, :poll_at),
        more: Keyword.get(options, :more, false)
      }}
+  end
+
+  defp message_queue_length(pid) do
+    {:message_queue_len, length} = Process.info(pid, :message_queue_len)
+    length
   end
 
   defp echo_request(source, destination, payload) do

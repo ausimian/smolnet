@@ -15,6 +15,14 @@ defmodule SmolNet.Native do
   @spec stack_poll(reference(), integer()) :: {:ok, map()} | {:error, atom()}
   def stack_poll(_stack, _now), do: :erlang.nif_error(:nif_not_loaded)
 
+  @spec stack_shutdown(reference()) :: {:ok, map()} | {:error, atom()}
+  def stack_shutdown(_stack), do: :erlang.nif_error(:nif_not_loaded)
+
+  @spec socket_cancel(reference(), map(), atom(), reference()) ::
+          {:ok, map()} | {:error, atom()}
+  def socket_cancel(_stack, _identity, _operation, _reference),
+    do: :erlang.nif_error(:nif_not_loaded)
+
   @spec stack_snapshot(reference()) :: {:ok, map()} | {:error, atom()}
   def stack_snapshot(_stack), do: :erlang.nif_error(:nif_not_loaded)
 
@@ -29,4 +37,19 @@ defmodule SmolNet.Native do
 
   @spec test_bounded_work(reference(), map()) :: {:ok, map()} | {:error, atom()}
   def test_bounded_work(_stack, _requested), do: :erlang.nif_error(:nif_not_loaded)
+
+  @spec test_socket_open(reference(), non_neg_integer()) :: {:ok, map()} | {:error, atom()}
+  def test_socket_open(_stack, _internal_handle), do: :erlang.nif_error(:nif_not_loaded)
+
+  @spec test_socket_wait(reference(), map(), map()) :: {:ok, map()} | {:error, atom()}
+  def test_socket_wait(_stack, _identity, _wait),
+    do: :erlang.nif_error(:nif_not_loaded)
+
+  @spec test_socket_ready(reference(), [map()]) :: {:ok, map()} | {:error, atom()}
+  def test_socket_ready(_stack, _keys), do: :erlang.nif_error(:nif_not_loaded)
+
+  @spec test_socket_close(reference(), map(), nil | :read | :write) ::
+          {:ok, map()} | {:error, atom()}
+  def test_socket_close(_stack, _identity, _wake_direction),
+    do: :erlang.nif_error(:nif_not_loaded)
 end

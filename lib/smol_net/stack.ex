@@ -4,6 +4,8 @@ defmodule SmolNet.Stack do
   use GenServer, restart: :temporary, significant: true
 
   alias SmolNet.Native
+  alias SmolNet.Socket
+  alias SmolNet.Socket.SelectInfo
   alias SmolNet.Stack.Clock.System, as: SystemClock
   alias SmolNet.Stack.Options
   alias SmolNet.Stack.Ref
@@ -47,6 +49,70 @@ defmodule SmolNet.Stack do
   end
 
   @doc false
+  @spec cancel(Socket.t(), SelectInfo.t()) ::
+          :ok | :already_sent | :not_found | {:error, :closed | :invalid_socket}
+  def cancel(
+        %Socket{stack: stack, id: id, generation: generation},
+        %SelectInfo{operation: operation, ref: reference}
+      ) do
+    GenServer.call(stack, {:socket_cancel, id, generation, operation, reference})
+  catch
+    :exit, _reason -> {:error, :closed}
+  end
+
+  @doc false
+  def test_socket_open(%Ref{stack: stack}, internal_handle) do
+    GenServer.call(stack, {:test_socket_open, internal_handle})
+  end
+
+  @doc false
+  def test_socket_wait(
+        %Socket{stack: stack, id: id, generation: generation},
+        direction,
+        operation,
+        arm_point,
+        wake_count,
+        completed
+      ) do
+    reference = make_ref()
+
+    GenServer.call(
+      stack,
+      {:test_socket_wait, id, generation, direction, operation, reference, arm_point, wake_count,
+       completed}
+    )
+  end
+
+  @doc false
+  def test_socket_ready(keys) do
+    [{%Socket{stack: stack}, _direction} | _rest] = keys
+
+    encoded =
+      Enum.map(keys, fn
+        {%Socket{stack: ^stack, id: id, generation: generation}, direction} ->
+          %{identity: %{id: id, generation: generation}, direction: direction}
+      end)
+
+    GenServer.call(stack, {:test_socket_ready, encoded})
+  end
+
+  @doc false
+  def test_socket_close(
+        %Socket{stack: stack, id: id, generation: generation},
+        wake_direction \\ nil
+      ) do
+    GenServer.call(stack, {:test_socket_close, id, generation, wake_direction})
+  end
+
+  @doc false
+  @spec shutdown_waiters(pid()) :: :ok | {:error, atom()}
+  def shutdown_waiters(stack) do
+    GenServer.call(stack, :shutdown_waiters)
+  catch
+    :exit, _reason -> {:error, :closed}
+  end
+
+  @doc false
   @spec info(Ref.t()) :: {:ok, map()} | {:error, :closed}
   def info(%Ref{stack: stack}) do
     GenServer.call(stack, :stack_info)
@@ -70,6 +136,8 @@ defmodule SmolNet.Stack do
 
   @impl true
   def init(options) do
+    Process.flag(:trap_exit, true)
+
     starter = Keyword.fetch!(options, :starter)
     egress = Keyword.get(options, :egress)
 
@@ -216,6 +284,76 @@ defmodule SmolNet.Stack do
     {:reply, state.native_module.test_bounded_work(state.native, requested), state}
   end
 
+  def handle_call(:shutdown_waiters, _from, state) do
+    state.native_module.stack_shutdown(state.native)
+    |> reply_native(state)
+  end
+
+  def handle_call(
+        {:socket_cancel, id, generation, operation, reference},
+        _from,
+        state
+      ) do
+    state.native_module.socket_cancel(
+      state.native,
+      %{id: id, generation: generation},
+      operation,
+      reference
+    )
+    |> reply_native(state, &Function.identity/1, :preserve_timer)
+  end
+
+  def handle_call({:test_socket_open, internal_handle}, _from, state) do
+    result = state.native_module.test_socket_open(state.native, internal_handle)
+
+    reply_native(
+      result,
+      state,
+      fn identity -> Socket.new(self(), identity) end,
+      :preserve_timer
+    )
+  end
+
+  def handle_call(
+        {:test_socket_wait, id, generation, direction, operation, reference, arm_point,
+         wake_count, completed},
+        {caller, _tag},
+        state
+      ) do
+    state.native_module.test_socket_wait(
+      state.native,
+      %{id: id, generation: generation},
+      %{
+        direction: direction,
+        operation: operation,
+        pid: caller,
+        reference: reference,
+        arm_point: arm_point,
+        wake_count: wake_count,
+        completed: completed
+      }
+    )
+    |> reply_native(state, &normalize_wait_result/1, :preserve_timer)
+  end
+
+  def handle_call({:test_socket_ready, keys}, _from, state) do
+    state.native_module.test_socket_ready(state.native, keys)
+    |> reply_native(state, &Function.identity/1, :preserve_timer)
+  end
+
+  def handle_call(
+        {:test_socket_close, id, generation, wake_direction},
+        _from,
+        state
+      ) do
+    state.native_module.test_socket_close(
+      state.native,
+      %{id: id, generation: generation},
+      wake_direction
+    )
+    |> reply_native(state, &Function.identity/1, :preserve_timer)
+  end
+
   def handle_call(:stack_info, _from, state) do
     native =
       case state.native_module.stack_snapshot(state.native) do
@@ -241,6 +379,10 @@ defmodule SmolNet.Stack do
   def terminate(_reason, state) do
     if state.timer do
       _cancel_result = state.clock.cancel_timer(state.timer.ref)
+    end
+
+    if state.native_module && state.native do
+      _shutdown_result = state.native_module.stack_shutdown(state.native)
     end
 
     :ok
@@ -302,21 +444,27 @@ defmodule SmolNet.Stack do
     end
   end
 
-  defp apply_effects(state, envelope) do
+  defp apply_effects(state, envelope, timer_policy \\ :replace_timer) do
     state = emit_packets(state, Map.get(envelope, :output, []))
+    more = Map.get(envelope, :more, false)
+    poll_at = Map.get(envelope, :poll_at)
 
-    if Map.get(envelope, :more, false) do
-      state =
+    cond do
+      more ->
+        state =
+          state
+          |> Map.put(:native_continuation, true)
+          |> replace_timer(nil)
+
+        send(self(), {:smolnet_poll, state.timer_generation})
         state
-        |> Map.put(:native_continuation, true)
-        |> replace_timer(nil)
 
-      send(self(), {:smolnet_poll, state.timer_generation})
-      state
-    else
-      state
-      |> Map.put(:native_continuation, false)
-      |> replace_timer(Map.get(envelope, :poll_at))
+      timer_policy == :preserve_timer and is_nil(poll_at) ->
+        state
+
+      true ->
+        state = Map.put(state, :native_continuation, false)
+        replace_timer(state, poll_at)
     end
   end
 
@@ -394,4 +542,26 @@ defmodule SmolNet.Stack do
 
   defp timer_deadline(nil), do: nil
   defp timer_deadline(timer), do: timer.deadline
+
+  defp reply_native(
+         result,
+         state,
+         transform \\ &Function.identity/1,
+         timer_policy \\ :replace_timer
+       )
+
+  defp reply_native({:ok, envelope}, state, transform, timer_policy) do
+    result = envelope |> Map.fetch!(:result) |> transform.()
+    {:reply, result, apply_effects(state, envelope, timer_policy)}
+  end
+
+  defp reply_native({:error, reason}, state, _transform, _timer_policy) do
+    {:reply, {:error, reason}, state}
+  end
+
+  defp normalize_wait_result(:ready), do: :ready
+
+  defp normalize_wait_result({:select, operation, reference}) do
+    {:select, SelectInfo.new(operation, reference)}
+  end
 end

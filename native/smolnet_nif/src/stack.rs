@@ -1,15 +1,20 @@
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Mutex, TryLockError};
 
-use rustler::{Atom, NifMap, Resource, ResourceArc};
+use rustler::{Atom, Encoder, Env, LocalPid, NifMap, Reference, Resource, ResourceArc, Term};
 use smoltcp::iface::{Config, Interface, PollResult, Route, SocketSet};
 use smoltcp::time::Instant;
 use smoltcp::wire::{HardwareAddress, IpAddress, IpCidr, Ipv6Address, Ipv6Cidr};
 
 use crate::device::BeamDevice;
 use crate::limits::{Limits, Work};
-use crate::socket_table::SocketTable;
-use crate::waiter::ReadyQueue;
+use crate::socket_table::{
+    CancelResult, InstallResult, ReadyResult, SocketError, SocketKind, SocketTable,
+    WaiterRegistration,
+};
+use crate::waiter::{
+    ArmPoint, Direction, Operation, ReadinessCounters, ReadyKey, ReadyQueue, SocketIdentity, Waiter,
+};
 
 static NEXT_STACK_ID: AtomicU64 = AtomicU64::new(1);
 static CREATED: AtomicUsize = AtomicUsize::new(0);
@@ -78,6 +83,8 @@ pub struct NativeStack {
     device: BeamDevice,
     socket_table: SocketTable,
     ready: ReadyQueue,
+    ready_sweep: bool,
+    ready_sweep_cursor: Option<ReadyKey>,
     counters: Counters,
     lifecycle: Lifecycle,
     limits: Limits,
@@ -115,8 +122,10 @@ impl NativeStack {
             interface,
             sockets: SocketSet::new(Vec::new()),
             device,
-            socket_table: SocketTable::default(),
-            ready: ReadyQueue::default(),
+            socket_table: SocketTable::new(limits.ready_events, limits.ready_events),
+            ready: ReadyQueue::new((limits.ready_events / 2).max(1)),
+            ready_sweep: false,
+            ready_sweep_cursor: None,
             counters: Counters::default(),
             lifecycle: Lifecycle::Running,
             limits,
@@ -126,6 +135,7 @@ impl NativeStack {
 
     pub fn snapshot(&self) -> Envelope<Snapshot> {
         let (receive_packets, transmit_packets) = self.device.queued_packets();
+        let (read_waiters, write_waiters) = self.socket_table.waiter_counts();
 
         Envelope {
             result: Snapshot {
@@ -133,7 +143,12 @@ impl NativeStack {
                 limits: self.limits,
                 socket_count: self.socket_table.len(),
                 native_socket_count: self.sockets.iter().count(),
+                waiter_count: self.socket_table.waiter_count(),
+                read_waiter_count: read_waiters,
+                write_waiter_count: write_waiters,
                 ready_count: self.ready.len(),
+                ready_overflow_pending: self.ready_sweep || self.ready.has_pending(),
+                readiness: self.ready.counters(),
                 receive_packets,
                 transmit_packets,
                 mtu: self.mtu,
@@ -172,6 +187,310 @@ impl NativeStack {
         self.counters.poll_calls += 1;
         self.drive(now, None)
             .expect("poll without ingress cannot fail")
+    }
+
+    pub fn finish_call<T>(
+        &mut self,
+        env: Env<'_>,
+        result: T,
+        mut effects: Effects,
+        aborts: Vec<PendingNotification>,
+    ) -> Envelope<T> {
+        let mut readiness_work = 0usize;
+
+        for notification in aborts {
+            debug_assert!(readiness_work < self.limits.ready_events);
+            self.send_abort(env, &notification.waiter, notification.identity);
+            readiness_work += 1;
+        }
+
+        if self.ready.take_overflow() {
+            self.ready_sweep = true;
+            self.ready_sweep_cursor = None;
+        }
+
+        let remaining = self.limits.ready_events.saturating_sub(readiness_work);
+        let queued = self.ready.drain(remaining);
+
+        for key in queued {
+            self.deliver_ready(env, key);
+            readiness_work += 1;
+        }
+
+        let remaining = self.limits.ready_events.saturating_sub(readiness_work);
+
+        if self.ready_sweep && remaining > 0 {
+            let scan = self
+                .socket_table
+                .scan_ready(self.ready_sweep_cursor, remaining, remaining);
+            let scan_cost = scan.entries_scanned.max(scan.keys.len());
+
+            for key in scan.keys {
+                self.deliver_ready(env, key);
+            }
+
+            readiness_work += scan_cost;
+            self.ready_sweep = !scan.complete;
+            self.ready_sweep_cursor = self.ready_sweep.then_some(scan.cursor).flatten();
+        }
+
+        effects.more = effects.more || self.ready.has_pending() || self.ready_sweep;
+        self.counters.observe(Work {
+            ready_events: readiness_work,
+            maintenance_work: effects.maintenance_work,
+            ..Work::default()
+        });
+
+        Envelope {
+            result,
+            output: effects.output,
+            poll_at: effects.poll_at,
+            more: effects.more,
+        }
+    }
+
+    pub fn shutdown(&mut self, env: Env<'_>) -> Envelope<Atom> {
+        if matches!(self.lifecycle, Lifecycle::Shutdown) {
+            return Envelope::empty(crate::atoms::ok());
+        }
+
+        // Linearize shutdown before draining the bounded table. Any socket
+        // operation serialized after this point is rejected as closed.
+        self.lifecycle = Lifecycle::Shutdown;
+        let waiters = self.socket_table.close_all();
+        debug_assert!(waiters.len() <= self.limits.ready_events);
+
+        for (identity, _direction, waiter) in &waiters {
+            self.send_abort(env, waiter, *identity);
+        }
+
+        self.ready.clear();
+        self.ready_sweep = false;
+        self.ready_sweep_cursor = None;
+        self.counters.observe(Work {
+            ready_events: waiters.len(),
+            ..Work::default()
+        });
+
+        Envelope::empty(crate::atoms::ok())
+    }
+
+    #[cfg(debug_assertions)]
+    pub fn test_socket_open(
+        &mut self,
+        env: Env<'_>,
+        internal_handle: u64,
+    ) -> Result<Envelope<SocketIdentity>, SocketError> {
+        self.ensure_running()?;
+        let identity = self
+            .socket_table
+            .insert(SocketKind::Synthetic, internal_handle)?;
+        Ok(self.finish_call(env, identity, Effects::empty(), Vec::new()))
+    }
+
+    #[cfg(debug_assertions)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn test_socket_wait<'a>(
+        &mut self,
+        env: Env<'a>,
+        identity: SocketIdentity,
+        direction: Direction,
+        operation: Operation,
+        pid: LocalPid,
+        reference: Reference<'a>,
+        arm_point: ArmPoint,
+        wake_count: usize,
+        completed: bool,
+    ) -> Result<Envelope<Term<'a>>, SocketError> {
+        self.ensure_running()?;
+
+        if operation.direction() != direction {
+            return Err(SocketError::InvalidOperation);
+        }
+
+        let flag = self
+            .socket_table
+            .ready_flag(identity, SocketKind::Synthetic, direction)?;
+        let key = ReadyKey {
+            identity,
+            direction,
+        };
+        let waker = self.ready.waker(key, flag);
+
+        if arm_point == ArmPoint::BeforeTry {
+            wake_repeatedly(&waker, wake_count);
+        }
+
+        let result = if completed {
+            crate::atoms::ready().encode(env)
+        } else {
+            if arm_point == ArmPoint::BetweenTryAndArm {
+                wake_repeatedly(&waker, wake_count);
+            }
+
+            let install = self.socket_table.install_waiter(
+                env,
+                WaiterRegistration {
+                    identity,
+                    expected_kind: SocketKind::Synthetic,
+                    direction,
+                    pid,
+                    operation,
+                    reference,
+                },
+            )?;
+
+            if arm_point == ArmPoint::AfterArm && install == InstallResult::Armed {
+                wake_repeatedly(&waker, wake_count);
+            }
+
+            (crate::atoms::select(), operation, reference).encode(env)
+        };
+
+        Ok(self.finish_call(env, result, Effects::empty(), Vec::new()))
+    }
+
+    #[cfg(debug_assertions)]
+    pub fn test_socket_ready(
+        &mut self,
+        env: Env<'_>,
+        keys: Vec<ReadyKey>,
+    ) -> Result<Envelope<Atom>, SocketError> {
+        self.ensure_running()?;
+
+        if keys.len() > self.limits.ready_events {
+            return Err(SocketError::SystemLimit);
+        }
+
+        let mut wakers = Vec::with_capacity(keys.len());
+
+        for key in keys {
+            let flag =
+                self.socket_table
+                    .ready_flag(key.identity, SocketKind::Synthetic, key.direction)?;
+            wakers.push(self.ready.waker(key, flag));
+        }
+
+        for waker in wakers {
+            waker.wake();
+        }
+
+        Ok(self.finish_call(env, crate::atoms::ok(), Effects::empty(), Vec::new()))
+    }
+
+    #[cfg(debug_assertions)]
+    pub fn test_socket_close(
+        &mut self,
+        env: Env<'_>,
+        identity: SocketIdentity,
+        wake_direction: Option<Direction>,
+    ) -> Result<Envelope<Atom>, SocketError> {
+        self.ensure_running()?;
+
+        if let Some(direction) = wake_direction {
+            let flag = self
+                .socket_table
+                .ready_flag(identity, SocketKind::Synthetic, direction)?;
+            self.ready
+                .waker(
+                    ReadyKey {
+                        identity,
+                        direction,
+                    },
+                    flag,
+                )
+                .wake();
+        }
+
+        let waiters = self.socket_table.close(identity)?;
+        let aborts = waiters
+            .into_iter()
+            .map(|(direction, waiter)| PendingNotification {
+                identity,
+                direction,
+                waiter,
+            })
+            .collect();
+
+        Ok(self.finish_call(env, crate::atoms::ok(), Effects::empty(), aborts))
+    }
+
+    pub fn cancel<'a>(
+        &mut self,
+        env: Env<'a>,
+        identity: SocketIdentity,
+        operation: Operation,
+        reference: Reference<'a>,
+    ) -> Result<Envelope<Atom>, SocketError> {
+        self.ensure_running()?;
+
+        let result = match self
+            .socket_table
+            .cancel(env, identity, operation, reference)?
+        {
+            CancelResult::Cancelled => crate::atoms::ok(),
+            CancelResult::AlreadySent => crate::atoms::already_sent(),
+            CancelResult::NotFound => crate::atoms::not_found(),
+        };
+
+        Ok(self.finish_call(env, result, Effects::empty(), Vec::new()))
+    }
+
+    fn ensure_running(&self) -> Result<(), SocketError> {
+        match self.lifecycle {
+            Lifecycle::Running => Ok(()),
+            Lifecycle::Shutdown => Err(SocketError::Closed),
+        }
+    }
+
+    fn deliver_ready(&mut self, env: Env<'_>, key: ReadyKey) {
+        match self.socket_table.take_ready_waiter(key) {
+            ReadyResult::Notify(waiter) => {
+                let delivered = env
+                    .send(
+                        &waiter.pid,
+                        (
+                            crate::atoms::smol_socket(),
+                            (key.identity.id, key.identity.generation),
+                            crate::atoms::select(),
+                            waiter.reference(env),
+                        ),
+                    )
+                    .is_ok();
+
+                self.observe_notification(delivered);
+                self.socket_table
+                    .remember_sent(key.identity, key.direction, waiter);
+            }
+            ReadyResult::NoWaiter | ReadyResult::Coalesced | ReadyResult::Stale => {
+                self.counters.readiness_dropped += 1;
+            }
+        }
+    }
+
+    fn send_abort(&mut self, env: Env<'_>, waiter: &Waiter, identity: SocketIdentity) {
+        let delivered = env
+            .send(
+                &waiter.pid,
+                (
+                    crate::atoms::smol_socket(),
+                    (identity.id, identity.generation),
+                    crate::atoms::abort(),
+                    waiter.reference(env),
+                    crate::atoms::closed(),
+                ),
+            )
+            .is_ok();
+
+        self.observe_notification(delivered);
+    }
+
+    fn observe_notification(&mut self, delivered: bool) {
+        if delivered {
+            self.counters.notifications_delivered += 1;
+        } else {
+            self.counters.notifications_dropped += 1;
+        }
     }
 
     fn drive(&mut self, now: Instant, ingress_bytes: Option<usize>) -> Result<Effects, StackError> {
@@ -240,6 +559,7 @@ impl NativeStack {
             output,
             poll_at,
             more,
+            maintenance_work,
         })
     }
 
@@ -376,16 +696,39 @@ pub struct Effects {
     pub output: Vec<Vec<u8>>,
     pub poll_at: Option<i64>,
     pub more: bool,
+    maintenance_work: usize,
+}
+
+impl Effects {
+    fn empty() -> Self {
+        Self {
+            output: Vec::new(),
+            poll_at: None,
+            more: false,
+            maintenance_work: 0,
+        }
+    }
+}
+
+pub struct PendingNotification {
+    identity: SocketIdentity,
+    #[allow(dead_code)]
+    direction: Direction,
+    waiter: Waiter,
 }
 
 #[derive(Clone, Copy)]
 enum Lifecycle {
     Running,
+    Shutdown,
 }
 
 impl Lifecycle {
     fn as_atom(self) -> Atom {
-        crate::atoms::running()
+        match self {
+            Self::Running => crate::atoms::running(),
+            Self::Shutdown => crate::atoms::shutdown(),
+        }
     }
 }
 
@@ -399,6 +742,9 @@ pub struct Counters {
     rejected_packets: usize,
     emitted_packets: usize,
     poll_calls: usize,
+    notifications_delivered: usize,
+    notifications_dropped: usize,
+    readiness_dropped: usize,
 }
 
 impl Counters {
@@ -418,6 +764,17 @@ pub struct Envelope<T> {
     pub more: bool,
 }
 
+impl<T> Envelope<T> {
+    pub fn empty(result: T) -> Self {
+        Self {
+            result,
+            output: Vec::new(),
+            poll_at: None,
+            more: false,
+        }
+    }
+}
+
 impl Envelope<ResourceArc<StackResource>> {
     pub fn created(resource: ResourceArc<StackResource>) -> Self {
         Self {
@@ -435,7 +792,12 @@ pub struct Snapshot {
     limits: Limits,
     socket_count: usize,
     native_socket_count: usize,
+    waiter_count: usize,
+    read_waiter_count: usize,
+    write_waiter_count: usize,
     ready_count: usize,
+    ready_overflow_pending: bool,
+    readiness: ReadinessCounters,
     receive_packets: usize,
     transmit_packets: usize,
     mtu: usize,
@@ -449,6 +811,12 @@ pub struct ResourceCounts {
     created: usize,
     dropped: usize,
     active: usize,
+}
+
+fn wake_repeatedly(waker: &std::task::Waker, count: usize) {
+    for _ in 0..count {
+        waker.wake_by_ref();
+    }
 }
 
 #[cfg(test)]
