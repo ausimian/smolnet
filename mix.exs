@@ -15,6 +15,7 @@ defmodule SmolNet.MixProject do
       homepage_url: @source_url,
       package: package(),
       docs: docs(),
+      elixirc_paths: elixirc_paths(Mix.env()),
       test_coverage: [tool: ExCoveralls],
       dialyzer: [
         plt_file: {:no_warn, "priv/plts/dialyzer.plt"},
@@ -70,6 +71,9 @@ defmodule SmolNet.MixProject do
       {:publisho, "~> 1.0", only: :dev, runtime: false}
     ]
   end
+
+  defp elixirc_paths(:test), do: ["lib", "test/support"]
+  defp elixirc_paths(_env), do: ["lib"]
 
   defp docs do
     [
