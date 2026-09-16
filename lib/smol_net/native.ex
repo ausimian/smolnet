@@ -34,6 +34,21 @@ defmodule SmolNet.Native do
   def tcp_connect(_stack, _identity, _endpoint, _pid, _reference, _now),
     do: :erlang.nif_error(:nif_not_loaded)
 
+  @spec tcp_send(reference(), map(), binary(), pid(), reference(), integer()) ::
+          {:ok, map()} | {:error, atom()}
+  def tcp_send(_stack, _identity, _data, _pid, _reference, _now),
+    do: :erlang.nif_error(:nif_not_loaded)
+
+  @spec tcp_recv(reference(), map(), non_neg_integer(), pid(), reference(), integer()) ::
+          {:ok, map()} | {:error, atom()}
+  def tcp_recv(_stack, _identity, _length, _pid, _reference, _now),
+    do: :erlang.nif_error(:nif_not_loaded)
+
+  @spec tcp_shutdown(reference(), map(), :read | :write | :read_write, integer()) ::
+          {:ok, map()} | {:error, atom()}
+  def tcp_shutdown(_stack, _identity, _how, _now),
+    do: :erlang.nif_error(:nif_not_loaded)
+
   @spec tcp_sockname(reference(), map()) :: {:ok, map()} | {:error, atom()}
   def tcp_sockname(_stack, _identity), do: :erlang.nif_error(:nif_not_loaded)
 

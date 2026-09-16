@@ -88,6 +88,38 @@ defmodule SmolNet.Stack do
   end
 
   @doc false
+  @spec socket_send(Socket.t(), binary()) ::
+          :ok | {:select, {:socket.select_info(), binary()}} | {:error, atom()}
+  def socket_send(%Socket{stack: stack, id: id, generation: generation}, data) do
+    reference = make_ref()
+    GenServer.call(stack, {:socket_send, id, generation, data, reference})
+  catch
+    :exit, _reason -> {:error, :closed}
+  end
+
+  @doc false
+  @spec socket_recv(Socket.t(), non_neg_integer()) ::
+          {:ok, binary()}
+          | {:select, :socket.select_info()}
+          | {:select, {:socket.select_info(), binary()}}
+          | {:error, atom()}
+  def socket_recv(%Socket{stack: stack, id: id, generation: generation}, length) do
+    reference = make_ref()
+    GenServer.call(stack, {:socket_recv, id, generation, length, reference})
+  catch
+    :exit, _reason -> {:error, :closed}
+  end
+
+  @doc false
+  @spec socket_shutdown(Socket.t(), :read | :write | :read_write) ::
+          :ok | {:error, atom()}
+  def socket_shutdown(%Socket{stack: stack, id: id, generation: generation}, how) do
+    GenServer.call(stack, {:socket_shutdown, id, generation, how})
+  catch
+    :exit, _reason -> {:error, :closed}
+  end
+
+  @doc false
   @spec socket_sockname(Socket.t()) :: {:ok, Socket.sockaddr_in6()} | {:error, atom()}
   def socket_sockname(%Socket{stack: stack, id: id, generation: generation}) do
     GenServer.call(stack, {:socket_sockname, id, generation})
@@ -384,6 +416,48 @@ defmodule SmolNet.Stack do
     |> reply_native(state, &normalize_wait_result/1)
   end
 
+  def handle_call(
+        {:socket_send, id, generation, data, reference},
+        {caller, _tag},
+        state
+      ) do
+    state.native_module.tcp_send(
+      state.native,
+      %{id: id, generation: generation},
+      data,
+      caller,
+      reference,
+      state.clock.now()
+    )
+    |> reply_native(state, &normalize_send_result(&1, data))
+  end
+
+  def handle_call(
+        {:socket_recv, id, generation, length, reference},
+        {caller, _tag},
+        state
+      ) do
+    state.native_module.tcp_recv(
+      state.native,
+      %{id: id, generation: generation},
+      length,
+      caller,
+      reference,
+      state.clock.now()
+    )
+    |> reply_native(state, &normalize_recv_result/1)
+  end
+
+  def handle_call({:socket_shutdown, id, generation, how}, _from, state) do
+    state.native_module.tcp_shutdown(
+      state.native,
+      %{id: id, generation: generation},
+      how,
+      state.clock.now()
+    )
+    |> reply_native(state)
+  end
+
   def handle_call({:socket_sockname, id, generation}, _from, state) do
     state.native_module.tcp_sockname(state.native, %{id: id, generation: generation})
     |> reply_native(state, &normalize_endpoint/1, :preserve_timer)
@@ -664,6 +738,24 @@ defmodule SmolNet.Stack do
 
   defp normalize_wait_result({:select, operation, reference}) do
     {:select, {:select_info, operation, reference}}
+  end
+
+  defp normalize_send_result(:ok, _data), do: :ok
+
+  defp normalize_send_result({:select, :send, reference, accepted}, data)
+       when accepted >= 0 and accepted <= byte_size(data) do
+    remainder = binary_part(data, accepted, byte_size(data) - accepted)
+    {:select, {{:select_info, :send, reference}, remainder}}
+  end
+
+  defp normalize_recv_result({:ok, data}) when is_binary(data), do: {:ok, data}
+
+  defp normalize_recv_result({:select, :recv, reference}) do
+    {:select, {:select_info, :recv, reference}}
+  end
+
+  defp normalize_recv_result({:select, :recv, reference, data}) when is_binary(data) do
+    {:select, {{:select_info, :recv, reference}, data}}
   end
 
   defp normalize_endpoint(endpoint), do: {:ok, Socket.endpoint_from_native(endpoint)}

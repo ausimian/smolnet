@@ -10,8 +10,11 @@ defmodule SmolNet.Socket do
   alias SmolNet.Stack
 
   import Bitwise, only: [band: 2]
+  import Kernel, except: [send: 2]
 
   @max_identity 576_460_752_303_423_487
+  @max_immediate_retries 16
+  @max_timeout 4_294_967_295
 
   @enforce_keys [:stack, :id, :generation]
   defstruct [:stack, :id, :generation]
@@ -66,7 +69,11 @@ defmodule SmolNet.Socket do
   def bind(_socket, _address), do: {:error, :invalid_socket}
 
   @doc false
-  @spec connect(t(), sockaddr_in6(), :nowait) ::
+  @spec connect(t(), sockaddr_in6()) :: :ok | {:error, atom()}
+  def connect(socket, address), do: connect(socket, address, :infinity)
+
+  @doc false
+  @spec connect(t(), sockaddr_in6(), :nowait | timeout()) ::
           :ok | {:select, :socket.select_info()} | {:error, atom()}
   def connect(%__MODULE__{} = socket, address, :nowait) do
     with true <- valid?(socket),
@@ -78,11 +85,117 @@ defmodule SmolNet.Socket do
     end
   end
 
+  def connect(%__MODULE__{} = socket, address, timeout)
+      when timeout == :infinity or
+             (is_integer(timeout) and timeout >= 0 and timeout <= @max_timeout) do
+    with true <- valid?(socket),
+         {:ok, endpoint} <- encode_endpoint(address, :remote) do
+      synchronous(socket, timeout, fn deadline, monitor ->
+        connect_loop(socket, endpoint, deadline, monitor, 0)
+      end)
+    else
+      false -> {:error, :invalid_socket}
+      {:error, _reason} = error -> error
+    end
+  end
+
   def connect(%__MODULE__{} = socket, _address, _timeout) do
-    if valid?(socket), do: {:error, :unsupported_timeout}, else: {:error, :invalid_socket}
+    if valid?(socket), do: {:error, :invalid_timeout}, else: {:error, :invalid_socket}
   end
 
   def connect(_socket, _address, _timeout), do: {:error, :invalid_socket}
+
+  @doc false
+  @spec send(t(), iodata()) :: :ok | {:error, atom() | {atom(), binary()}}
+  def send(socket, data), do: send(socket, data, :infinity)
+
+  @doc false
+  @spec send(t(), iodata(), :nowait | timeout()) ::
+          :ok
+          | {:select, {:socket.select_info(), binary()}}
+          | {:error, atom() | {atom(), binary()}}
+  def send(%__MODULE__{} = socket, data, :nowait) do
+    with true <- valid?(socket),
+         {:ok, binary} <- encode_data(data) do
+      Stack.socket_send(socket, binary)
+    else
+      false -> {:error, :invalid_socket}
+      {:error, _reason} = error -> error
+    end
+  end
+
+  def send(%__MODULE__{} = socket, data, timeout)
+      when timeout == :infinity or
+             (is_integer(timeout) and timeout >= 0 and timeout <= @max_timeout) do
+    with true <- valid?(socket),
+         {:ok, binary} <- encode_data(data) do
+      synchronous(socket, timeout, fn deadline, monitor ->
+        send_loop(socket, binary, deadline, monitor, false, 0)
+      end)
+    else
+      false -> {:error, :invalid_socket}
+      {:error, _reason} = error -> error
+    end
+  end
+
+  def send(%__MODULE__{} = socket, _data, _timeout) do
+    if valid?(socket), do: {:error, :invalid_timeout}, else: {:error, :invalid_socket}
+  end
+
+  def send(_socket, _data, _timeout), do: {:error, :invalid_socket}
+
+  @doc false
+  @spec recv(t(), non_neg_integer()) ::
+          {:ok, binary()} | {:error, atom() | {atom(), binary()}}
+  def recv(socket, length), do: recv(socket, length, :infinity)
+
+  @doc false
+  @spec recv(t(), non_neg_integer(), :nowait | timeout()) ::
+          {:ok, binary()}
+          | {:select, :socket.select_info()}
+          | {:select, {:socket.select_info(), binary()}}
+          | {:error, atom() | {atom(), binary()}}
+  def recv(%__MODULE__{} = socket, length, :nowait) do
+    with true <- valid?(socket),
+         true <- valid_length?(length) do
+      socket
+      |> Stack.socket_recv(length)
+      |> normalize_nowait_recv()
+    else
+      false -> invalid_socket_or_length(socket, length)
+    end
+  end
+
+  def recv(%__MODULE__{} = socket, length, timeout)
+      when timeout == :infinity or
+             (is_integer(timeout) and timeout >= 0 and timeout <= @max_timeout) do
+    with true <- valid?(socket),
+         true <- valid_length?(length) do
+      synchronous(socket, timeout, fn deadline, monitor ->
+        recv_loop(socket, length, deadline, monitor, [], 0)
+      end)
+    else
+      false -> invalid_socket_or_length(socket, length)
+    end
+  end
+
+  def recv(%__MODULE__{} = socket, _length, _timeout) do
+    if valid?(socket), do: {:error, :invalid_timeout}, else: {:error, :invalid_socket}
+  end
+
+  def recv(_socket, _length, _timeout), do: {:error, :invalid_socket}
+
+  @doc false
+  @spec shutdown(t(), :read | :write | :read_write) :: :ok | {:error, atom()}
+  def shutdown(%__MODULE__{} = socket, how) when how in [:read, :write, :read_write] do
+    if valid?(socket), do: Stack.socket_shutdown(socket, how), else: {:error, :invalid_socket}
+  end
+
+  def shutdown(%__MODULE__{} = socket, _how) do
+    if valid?(socket), do: {:error, :invalid_how}, else: {:error, :invalid_socket}
+  end
+
+  def shutdown(_socket, _how), do: {:error, :invalid_socket}
 
   @doc false
   @spec sockname(t()) :: {:ok, sockaddr_in6()} | {:error, atom()}
@@ -159,6 +272,296 @@ defmodule SmolNet.Socket do
       |> List.to_tuple()
 
     %{family: :inet6, addr: address, port: port, flowinfo: 0, scope_id: scope_id}
+  end
+
+  defp connect_loop(socket, endpoint, deadline, monitor, retries) do
+    case prepare_retry(deadline, retries) do
+      :ok ->
+        socket
+        |> Stack.socket_connect(endpoint)
+        |> handle_connect_result(socket, endpoint, deadline, monitor, retries)
+
+      :timeout ->
+        {:error, :timeout}
+    end
+  end
+
+  defp handle_connect_result(
+         {:select, select_info},
+         socket,
+         endpoint,
+         deadline,
+         monitor,
+         retries
+       ) do
+    socket
+    |> await_select(select_info, deadline, monitor)
+    |> continue_connect(socket, endpoint, deadline, monitor, retries)
+  end
+
+  defp handle_connect_result(result, _socket, _endpoint, _deadline, _monitor, _retries),
+    do: result
+
+  defp continue_connect(:ready, socket, endpoint, deadline, monitor, retries) do
+    connect_loop(socket, endpoint, deadline, monitor, retries + 1)
+  end
+
+  defp continue_connect({:error, reason}, _socket, _endpoint, _deadline, _monitor, _retries),
+    do: {:error, reason}
+
+  defp send_loop(socket, data, deadline, monitor, sent?, retries) do
+    case prepare_retry(deadline, retries) do
+      :ok ->
+        socket
+        |> Stack.socket_send(data)
+        |> handle_send_result(socket, data, deadline, monitor, sent?, retries)
+
+      :timeout ->
+        send_error(:timeout, data, sent?)
+    end
+  end
+
+  defp handle_send_result(:ok, _socket, _data, _deadline, _monitor, _sent?, _retries), do: :ok
+
+  defp handle_send_result(
+         {:select, {select_info, remainder}},
+         socket,
+         data,
+         deadline,
+         monitor,
+         sent?,
+         retries
+       ) do
+    sent? = sent? or byte_size(remainder) < byte_size(data)
+
+    socket
+    |> await_select(select_info, deadline, monitor)
+    |> continue_send(socket, remainder, deadline, monitor, sent?, retries)
+  end
+
+  defp handle_send_result(
+         {:error, reason},
+         _socket,
+         data,
+         _deadline,
+         _monitor,
+         sent?,
+         _retries
+       ),
+       do: send_error(reason, data, sent?)
+
+  defp continue_send(:ready, socket, remainder, deadline, monitor, sent?, retries) do
+    send_loop(socket, remainder, deadline, monitor, sent?, retries + 1)
+  end
+
+  defp continue_send(
+         {:error, reason},
+         _socket,
+         remainder,
+         _deadline,
+         _monitor,
+         sent?,
+         _retries
+       ),
+       do: send_error(reason, remainder, sent?)
+
+  defp recv_loop(socket, length, deadline, monitor, chunks, retries) do
+    case prepare_retry(deadline, retries) do
+      :ok ->
+        socket
+        |> Stack.socket_recv(length)
+        |> handle_recv_result(socket, length, deadline, monitor, chunks, retries)
+
+      :timeout ->
+        recv_error(:timeout, chunks)
+    end
+  end
+
+  defp handle_recv_result(
+         {:ok, data},
+         _socket,
+         _length,
+         _deadline,
+         _monitor,
+         chunks,
+         _retries
+       ),
+       do: {:ok, chunks_to_binary(chunks, data)}
+
+  defp handle_recv_result(
+         {:select, {select_info, data}},
+         socket,
+         length,
+         deadline,
+         monitor,
+         chunks,
+         retries
+       ) do
+    remaining = if length == 0, do: 0, else: length - byte_size(data)
+    chunks = [data | chunks]
+
+    socket
+    |> await_select(select_info, deadline, monitor)
+    |> continue_recv(socket, remaining, deadline, monitor, chunks, retries)
+  end
+
+  defp handle_recv_result(
+         {:select, select_info},
+         socket,
+         length,
+         deadline,
+         monitor,
+         chunks,
+         retries
+       ) do
+    socket
+    |> await_select(select_info, deadline, monitor)
+    |> continue_recv(socket, length, deadline, monitor, chunks, retries)
+  end
+
+  defp handle_recv_result(
+         {:error, :end_of_stream},
+         _socket,
+         _length,
+         _deadline,
+         _monitor,
+         [_chunk | _rest] = chunks,
+         _retries
+       ),
+       do: {:ok, chunks_to_binary(chunks, <<>>)}
+
+  defp handle_recv_result(
+         {:error, :end_of_stream},
+         _socket,
+         _length,
+         _deadline,
+         _monitor,
+         [],
+         _retries
+       ),
+       do: {:error, :closed}
+
+  defp handle_recv_result(
+         {:error, reason},
+         _socket,
+         _length,
+         _deadline,
+         _monitor,
+         chunks,
+         _retries
+       ),
+       do: recv_error(reason, chunks)
+
+  defp continue_recv(:ready, socket, length, deadline, monitor, chunks, retries) do
+    recv_loop(socket, length, deadline, monitor, chunks, retries + 1)
+  end
+
+  defp continue_recv(
+         {:error, reason},
+         _socket,
+         _length,
+         _deadline,
+         _monitor,
+         chunks,
+         _retries
+       ),
+       do: recv_error(reason, chunks)
+
+  defp synchronous(%__MODULE__{stack: stack}, timeout, operation) do
+    monitor = Process.monitor(stack)
+    deadline = deadline(timeout)
+
+    try do
+      operation.(deadline, monitor)
+    after
+      Process.demonitor(monitor, [:flush])
+    end
+  end
+
+  defp await_select(
+         %__MODULE__{stack: stack, id: id, generation: generation} = socket,
+         {:select_info, _operation, reference} = select_info,
+         deadline,
+         monitor
+       ) do
+    receive do
+      {:"$smol_socket", {^id, ^generation}, :select, ^reference} ->
+        :ready
+
+      {:"$smol_socket", {^id, ^generation}, :abort, ^reference, reason} ->
+        {:error, reason}
+
+      {:DOWN, ^monitor, :process, ^stack, _reason} ->
+        {:error, :closed}
+    after
+      remaining_timeout(deadline) ->
+        _cancel_result = cancel(socket, select_info)
+        drain_select_message(socket, reference)
+        {:error, :timeout}
+    end
+  end
+
+  defp drain_select_message(%__MODULE__{id: id, generation: generation}, reference) do
+    receive do
+      {:"$smol_socket", {^id, ^generation}, :select, ^reference} -> :ok
+      {:"$smol_socket", {^id, ^generation}, :abort, ^reference, _reason} -> :ok
+    after
+      0 -> :ok
+    end
+  end
+
+  defp send_error(reason, _remainder, false), do: {:error, reason}
+  defp send_error(reason, remainder, true), do: {:error, {reason, remainder}}
+
+  defp recv_error(reason, []), do: {:error, reason}
+  defp recv_error(reason, chunks), do: {:error, {reason, chunks_to_binary(chunks, <<>>)}}
+
+  defp normalize_nowait_recv({:error, :end_of_stream}), do: {:error, :closed}
+  defp normalize_nowait_recv(result), do: result
+
+  defp chunks_to_binary([], final), do: final
+  defp chunks_to_binary(chunks, final), do: IO.iodata_to_binary([Enum.reverse(chunks), final])
+
+  defp deadline(:infinity), do: :infinity
+  defp deadline(timeout), do: System.monotonic_time(:millisecond) + timeout
+
+  defp remaining_timeout(:infinity), do: :infinity
+
+  defp remaining_timeout(deadline) do
+    max(deadline - System.monotonic_time(:millisecond), 0)
+  end
+
+  defp deadline_reached?(:infinity), do: false
+  defp deadline_reached?(deadline), do: System.monotonic_time(:millisecond) >= deadline
+
+  defp prepare_retry(_deadline, 0), do: :ok
+
+  defp prepare_retry(deadline, retries) do
+    if deadline_reached?(deadline) do
+      :timeout
+    else
+      yield_if_needed(retries)
+    end
+  end
+
+  defp yield_if_needed(retries) when rem(retries, @max_immediate_retries) == 0 do
+    Process.sleep(0)
+  end
+
+  defp yield_if_needed(_retries), do: :ok
+
+  defp encode_data(data) do
+    {:ok, IO.iodata_to_binary(data)}
+  rescue
+    ArgumentError -> {:error, :invalid_data}
+  end
+
+  defp valid_length?(length), do: is_integer(length) and length in 0..@max_identity
+
+  defp invalid_socket_or_length(socket, length) do
+    if valid?(socket) and not valid_length?(length),
+      do: {:error, :invalid_length},
+      else: {:error, :invalid_socket}
   end
 
   defp encode_endpoint(%{family: :inet} = _address, _usage),

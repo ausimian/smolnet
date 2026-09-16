@@ -323,8 +323,8 @@ defmodule SmolNet.TcpConnectTest do
     assert {:error, :network_unreachable} =
              SmolNet.connect(other, endpoint(@unreachable, 80), :nowait)
 
-    assert {:error, :unsupported_timeout} =
-             SmolNet.connect(other, endpoint(@peer, 80), 1_000)
+    assert {:error, :invalid_timeout} =
+             SmolNet.connect(other, endpoint(@peer, 80), -1)
   end
 
   test "many pending sockets stay bounded and separate stacks progress independently" do
