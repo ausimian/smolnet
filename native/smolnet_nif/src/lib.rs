@@ -6,8 +6,8 @@ mod time;
 mod waiter;
 
 use limits::{Limits, Work};
-use rustler::{Atom, Decoder, Encoder, Env, ResourceArc, Term};
-use stack::{ResourceCounts, StackResource};
+use rustler::{Atom, Binary, Decoder, Encoder, Env, NewBinary, NifMap, ResourceArc, Term};
+use stack::{Effects, ResourceCounts, StackConfig, StackError, StackResource};
 
 mod atoms {
     rustler::atoms! {
@@ -17,6 +17,10 @@ mod atoms {
         ownership_invariant_violation,
         time_overflow,
         invalid_limits,
+        invalid_stack_config,
+        invalid_packet,
+        unsupported_family,
+        packet_too_large,
         running
     }
 }
@@ -27,13 +31,49 @@ fn health() -> Atom {
 }
 
 #[rustler::nif]
-fn stack_new<'a>(env: Env<'a>, limits_term: Term<'a>, now_millis: i64) -> Term<'a> {
+fn stack_new<'a>(
+    env: Env<'a>,
+    limits_term: Term<'a>,
+    config_term: Term<'a>,
+    now_millis: i64,
+) -> Term<'a> {
     guarded(env, || {
         let limits = Limits::decode(limits_term).map_err(|_| atoms::invalid_limits())?;
+        let config = StackConfig::decode(config_term).map_err(|_| atoms::invalid_stack_config())?;
         let now = time::instant_from_millis(now_millis).map_err(|_| atoms::time_overflow())?;
-        let resource = StackResource::new(limits, now).map_err(|_| atoms::invalid_limits())?;
+        let resource = StackResource::new(limits, config, now).map_err(stack_error_atom)?;
         Ok((atoms::ok(), stack::Envelope::created(resource)))
     })
+}
+
+#[rustler::nif]
+fn stack_ingress<'a>(
+    env: Env<'a>,
+    resource: ResourceArc<StackResource>,
+    packet: Binary<'a>,
+    now_millis: i64,
+) -> Term<'a> {
+    let result = catch_operation(|| {
+        let now = time::instant_from_millis(now_millis).map_err(|_| atoms::time_overflow())?;
+        resource
+            .with_stack(|stack| stack.ingress(packet.as_slice(), now))
+            .map_err(|_| atoms::ownership_invariant_violation())?
+            .map_err(stack_error_atom)
+    });
+
+    encode_effect_result(env, result)
+}
+
+#[rustler::nif]
+fn stack_poll<'a>(env: Env<'a>, resource: ResourceArc<StackResource>, now_millis: i64) -> Term<'a> {
+    let result = catch_operation(|| {
+        let now = time::instant_from_millis(now_millis).map_err(|_| atoms::time_overflow())?;
+        resource
+            .with_stack(|stack| stack.poll(now))
+            .map_err(|_| atoms::ownership_invariant_violation())
+    });
+
+    encode_effect_result(env, result)
 }
 
 #[rustler::nif]
@@ -96,6 +136,50 @@ where
     F: FnOnce() -> Result<T, E>,
 {
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(operation)).map_err(|_| ())
+}
+
+#[derive(NifMap)]
+struct EncodedEnvelope<'a> {
+    result: Atom,
+    output: Vec<Term<'a>>,
+    poll_at: Option<i64>,
+    more: bool,
+}
+
+fn encode_effect_result<'a>(env: Env<'a>, result: Result<Result<Effects, Atom>, ()>) -> Term<'a> {
+    match result {
+        Ok(Ok(effects)) => {
+            let output = effects
+                .output
+                .into_iter()
+                .map(|packet| NewBinary::from_iter(env, packet.into_iter()).into())
+                .collect();
+
+            (
+                atoms::ok(),
+                EncodedEnvelope {
+                    result: atoms::ok(),
+                    output,
+                    poll_at: effects.poll_at,
+                    more: effects.more,
+                },
+            )
+                .encode(env)
+        }
+        Ok(Err(reason)) => (atoms::error(), reason).encode(env),
+        Err(()) => (atoms::error(), atoms::native_panic()).encode(env),
+    }
+}
+
+fn stack_error_atom(error: StackError) -> Atom {
+    match error {
+        StackError::InvalidLimits => atoms::invalid_limits(),
+        StackError::InvalidStackConfig => atoms::invalid_stack_config(),
+        StackError::InvalidPacket => atoms::invalid_packet(),
+        StackError::UnsupportedFamily => atoms::unsupported_family(),
+        StackError::PacketTooLarge => atoms::packet_too_large(),
+        StackError::OwnershipInvariantViolation => atoms::ownership_invariant_violation(),
+    }
 }
 
 #[cfg(test)]

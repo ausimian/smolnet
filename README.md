@@ -4,14 +4,38 @@ SmolNet is an Elixir library that embeds the Rust
 [`smoltcp`](https://github.com/smoltcp-rs/smoltcp) TCP/IP stack behind a
 deliberately small Rustler NIF.
 
-The project is under initial development. No networking API is available yet.
-The first implementation target is TCP over IPv6, followed by TCP over IPv4,
-then UDP over IPv6 and IPv4.
+The project is under initial development. Phase 2 provides independent raw-IP
+IPv6 stacks; sockets arrive in later phases. TCP over IPv6 is the first socket
+target, followed by TCP over IPv4, then UDP over IPv6 and IPv4.
 
-Phase 1 provides stack lifecycle only. `SmolNet.start_stack/1` creates an
-independent native stack and returns an opaque reference; `SmolNet.stop_stack/1`
-stops its complete temporary supervision bundle. Packet ingress and sockets are
-not available yet.
+`SmolNet.start_stack/1` creates an independent native stack and returns an
+opaque reference. A transport-neutral link process supplies complete IPv6
+packets with `SmolNet.ingress/2` and receives each emitted packet as a message:
+
+```elixir
+address = {0xFD00, 0, 0, 0, 0, 0, 0, 1}
+
+{:ok, stack} =
+  SmolNet.start_stack(
+    egress: {self(), :my_link},
+    mtu: 1280,
+    addresses: [{address, 64}],
+    link_down: :stop
+  )
+
+:ok = SmolNet.ingress(stack, complete_ipv6_packet)
+
+receive do
+  {:smol_stack, :my_link, :egress, complete_ipv6_packet} ->
+    :send_it_over_the_external_transport
+end
+```
+
+Ingress validates the IPv6 header and declared length before reserving space in
+a packet-and-byte-bounded queue. Saturation returns `{:error, :queue_full}`.
+IPv4 is rejected until its planned phase. Link-recipient failure can stop the
+stack, retain it as marked down, or notify another process. `SmolNet.stop_stack/1`
+stops the complete temporary supervision bundle.
 
 ## Development
 

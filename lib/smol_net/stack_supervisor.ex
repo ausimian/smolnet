@@ -4,16 +4,11 @@ defmodule SmolNet.StackSupervisor do
   use Supervisor, restart: :temporary, shutdown: :infinity
 
   alias SmolNet.Stack
+  alias SmolNet.Stack.IngressGate
+  alias SmolNet.Stack.Options
   alias SmolNet.Stack.Ref
 
   @ready_timeout 5_000
-  @max_limits %{
-    bytes_copied: 16 * 1024 * 1024,
-    output_packets: 1_024,
-    ready_events: 4_096,
-    maintenance_work: 4_096
-  }
-
   @spec start_link(keyword()) :: Supervisor.on_start()
   def start_link(options), do: Supervisor.start_link(__MODULE__, options)
 
@@ -41,14 +36,35 @@ defmodule SmolNet.StackSupervisor do
   def start_stack(options \\ [])
 
   def start_stack(options) when is_list(options) do
-    with :ok <- validate_options(options),
-         {:ok, limits} <- limits(options) do
+    with {:ok, config} <- Options.parse(options) do
       ready_ref = make_ref()
-      child_options = [starter: self(), ready_ref: ready_ref, limits: limits]
+      ingress_token = make_ref()
+      gate_status = if config.egress, do: :up, else: :down
+
+      gate =
+        IngressGate.new(
+          config.ingress_queue.packets,
+          config.ingress_queue.bytes,
+          gate_status
+        )
+
+      child_options =
+        config
+        |> Map.take([:egress, :link_down, :limits, :ingress_queue, :native_config])
+        |> Map.to_list()
+        |> Keyword.merge(
+          starter: self(),
+          ready_ref: ready_ref,
+          ingress_gate: gate,
+          ingress_token: ingress_token
+        )
 
       case DynamicSupervisor.start_child(SmolNet.Supervisor, {__MODULE__, child_options}) do
-        {:ok, bundle} -> await_ready(bundle, ready_ref)
-        {:error, reason} -> {:error, normalize_start_error(reason)}
+        {:ok, bundle} ->
+          await_ready(bundle, ready_ref, gate, ingress_token, config.native_config.mtu)
+
+        {:error, reason} ->
+          {:error, normalize_start_error(reason)}
       end
     end
   end
@@ -72,12 +88,20 @@ defmodule SmolNet.StackSupervisor do
     |> then(&DynamicSupervisor.start_child(supervisor, &1))
   end
 
-  defp await_ready(bundle, ready_ref) do
+  defp await_ready(bundle, ready_ref, ingress_gate, ingress_token, mtu) do
     bundle_monitor = Process.monitor(bundle)
 
     case resolve_children(bundle) do
       {:ok, children} ->
-        await_stack_ready(bundle, bundle_monitor, ready_ref, children)
+        await_stack_ready(
+          bundle,
+          bundle_monitor,
+          ready_ref,
+          children,
+          ingress_gate,
+          ingress_token,
+          mtu
+        )
 
       {:error, reason} ->
         stop_and_wait(bundle, bundle_monitor)
@@ -85,7 +109,15 @@ defmodule SmolNet.StackSupervisor do
     end
   end
 
-  defp await_stack_ready(bundle, bundle_monitor, ready_ref, children) do
+  defp await_stack_ready(
+         bundle,
+         bundle_monitor,
+         ready_ref,
+         children,
+         ingress_gate,
+         ingress_token,
+         mtu
+       ) do
     %{stack: stack, inet_backends: inet_backends} = children
     stack_monitor = Process.monitor(stack)
 
@@ -93,7 +125,16 @@ defmodule SmolNet.StackSupervisor do
       {:smolnet_stack_ready, ^ready_ref} ->
         send(stack, {:smolnet_stack_accepted, ready_ref})
         demonitor_all([bundle_monitor, stack_monitor])
-        {:ok, %Ref{bundle: bundle, stack: stack, inet_backends: inet_backends}}
+
+        {:ok,
+         %Ref{
+           bundle: bundle,
+           stack: stack,
+           inet_backends: inet_backends,
+           ingress_gate: ingress_gate,
+           ingress_token: ingress_token,
+           mtu: mtu
+         }}
 
       {:smolnet_stack_error, ^ready_ref, reason} ->
         stop_and_wait(bundle, bundle_monitor)
@@ -143,36 +184,6 @@ defmodule SmolNet.StackSupervisor do
 
   defp demonitor_all(monitors) do
     Enum.each(monitors, &Process.demonitor(&1, [:flush]))
-  end
-
-  defp limits(options) do
-    defaults = Stack.default_limits()
-
-    case Keyword.get(options, :limits, %{}) do
-      overrides when is_map(overrides) ->
-        limits = Map.merge(defaults, overrides)
-
-        if valid_limits?(limits, defaults) do
-          {:ok, limits}
-        else
-          {:error, :invalid_limits}
-        end
-
-      _other ->
-        {:error, :invalid_limits}
-    end
-  end
-
-  defp validate_options([]), do: :ok
-  defp validate_options([{:limits, _limits}]), do: :ok
-  defp validate_options(_options), do: {:error, :invalid_options}
-
-  defp valid_limits?(limits, defaults) do
-    MapSet.new(Map.keys(limits)) == MapSet.new(Map.keys(defaults)) and
-      Enum.all?(limits, fn {_name, value} ->
-        is_integer(value) and value > 0
-      end) and
-      Enum.all?(limits, fn {name, value} -> value <= Map.fetch!(@max_limits, name) end)
   end
 
   defp normalize_start_error({:native_initialization_failed, reason}), do: reason
