@@ -1,14 +1,14 @@
 defmodule SmolNet.InetBackend.Tcp do
   @moduledoc """
-  IPv6 TCP adapter for Erlang `:gen_tcp` and `:inet`.
+  TCP adapter for Erlang `:gen_tcp` and `:inet`.
 
   Select this callback with the `:tcp_module` option and pass the target stack
   with the `:smolnet_stack` option. Each returned OTP socket is backed by one
   temporary `:gen_statem` child of that stack's inet supervisor.
 
-  This backend supports outbound IPv6 clients and reusable bounded IPv6
-  listeners. IPv4, file descriptors, and packet modes other than raw, line,
-  1, 2, and 4 fail explicitly.
+  This module is the IPv6 callback and shared socket implementation. Use
+  `SmolNet.InetBackend.Tcp4` as the callback for IPv4. File descriptors and
+  packet modes other than raw, line, 1, 2, and 4 fail explicitly.
   """
 
   @behaviour :gen_statem
@@ -62,27 +62,28 @@ defmodule SmolNet.InetBackend.Tcp do
     do: connect(address, port, options, :infinity)
 
   @spec connect(map(), list(), timeout()) :: {:ok, socket_term()} | {:error, atom()}
-  def connect(%{family: :inet6} = sockaddr, options, timeout) do
+  def connect(%{family: family} = sockaddr, options, timeout)
+      when family in [:inet, :inet6] do
     with {:ok, endpoint} <- endpoint(sockaddr),
-         {:ok, parsed} <- Options.parse(options) do
+         {:ok, parsed} <- Options.parse(ensure_family_option(options, family)),
+         true <- parsed.family == family do
       start_client(endpoint, parsed, timeout)
+    else
+      false -> {:error, :eafnosupport}
+      {:error, _reason} = error -> error
     end
   end
 
-  def connect(%{family: :inet}, _options, _timeout), do: {:error, :eafnosupport}
   def connect(_sockaddr, _options, _timeout), do: {:error, :einval}
 
   @spec connect(term(), term(), list(), timeout()) ::
           {:ok, socket_term()} | {:error, atom()}
   def connect(address, port, options, timeout)
-      when is_tuple(address) and tuple_size(address) == 8 and is_integer(port) and
+      when is_tuple(address) and tuple_size(address) in [4, 8] and is_integer(port) and
              port in 1..65_535 do
-    connect(%{family: :inet6, addr: address, port: port}, options, timeout)
+    family = if tuple_size(address) == 4, do: :inet, else: :inet6
+    connect(%{family: family, addr: address, port: port}, options, timeout)
   end
-
-  def connect(address, _port, _options, _timeout)
-      when is_tuple(address) and tuple_size(address) == 4,
-      do: {:error, :eafnosupport}
 
   def connect(_address, _port, _options, _timeout), do: {:error, :einval}
 
@@ -231,7 +232,7 @@ defmodule SmolNet.InetBackend.Tcp do
   def init(%{owner: owner, role: :listener, options: %Options{} = options}) do
     data = base_data(owner, options, :listener, nil, nil)
 
-    with {:ok, socket} <- SmolNet.open(:inet6, :stream, :tcp, stack: options.stack),
+    with {:ok, socket} <- SmolNet.open(options.family, :stream, :tcp, stack: options.stack),
          :ok <- Stack.socket_watch_owner(socket, self()),
          :ok <- SmolNet.bind(socket, listener_endpoint(options)),
          :ok <- SmolNet.listen(socket, options.backlog) do
@@ -705,17 +706,19 @@ defmodule SmolNet.InetBackend.Tcp do
   end
 
   defp listener_endpoint(options) do
-    %{
-      family: :inet6,
-      addr: options.bind_address || {0, 0, 0, 0, 0, 0, 0, 0},
-      port: options.bind_port,
-      flowinfo: 0,
-      scope_id: options.bind_scope_id
-    }
+    address =
+      options.bind_address ||
+        if(options.family == :inet, do: {0, 0, 0, 0}, else: {0, 0, 0, 0, 0, 0, 0, 0})
+
+    endpoint = %{family: options.family, addr: address, port: options.bind_port}
+
+    if options.family == :inet6,
+      do: Map.merge(endpoint, %{flowinfo: 0, scope_id: options.bind_scope_id}),
+      else: endpoint
   end
 
   defp handle_continue(data, :open_and_connect) do
-    case SmolNet.open(:inet6, :stream, :tcp, stack: data.stack) do
+    case SmolNet.open(data.options.family, :stream, :tcp, stack: data.stack) do
       {:ok, socket} ->
         data = %{data | low_socket: socket}
 
@@ -1388,23 +1391,37 @@ defmodule SmolNet.InetBackend.Tcp do
     %{data | connect_from: nil, accept: nil, read: nil, write: nil}
   end
 
-  defp endpoint(%{family: :inet6, addr: address, port: port} = sockaddr)
-       when is_tuple(address) and tuple_size(address) == 8 and is_integer(port) and
+  defp endpoint(%{family: family, addr: address, port: port} = sockaddr)
+       when family in [:inet, :inet6] and is_tuple(address) and tuple_size(address) in [4, 8] and
+              is_integer(port) and
               port in 1..65_535 do
-    {:ok,
-     %{
-       family: :inet6,
-       addr: address,
-       port: port,
-       flowinfo: Map.get(sockaddr, :flowinfo, 0),
-       scope_id: Map.get(sockaddr, :scope_id, 0)
-     }}
+    expected_size = if family == :inet, do: 4, else: 8
+
+    if tuple_size(address) == expected_size do
+      endpoint = %{family: family, addr: address, port: port}
+
+      {:ok,
+       if(family == :inet6,
+         do:
+           Map.merge(endpoint, %{
+             flowinfo: Map.get(sockaddr, :flowinfo, 0),
+             scope_id: Map.get(sockaddr, :scope_id, 0)
+           }),
+         else: endpoint
+       )}
+    else
+      {:error, :eafnosupport}
+    end
   end
 
   defp endpoint(_sockaddr), do: {:error, :einval}
 
   defp endpoint_result({:ok, %{addr: address, port: port}}), do: {:ok, {address, port}}
   defp endpoint_result({:error, reason}), do: {:error, translate_reason(reason)}
+
+  defp ensure_family_option(options, family) do
+    if family in options, do: options, else: [family | options]
+  end
 
   defp module_socket(pid), do: {:"$inet", __MODULE__, pid}
 

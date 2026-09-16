@@ -267,7 +267,7 @@ defmodule SmolNet.TcpConnectTest do
     {:ok, stack} = SmolNet.start_stack(addresses: [{@client, 64}, {@link_local, 64}])
     {:ok, socket} = SmolNet.open(:inet6, :stream, :tcp, stack: stack)
 
-    assert {:error, :unsupported_family} = SmolNet.open(:inet, :stream, :tcp, stack: stack)
+    assert {:ok, ipv4_socket} = SmolNet.open(:inet, :stream, :tcp, stack: stack)
     assert {:error, :unsupported_socket} = SmolNet.open(:inet6, :dgram, :udp, stack: stack)
     assert {:error, :invalid_options} = SmolNet.open(:inet6, :stream, :tcp, [])
 
@@ -278,8 +278,10 @@ defmodule SmolNet.TcpConnectTest do
              SmolNet.bind(socket, endpoint(@client, 1) |> Map.put(:flowinfo, 0.0))
 
     ipv4_endpoint = %{family: :inet, addr: {192, 0, 2, 1}, port: 80}
-    assert {:error, :unsupported_family} = SmolNet.bind(socket, ipv4_endpoint)
-    assert {:error, :unsupported_family} = SmolNet.connect(socket, ipv4_endpoint, :nowait)
+    assert {:error, :invalid_address} = SmolNet.bind(socket, ipv4_endpoint)
+    assert {:error, :invalid_address} = SmolNet.connect(socket, ipv4_endpoint, :nowait)
+    assert {:error, :invalid_address} = SmolNet.bind(ipv4_socket, endpoint(@client, 0))
+    assert :ok = SmolNet.close(ipv4_socket)
 
     assert {:error, :invalid_port} = SmolNet.bind(socket, endpoint(@client, 65_536))
     assert {:error, :scope_required} = SmolNet.bind(socket, endpoint(@link_local, 1))

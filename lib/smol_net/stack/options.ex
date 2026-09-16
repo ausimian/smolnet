@@ -69,10 +69,11 @@ defmodule SmolNet.Stack.Options do
 
   defp addresses(_values), do: {:error, :invalid_addresses}
 
-  defp address({address, prefix_length})
-       when is_integer(prefix_length) and prefix_length in 0..128 do
-    with {:ok, bytes} <- ipv6_bytes(address),
-         true <- not multicast?(bytes) do
+  defp address({address, prefix_length}) when is_integer(prefix_length) do
+    with {:ok, bytes, max_prefix} <- ip_bytes(address),
+         true <- prefix_length in 0..max_prefix,
+         true <- not multicast?(bytes),
+         true <- not broadcast?(bytes) do
       {:ok, %{address: bytes, prefix_length: prefix_length}}
     else
       _invalid -> :error
@@ -87,12 +88,13 @@ defmodule SmolNet.Stack.Options do
 
   defp routes(_values), do: {:error, :invalid_routes}
 
-  defp route({destination, prefix_length, gateway})
-       when is_integer(prefix_length) and prefix_length in 0..128 do
-    with {:ok, destination_bytes} <- ipv6_bytes(destination),
-         {:ok, gateway_bytes} <- ipv6_bytes(gateway),
+  defp route({destination, prefix_length, gateway}) when is_integer(prefix_length) do
+    with {:ok, destination_bytes, max_prefix} <- ip_bytes(destination),
+         {:ok, gateway_bytes, ^max_prefix} <- ip_bytes(gateway),
+         true <- prefix_length in 0..max_prefix,
          true <- not multicast?(destination_bytes),
          true <- not multicast?(gateway_bytes),
+         true <- not broadcast?(gateway_bytes),
          true <- not unspecified?(gateway_bytes) do
       {:ok,
        %{
@@ -107,20 +109,40 @@ defmodule SmolNet.Stack.Options do
 
   defp route(_route), do: :error
 
-  defp ipv6_bytes(address) when is_tuple(address) and tuple_size(address) == 8 do
+  defp ip_bytes(address) when is_tuple(address) and tuple_size(address) == 8 do
     segments = Tuple.to_list(address)
 
     if Enum.all?(segments, &(is_integer(&1) and &1 in 0..65_535)) do
-      {:ok, Enum.flat_map(segments, &[div(&1, 256), rem(&1, 256)])}
+      bytes = Enum.flat_map(segments, &[div(&1, 256), rem(&1, 256)])
+
+      if ipv4_mapped?(bytes), do: :error, else: {:ok, bytes, 128}
     else
       :error
     end
   end
 
-  defp ipv6_bytes(_address), do: :error
+  defp ip_bytes(address) when is_tuple(address) and tuple_size(address) == 4 do
+    octets = Tuple.to_list(address)
+
+    if Enum.all?(octets, &(is_integer(&1) and &1 in 0..255)) do
+      {:ok, octets, 32}
+    else
+      :error
+    end
+  end
+
+  defp ip_bytes(_address), do: :error
 
   defp multicast?([0xFF | _rest]), do: true
+  defp multicast?([first | _rest]) when first in 224..239, do: true
   defp multicast?(_bytes), do: false
+
+  defp broadcast?([255, 255, 255, 255]), do: true
+  defp broadcast?(_bytes), do: false
+
+  defp ipv4_mapped?(bytes) do
+    Enum.take(bytes, 10) == List.duplicate(0, 10) and Enum.slice(bytes, 10, 2) == [0xFF, 0xFF]
+  end
 
   defp unspecified?(bytes), do: Enum.all?(bytes, &(&1 == 0))
 

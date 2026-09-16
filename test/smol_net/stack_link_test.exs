@@ -68,7 +68,7 @@ defmodule SmolNet.StackLinkTest do
     end)
   end
 
-  test "rejects malformed, IPv4, and oversized packets before native mutation" do
+  test "rejects malformed and oversized packets before native mutation" do
     {:ok, stack} =
       SmolNet.start_stack(
         egress: {self(), :validation},
@@ -78,7 +78,7 @@ defmodule SmolNet.StackLinkTest do
 
     assert SmolNet.ingress(stack, :not_a_binary) == {:error, :invalid_packet}
     assert SmolNet.ingress(stack, <<6::4, 0::308>>) == {:error, :invalid_packet}
-    assert SmolNet.ingress(stack, <<4::4, 0::156>>) == {:error, :unsupported_family}
+    assert SmolNet.ingress(stack, <<4::4, 0::156>>) == {:error, :invalid_packet}
 
     wrong_declared_length = <<6::4, 0::28, 1::16, 59, 64, 0::256>>
     assert SmolNet.ingress(stack, wrong_declared_length) == {:error, :invalid_packet}

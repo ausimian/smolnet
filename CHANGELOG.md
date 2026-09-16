@@ -31,3 +31,6 @@ and this project adheres to
 - Add bounded reusable IPv6 TCP listeners, low-level and `gen_tcp` accept,
   stable accepted-child identities, inherited inet options, explicit backlog
   overflow behavior, and race-safe listener, queue, and half-open cleanup.
+- Add IPv4 and dual-family TCP parity across raw packet admission, stack
+  addresses and routes, low-level clients and listeners, and the `gen_tcp`
+  adapter, with explicit family isolation and IPv4 fragment rejection.

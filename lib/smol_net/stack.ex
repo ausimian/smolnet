@@ -9,6 +9,8 @@ defmodule SmolNet.Stack do
   alias SmolNet.Stack.Options
   alias SmolNet.Stack.Ref
 
+  import Bitwise, only: [band: 2, bnot: 1]
+
   @default_limits %{
     bytes_copied: 64 * 1024,
     output_packets: 32,
@@ -27,7 +29,7 @@ defmodule SmolNet.Stack do
   def start_link(options), do: GenServer.start_link(__MODULE__, options)
 
   @doc """
-  Hands one complete raw IPv6 packet from the single feeder to its stack.
+  Hands one complete raw IPv4 or IPv6 packet from the single feeder to its stack.
 
   The call returns when the stack process accepts the packet. Native processing
   then runs as a continuation before the stack accepts another message.
@@ -60,14 +62,14 @@ defmodule SmolNet.Stack do
   end
 
   @doc false
-  @spec socket_open(term()) :: {:ok, Socket.t()} | {:error, atom()}
-  def socket_open(%Ref{stack: stack}) do
-    GenServer.call(stack, :socket_open)
+  @spec socket_open(term(), :inet | :inet6) :: {:ok, Socket.t()} | {:error, atom()}
+  def socket_open(%Ref{stack: stack}, family) when family in [:inet, :inet6] do
+    GenServer.call(stack, {:socket_open, family})
   catch
     :exit, _reason -> {:error, :closed}
   end
 
-  def socket_open(_stack), do: {:error, :invalid_options}
+  def socket_open(_stack, _family), do: {:error, :invalid_options}
 
   @doc false
   @spec socket_bind(Socket.t(), map()) :: :ok | {:error, atom()}
@@ -98,7 +100,10 @@ defmodule SmolNet.Stack do
   @doc false
   @spec socket_accept(Socket.t(), pid()) ::
           {:ok, Socket.t()} | {:select, :socket.select_info()} | {:error, atom()}
-  def socket_accept(%Socket{stack: stack, id: id, generation: generation}, owner)
+  def socket_accept(
+        %Socket{stack: stack, id: id, generation: generation},
+        owner
+      )
       when is_pid(owner) do
     reference = make_ref()
     GenServer.call(stack, {:socket_accept_owned, id, generation, reference, owner})
@@ -149,7 +154,8 @@ defmodule SmolNet.Stack do
   end
 
   @doc false
-  @spec socket_sockname(Socket.t()) :: {:ok, Socket.sockaddr_in6()} | {:error, atom()}
+  @spec socket_sockname(Socket.t()) ::
+          {:ok, Socket.sockaddr_in() | Socket.sockaddr_in6()} | {:error, atom()}
   def socket_sockname(%Socket{stack: stack, id: id, generation: generation}) do
     GenServer.call(stack, {:socket_sockname, id, generation})
   catch
@@ -157,7 +163,8 @@ defmodule SmolNet.Stack do
   end
 
   @doc false
-  @spec socket_peername(Socket.t()) :: {:ok, Socket.sockaddr_in6()} | {:error, atom()}
+  @spec socket_peername(Socket.t()) ::
+          {:ok, Socket.sockaddr_in() | Socket.sockaddr_in6()} | {:error, atom()}
   def socket_peername(%Socket{stack: stack, id: id, generation: generation}) do
     GenServer.call(stack, {:socket_peername, id, generation})
   catch
@@ -443,11 +450,11 @@ defmodule SmolNet.Stack do
     |> reply_native(state, &Function.identity/1, :preserve_timer)
   end
 
-  def handle_call(:socket_open, _from, state) do
-    state.native_module.tcp_open(state.native)
+  def handle_call({:socket_open, family}, _from, state) do
+    state.native_module.tcp_open(state.native, family)
     |> reply_native(
       state,
-      fn identity -> {:ok, Socket.new(self(), identity)} end,
+      fn identity -> {:ok, Socket.new(self(), identity, family)} end,
       :preserve_timer
     )
   end
@@ -681,31 +688,68 @@ defmodule SmolNet.Stack do
   @spec default_limits() :: limits()
   def default_limits, do: @default_limits
 
-  defp validate_packet(packet, mtu) when is_binary(packet) and byte_size(packet) >= 40 do
+  defp validate_packet(packet, mtu) when is_binary(packet) and byte_size(packet) >= 20 do
     case packet do
-      <<6::4, _traffic_and_flow::28, payload_length::16, _rest::binary>> ->
-        cond do
-          byte_size(packet) != 40 + payload_length -> {:error, :invalid_packet}
-          byte_size(packet) > mtu -> {:error, :packet_too_large}
-          true -> :ok
-        end
+      <<6::4, _rest::bitstring>> ->
+        validate_ipv6_packet(packet, mtu)
 
-      <<4::4, _rest::bitstring>> ->
-        {:error, :unsupported_family}
+      <<4::4, ihl::4, _dscp::8, total_length::16, _id::16, flags::3, fragment_offset::13,
+        _rest::binary>> ->
+        validate_ipv4_packet(packet, mtu, ihl, total_length, flags, fragment_offset)
 
       _other ->
         {:error, :invalid_packet}
     end
   end
 
-  defp validate_packet(packet, _mtu) when is_binary(packet) do
+  defp validate_packet(packet, _mtu) when is_binary(packet), do: {:error, :invalid_packet}
+
+  defp validate_packet(_packet, _mtu), do: {:error, :invalid_packet}
+
+  defp validate_ipv6_packet(packet, mtu) do
     case packet do
-      <<4::4, _rest::bitstring>> -> {:error, :unsupported_family}
-      _other -> {:error, :invalid_packet}
+      <<6::4, _traffic_and_flow::28, payload_length::16, _rest::binary>> ->
+        cond do
+          byte_size(packet) < 40 -> {:error, :invalid_packet}
+          byte_size(packet) != 40 + payload_length -> {:error, :invalid_packet}
+          byte_size(packet) > mtu -> {:error, :packet_too_large}
+          true -> :ok
+        end
+
+      _packet ->
+        {:error, :invalid_packet}
     end
   end
 
-  defp validate_packet(_packet, _mtu), do: {:error, :invalid_packet}
+  defp validate_ipv4_packet(packet, mtu, ihl, total_length, flags, fragment_offset) do
+    header_length = ihl * 4
+
+    cond do
+      ihl < 5 -> {:error, :invalid_packet}
+      total_length != byte_size(packet) -> {:error, :invalid_packet}
+      header_length > byte_size(packet) -> {:error, :invalid_packet}
+      band(flags, 1) != 0 or fragment_offset != 0 -> {:error, :invalid_packet}
+      not valid_ipv4_checksum?(binary_part(packet, 0, header_length)) -> {:error, :invalid_packet}
+      byte_size(packet) > mtu -> {:error, :packet_too_large}
+      true -> :ok
+    end
+  end
+
+  defp valid_ipv4_checksum?(header) do
+    header
+    |> :binary.bin_to_list()
+    |> Enum.chunk_every(2)
+    |> Enum.reduce(0, fn [high, low], sum -> sum + high * 256 + low end)
+    |> fold_checksum()
+    |> bnot()
+    |> band(0xFFFF)
+    |> Kernel.==(0)
+  end
+
+  defp fold_checksum(sum) when sum > 0xFFFF,
+    do: fold_checksum(band(sum, 0xFFFF) + div(sum, 0x10000))
+
+  defp fold_checksum(sum), do: sum
 
   defp egress_state(nil), do: {nil, nil, nil, :down}
 
@@ -858,9 +902,9 @@ defmodule SmolNet.Stack do
 
   defp reply_owned_accept({:ok, envelope}, state, owner) do
     case Map.fetch!(envelope, :result) do
-      {:ok, identity} ->
+      {:ok, identity, family} ->
         state = state |> apply_effects(envelope) |> watch_socket_owner(identity, owner)
-        {:reply, {:ok, Socket.new(self(), identity)}, state}
+        {:reply, {:ok, Socket.new(self(), identity, family)}, state}
 
       result ->
         {:reply, normalize_accept_result(result, self()), apply_effects(state, envelope)}
@@ -878,8 +922,8 @@ defmodule SmolNet.Stack do
     {:select, {:select_info, operation, reference}}
   end
 
-  defp normalize_accept_result({:ok, identity}, stack) do
-    {:ok, Socket.new(stack, identity)}
+  defp normalize_accept_result({:ok, identity, family}, stack) do
+    {:ok, Socket.new(stack, identity, family)}
   end
 
   defp normalize_accept_result({:select, :accept, reference}, _stack) do

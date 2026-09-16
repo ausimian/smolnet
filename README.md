@@ -4,15 +4,14 @@ SmolNet is an Elixir library that embeds the Rust
 [`smoltcp`](https://github.com/smoltcp-rs/smoltcp) TCP/IP stack behind a
 deliberately small Rustler NIF.
 
-The project is under initial development. Phase 7 provides independent raw-IP
-IPv6 stacks plus low-level IPv6 TCP open, bind, connect, bounded stream I/O,
-listen, accept, half-close, endpoint queries, cancellation, and graceful close.
-IPv6 TCP clients and servers are also available through `:gen_tcp` with passive
+The project is under initial development. Phase 8 provides independent raw-IP
+dual-family stacks plus complete low-level IPv4 and IPv6 TCP client/server
+operation. Both families are also available through `:gen_tcp` with passive
 and active delivery, bounded packet framing, and normal controlling-process
-ownership. IPv4 and UDP arrive in later phases.
+ownership. UDP arrives in later phases.
 
 `SmolNet.start_stack/1` creates an independent native stack and returns an
-opaque reference. A transport-neutral link process supplies complete IPv6
+opaque reference. A transport-neutral link process supplies complete IPv4 or IPv6
 packets with `SmolNet.ingress/2` and receives each emitted packet as a message:
 
 ```elixir
@@ -22,14 +21,14 @@ address = {0xFD00, 0, 0, 0, 0, 0, 0, 1}
   SmolNet.start_stack(
     egress: {self(), :my_link},
     mtu: 1280,
-    addresses: [{address, 64}],
+    addresses: [{address, 64}, {{192, 0, 2, 1}, 24}],
     link_down: :stop
   )
 
-:ok = SmolNet.ingress(stack, complete_ipv6_packet)
+:ok = SmolNet.ingress(stack, complete_ip_packet)
 
 receive do
-  {:smol_stack, :my_link, :egress, complete_ipv6_packet} ->
+  {:smol_stack, :my_link, :egress, complete_ip_packet} ->
     :send_it_over_the_external_transport
 end
 ```
@@ -38,8 +37,8 @@ Each stack has one serialized link feeder. Ingress waits only until the stack
 owner validates and accepts the packet; bounded native processing then runs
 before another stack message is accepted. This naturally limits ingress to one
 packet being processed and one subsequent feeder call waiting. The feeder owns
-backpressure for its external transport. IPv4 is rejected until its planned
-phase. Link-recipient failure can stop the stack, retain it as marked down, or
+backpressure for its external transport. Link-recipient failure can stop the
+stack, retain it as marked down, or
 notify another process. `SmolNet.stop_stack/1` stops the complete temporary
 supervision bundle.
 
@@ -61,9 +60,12 @@ The message is only a retry hint. `SmolNet.cancel/2` removes the exact waiter
 and returns `:ok`, `:already_sent`, or `:not_found` according to which side of
 the readiness race won.
 
-## Low-level IPv6 TCP streams
+## Low-level TCP streams
 
-TCP endpoints use `:socket`-style IPv6 maps. Synchronous calls wait in the
+TCP endpoints use explicit `:socket`-style IPv4 or IPv6 maps. The family is
+fixed by `SmolNet.open/4`; mismatched endpoints are rejected rather than
+converted. IPv4-mapped IPv6 addresses are intentionally unsupported.
+Synchronous calls wait in the
 calling process using one monotonic deadline; the stack owner and native
 scheduler never wait for traffic. Finite timeouts use milliseconds in
 `0..4_294_967_295`. Passing `:nowait` exposes the same one-shot retry primitive
@@ -114,7 +116,8 @@ returns accumulated data in `{reason, continuation}`.
 
 Each TCP socket has fixed 4096-byte native RX and TX buffers. Automatic ports
 come from the bounded `49152..50175` range. Bind reservations are unique within
-one stack; accepted children intentionally retain their listener's local port.
+one address family, so one dual-family stack may bind the same port once for
+IPv4 and once for IPv6; accepted children retain their listener's local port.
 Link-local `fe80::/10` endpoints require a positive integer `scope_id`; global
 addresses use scope zero. The native layer never stores arbitrary unsent
 payloads or exact-receive accumulation. Established close invalidates the
@@ -124,7 +127,19 @@ the close call; closing records continue to count against the socket limit.
 The public module documentation lists the stable validation, timeout,
 connection, stream, lifecycle, and handle errors.
 
-## Low-level IPv6 TCP listeners
+IPv4 endpoints use `%{family: :inet, addr: {192, 0, 2, 2}, port: 443}` and
+otherwise have the same connect, stream, timeout, cancellation, half-close,
+and close behavior. A stack may contain both four-octet IPv4 and eight-segment
+IPv6 addresses and routes. Each route's destination and gateway must have the
+same family.
+
+Raw IPv4 ingress validates the IHL, exact total length, header checksum, and
+MTU before native mutation. Fragmented IPv4 input (a nonzero fragment offset or
+the more-fragments flag) is rejected; reassembly is outside this raw-link API.
+IPv4 limited broadcast is rejected for interface addresses, gateways, and TCP
+endpoints.
+
+## Low-level TCP listeners
 
 A bound stream socket becomes a reusable listener with `SmolNet.listen/2`.
 Backlogs are integers in `1..128`. Each listener maintains
@@ -133,6 +148,8 @@ promoted into a connected child without pretending that it remains reusable.
 Every promoted child receives a fresh public socket ID and generation, and the
 native pool is replenished. Half-open handshakes expire after 30 seconds and
 their pool slots are replenished from timer-driven maintenance.
+Wildcard listeners remain scoped to their explicit socket family on a
+dual-family stack and accept any configured local address in that family.
 
 ```elixir
 {:ok, listener} = SmolNet.open(:inet6, :stream, :tcp, stack: stack)
@@ -159,7 +176,7 @@ children and listening or half-open pool members. Already-returned children are
 independent and remain usable. Stack shutdown releases both listener and child
 state.
 
-## `gen_tcp` IPv6 clients and servers
+## `gen_tcp` IPv4 and IPv6 clients and servers
 
 Select the SmolNet backend with `{:tcp_module, SmolNet.InetBackend.Tcp}` and
 identify the target stack with `{:smolnet_stack, stack}`. The returned socket
@@ -181,6 +198,21 @@ options = [
 {:ok, response} = :gen_tcp.recv(socket, 0, 5_000)
 :ok = :gen_tcp.shutdown(socket, :write)
 :ok = :gen_tcp.close(socket)
+```
+
+For IPv4, use `SmolNet.InetBackend.Tcp4` and `:inet`; all socket operations use
+the shared adapter implementation:
+
+```elixir
+ipv4_options = [
+  {:tcp_module, SmolNet.InetBackend.Tcp4},
+  {:smolnet_stack, stack},
+  :inet,
+  :binary,
+  {:active, false}
+]
+
+{:ok, socket} = :gen_tcp.connect({192, 0, 2, 2}, 443, ipv4_options, 5_000)
 ```
 
 The same options can create a server. `backlog` defaults to 5 and accepts
@@ -215,7 +247,7 @@ queued and future messages in order. Owner death, adapter death, or stack
 failure closes the low-level socket without affecting independent stack
 bundles. A listener has its own adapter state, while each accepted child gets a
 separate connected-stream adapter owned by the process that called
-`:gen_tcp.accept/2`. This phase deliberately reports IPv4 as `:eafnosupport`.
+`:gen_tcp.accept/2`.
 
 ## Development
 

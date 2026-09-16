@@ -4,7 +4,7 @@ use rustler::{NifMap, NifUnitEnum};
 use smoltcp::iface::SocketHandle;
 use smoltcp::socket::tcp;
 use smoltcp::time::Instant;
-use smoltcp::wire::{IpAddress, IpEndpoint, IpListenEndpoint, Ipv6Address};
+use smoltcp::wire::{IpAddress, IpEndpoint, IpListenEndpoint, Ipv4Address, Ipv6Address};
 
 use crate::socket_table::SocketError;
 use crate::waiter::SocketIdentity;
@@ -16,6 +16,35 @@ pub const EPHEMERAL_PORT_FIRST: u16 = 49_152;
 pub const EPHEMERAL_PORT_LAST: u16 = 50_175;
 pub const LISTENER_POOL_MAX: usize = 4;
 pub const LISTENER_BACKLOG_MAX: usize = 128;
+
+#[derive(Clone, Copy, Debug, Eq, NifUnitEnum, Ord, PartialEq, PartialOrd)]
+pub enum AddressFamily {
+    Inet,
+    Inet6,
+}
+
+impl AddressFamily {
+    pub fn of(address: IpAddress) -> Self {
+        match address {
+            IpAddress::Ipv4(_) => Self::Inet,
+            IpAddress::Ipv6(_) => Self::Inet6,
+        }
+    }
+
+    pub fn unspecified(self) -> IpAddress {
+        match self {
+            Self::Inet => IpAddress::Ipv4(Ipv4Address::UNSPECIFIED),
+            Self::Inet6 => IpAddress::Ipv6(Ipv6Address::UNSPECIFIED),
+        }
+    }
+
+    pub fn matches(self, address: IpAddress) -> bool {
+        matches!(
+            (self, address),
+            (Self::Inet, IpAddress::Ipv4(_)) | (Self::Inet6, IpAddress::Ipv6(_))
+        )
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct TcpEndpoint {
@@ -34,14 +63,22 @@ impl TcpEndpoint {
     }
 
     fn validate(&self, bind: bool) -> Result<ValidatedEndpoint, SocketError> {
-        let octets: [u8; 16] = self
-            .address
-            .as_slice()
-            .try_into()
-            .map_err(|_| SocketError::InvalidAddress)?;
-        let address = Ipv6Address::from_octets(octets);
+        let address = match self.address.as_slice() {
+            octets if octets.len() == 4 => {
+                let octets: [u8; 4] = octets.try_into().expect("checked IPv4 length");
+                IpAddress::Ipv4(Ipv4Address::from_octets(octets))
+            }
+            octets if octets.len() == 16 => {
+                let octets: [u8; 16] = octets.try_into().expect("checked IPv6 length");
+                if ipv4_mapped(&octets) {
+                    return Err(SocketError::InvalidAddress);
+                }
+                IpAddress::Ipv6(Ipv6Address::from_octets(octets))
+            }
+            _ => return Err(SocketError::InvalidAddress),
+        };
 
-        if address.is_multicast() || (!bind && address.is_unspecified()) {
+        if address.is_multicast() || address.is_broadcast() || (!bind && address.is_unspecified()) {
             return Err(SocketError::InvalidAddress);
         }
 
@@ -49,16 +86,18 @@ impl TcpEndpoint {
             return Err(SocketError::InvalidPort);
         }
 
-        if link_local(&octets) {
-            if self.scope_id == 0 {
-                return Err(SocketError::ScopeRequired);
-            }
+        match address {
+            IpAddress::Ipv6(address) if link_local(&address.octets()) => {
+                if self.scope_id == 0 {
+                    return Err(SocketError::ScopeRequired);
+                }
 
-            if self.scope_id < 0 || self.scope_id > i64::from(u32::MAX) {
-                return Err(SocketError::InvalidScope);
+                if self.scope_id < 0 || self.scope_id > i64::from(u32::MAX) {
+                    return Err(SocketError::InvalidScope);
+                }
             }
-        } else if self.scope_id != 0 {
-            return Err(SocketError::InvalidScope);
+            _ if self.scope_id != 0 => return Err(SocketError::InvalidScope),
+            _ => {}
         }
 
         Ok(ValidatedEndpoint {
@@ -71,19 +110,19 @@ impl TcpEndpoint {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ValidatedEndpoint {
-    pub address: Ipv6Address,
+    pub address: IpAddress,
     pub port: u16,
     pub scope_id: u32,
 }
 
 impl ValidatedEndpoint {
     pub fn ip_endpoint(self) -> IpEndpoint {
-        IpEndpoint::new(IpAddress::Ipv6(self.address), self.port)
+        IpEndpoint::new(self.address, self.port)
     }
 
     pub fn listen_endpoint(self) -> IpListenEndpoint {
         IpListenEndpoint {
-            addr: (!self.address.is_unspecified()).then_some(IpAddress::Ipv6(self.address)),
+            addr: (!self.address.is_unspecified()).then_some(self.address),
             port: self.port,
         }
     }
@@ -98,10 +137,11 @@ pub struct EncodedEndpoint {
 
 impl EncodedEndpoint {
     pub fn new(endpoint: IpEndpoint, scope_id: u32) -> Self {
-        let IpAddress::Ipv6(address) = endpoint.addr;
-
         Self {
-            address: address.octets().to_vec(),
+            address: match endpoint.addr {
+                IpAddress::Ipv4(address) => address.octets().to_vec(),
+                IpAddress::Ipv6(address) => address.octets().to_vec(),
+            },
             port: endpoint.port,
             scope_id,
         }
@@ -145,6 +185,7 @@ impl ConnectFailure {
 pub struct TcpRecord {
     pub identity: SocketIdentity,
     pub handle: SocketHandle,
+    pub family: AddressFamily,
     pub phase: ConnectPhase,
     pub local: Option<IpEndpoint>,
     pub local_scope_id: u32,
@@ -160,6 +201,7 @@ pub struct TcpRecord {
 pub struct ListenerRecord {
     pub identity: SocketIdentity,
     pub endpoint: ValidatedEndpoint,
+    pub listen_endpoint: IpListenEndpoint,
     pub local: IpEndpoint,
     pub backlog: usize,
     pub pool_target: usize,
@@ -171,6 +213,7 @@ impl ListenerRecord {
     pub fn new(
         identity: SocketIdentity,
         endpoint: ValidatedEndpoint,
+        listen_endpoint: IpListenEndpoint,
         local: IpEndpoint,
         backlog: usize,
         handles: impl IntoIterator<Item = SocketHandle>,
@@ -178,6 +221,7 @@ impl ListenerRecord {
         Self {
             identity,
             endpoint,
+            listen_endpoint,
             local,
             backlog,
             pool_target: backlog.min(LISTENER_POOL_MAX),
@@ -188,10 +232,11 @@ impl ListenerRecord {
 }
 
 impl TcpRecord {
-    pub fn new(identity: SocketIdentity, handle: SocketHandle) -> Self {
+    pub fn new(identity: SocketIdentity, handle: SocketHandle, family: AddressFamily) -> Self {
         Self {
             identity,
             handle,
+            family,
             phase: ConnectPhase::Open,
             local: None,
             local_scope_id: 0,
@@ -214,6 +259,7 @@ impl TcpRecord {
         Self {
             identity,
             handle,
+            family: AddressFamily::of(local.addr),
             phase: ConnectPhase::Connected,
             local: Some(local),
             local_scope_id: scope_id,
@@ -225,6 +271,10 @@ impl TcpRecord {
             accepted: true,
         }
     }
+}
+
+fn ipv4_mapped(octets: &[u8; 16]) -> bool {
+    octets[..10].iter().all(|byte| *byte == 0) && octets[10..12] == [0xff, 0xff]
 }
 
 pub fn socket() -> tcp::Socket<'static> {
@@ -292,6 +342,7 @@ mod tests {
     fn endpoint_validation_rejects_bad_ports_addresses_and_scopes() {
         let global = vec![0xfd, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
         let link_local = vec![0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
+        let broadcast = vec![255, 255, 255, 255];
 
         assert_eq!(
             TcpEndpoint {
@@ -328,6 +379,15 @@ mod tests {
             }
             .remote_endpoint(),
             Err(SocketError::InvalidScope)
+        );
+        assert_eq!(
+            TcpEndpoint {
+                address: broadcast,
+                port: 80,
+                scope_id: 0,
+            }
+            .remote_endpoint(),
+            Err(SocketError::InvalidAddress)
         );
     }
 }
