@@ -4,14 +4,13 @@ defmodule SmolNet.Stack.Options do
   alias SmolNet.Stack
 
   @default_mtu 1_500
-  @default_ingress_queue %{packets: 64, bytes: 64 * 1_500}
   @max_limits %{
     bytes_copied: 16 * 1024 * 1024,
     output_packets: 1_024,
     ready_events: 4_096,
     maintenance_work: 4_096
   }
-  @allowed [:egress, :mtu, :addresses, :routes, :limits, :ingress_queue, :link_down]
+  @allowed [:egress, :mtu, :addresses, :routes, :limits, :link_down]
 
   @spec parse(keyword()) :: {:ok, map()} | {:error, atom()}
   def parse(options) when is_list(options) do
@@ -21,14 +20,12 @@ defmodule SmolNet.Stack.Options do
          {:ok, addresses} <- addresses(Keyword.get(options, :addresses, [])),
          {:ok, routes} <- routes(Keyword.get(options, :routes, [])),
          {:ok, limits} <- limits(Keyword.get(options, :limits, %{}), mtu),
-         {:ok, ingress_queue} <- ingress_queue(Keyword.get(options, :ingress_queue)),
          {:ok, link_down} <- link_down(Keyword.get(options, :link_down, :stop)) do
       {:ok,
        %{
          egress: egress,
          link_down: link_down,
          limits: limits,
-         ingress_queue: ingress_queue,
          native_config: %{
            mtu: mtu,
            addresses: addresses,
@@ -44,9 +41,6 @@ defmodule SmolNet.Stack.Options do
   def default_native_config do
     %{mtu: @default_mtu, addresses: [], routes: []}
   end
-
-  @spec default_ingress_queue() :: map()
-  def default_ingress_queue, do: @default_ingress_queue
 
   defp validate_keyword(options) do
     if Keyword.keyword?(options) do
@@ -144,25 +138,6 @@ defmodule SmolNet.Stack.Options do
   end
 
   defp limits(_overrides, _mtu), do: {:error, :invalid_limits}
-
-  defp ingress_queue(nil), do: {:ok, @default_ingress_queue}
-
-  defp ingress_queue(value) when is_list(value) do
-    if Keyword.keyword?(value) and Enum.uniq(Keyword.keys(value)) == Keyword.keys(value) do
-      value |> Map.new() |> ingress_queue()
-    else
-      {:error, :invalid_ingress_queue}
-    end
-  end
-
-  defp ingress_queue(%{packets: packets, bytes: bytes} = value)
-       when map_size(value) == 2 and is_integer(packets) and packets > 0 and
-              packets <= 1_000_000 and is_integer(bytes) and bytes > 0 and
-              bytes <= 1_073_741_824 do
-    {:ok, %{packets: packets, bytes: bytes}}
-  end
-
-  defp ingress_queue(_value), do: {:error, :invalid_ingress_queue}
 
   defp link_down(:stop), do: {:ok, :stop}
   defp link_down(:mark_down), do: {:ok, :mark_down}

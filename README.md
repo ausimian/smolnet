@@ -31,11 +31,14 @@ receive do
 end
 ```
 
-Ingress validates the IPv6 header and declared length before reserving space in
-a packet-and-byte-bounded queue. Saturation returns `{:error, :queue_full}`.
-IPv4 is rejected until its planned phase. Link-recipient failure can stop the
-stack, retain it as marked down, or notify another process. `SmolNet.stop_stack/1`
-stops the complete temporary supervision bundle.
+Each stack has one serialized link feeder. Ingress waits only until the stack
+owner validates and accepts the packet; bounded native processing then runs
+before another stack message is accepted. This naturally limits ingress to one
+packet being processed and one subsequent feeder call waiting. The feeder owns
+backpressure for its external transport. IPv4 is rejected until its planned
+phase. Link-recipient failure can stop the stack, retain it as marked down, or
+notify another process. `SmolNet.stop_stack/1` stops the complete temporary
+supervision bundle.
 
 ## Development
 

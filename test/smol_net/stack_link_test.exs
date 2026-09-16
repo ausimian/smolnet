@@ -119,35 +119,107 @@ defmodule SmolNet.StackLinkTest do
     end)
   end
 
-  test "bounds admission before ingress messages enter the stack mailbox" do
+  test "single feeder is acknowledged before bounded native processing" do
     configure_native_double(:wait)
-
-    {:ok, stack} =
-      SmolNet.start_stack(
-        egress: {self(), :bounded},
-        ingress_queue: [packets: 2, bytes: 80]
-      )
-
+    Application.put_env(:smolnet, :native_poll_result, :wait)
     packet = empty_ipv6_packet()
-    assert :ok = SmolNet.ingress(stack, packet)
+    test = self()
+
+    feeder =
+      spawn(fn ->
+        receive do
+          {:feed, stack} ->
+            send(test, {:first_ingress, SmolNet.ingress(stack, packet)})
+            send(test, :second_ingress_started)
+            send(test, {:second_ingress, SmolNet.ingress(stack, packet)})
+
+            receive do
+              :stop -> :ok
+            end
+        end
+      end)
+
+    feeder_monitor = Process.monitor(feeder)
+    {:ok, stack} = SmolNet.start_stack(egress: {feeder, :serialized})
+    send(feeder, {:feed, stack})
+
+    assert_receive {:first_ingress, :ok}
     assert_receive {:native_stack_ingress, stack_pid, ^packet}
+    assert_receive :second_ingress_started
 
-    assert :ok = SmolNet.ingress(stack, packet)
-    assert SmolNet.ingress(stack, packet) == {:error, :queue_full}
+    refute_receive {:second_ingress, _result}, 50
+    refute_receive {:native_stack_ingress, _, _}, 50
 
-    send(stack_pid, {:native_ingress_reply, empty_effects()})
+    send(stack_pid, {:native_ingress_reply, empty_effects(more: true)})
+    assert_receive {:native_stack_poll, ^stack_pid, _now}
+
+    refute_receive {:second_ingress, _result}, 50
+    refute_receive {:native_stack_ingress, _, _}, 50
+
+    send(stack_pid, {:native_poll_reply, empty_effects()})
+    assert_receive {:second_ingress, :ok}
     assert_receive {:native_stack_ingress, ^stack_pid, ^packet}
     send(stack_pid, {:native_ingress_reply, empty_effects()})
 
     assert_eventually(fn ->
       {:ok, drained} = SmolNet.stack_info(stack)
 
-      drained.ingress.packets == 0 and drained.ingress.bytes == 0 and
-        drained.ingress.rejected == 1 and drained.processed_ingress == 2
+      drained.ingress == %{mode: :single_feeder, rejected: 0} and
+        drained.processed_ingress == 2
     end)
+
+    send(feeder, :stop)
+    assert_receive {:DOWN, ^feeder_monitor, :process, ^feeder, :normal}
   end
 
-  test "unadmitted ingress-shaped mailbox messages cannot bypass the queue gate" do
+  test "continuation poll failure closes without admitting waiting ingress" do
+    configure_native_double(:wait)
+    Application.put_env(:smolnet, :native_poll_result, :wait)
+    packet = empty_ipv6_packet()
+    test = self()
+
+    feeder =
+      spawn(fn ->
+        receive do
+          {:feed, stack} ->
+            send(test, {:first_ingress, SmolNet.ingress(stack, packet)})
+            send(test, :second_ingress_started)
+            send(test, {:second_ingress, SmolNet.ingress(stack, packet)})
+
+            receive do
+              :stop -> :ok
+            end
+        end
+      end)
+
+    feeder_monitor = Process.monitor(feeder)
+    {:ok, stack} = SmolNet.start_stack(egress: {feeder, :poll_failure})
+    %{stack: stack_pid} = Ref.pids(stack)
+    stack_monitor = Process.monitor(stack_pid)
+    send(feeder, {:feed, stack})
+
+    assert_receive {:first_ingress, :ok}
+    assert_receive {:native_stack_ingress, ^stack_pid, ^packet}
+    assert_receive :second_ingress_started
+
+    send(stack_pid, {:native_ingress_reply, empty_effects(more: true)})
+    assert_receive {:native_stack_poll, ^stack_pid, _now}
+    refute_receive {:second_ingress, _result}, 50
+
+    send(stack_pid, {:native_poll_reply, {:error, :time_overflow}})
+
+    assert_receive {:second_ingress, {:error, :closed}}
+
+    assert_receive {:DOWN, ^stack_monitor, :process, ^stack_pid,
+                    {:shutdown, {:native_poll_failed, :time_overflow}}}
+
+    refute_receive {:native_stack_ingress, _, _}, 50
+
+    send(feeder, :stop)
+    assert_receive {:DOWN, ^feeder_monitor, :process, ^feeder, :normal}
+  end
+
+  test "only capability-authenticated ingress calls reach native processing" do
     {:ok, stack} = SmolNet.start_stack(egress: {self(), :authenticated})
     %{stack: stack_pid} = Ref.pids(stack)
     packet = empty_ipv6_packet()
@@ -155,10 +227,12 @@ defmodule SmolNet.StackLinkTest do
     send(stack_pid, {:smolnet_ingress, packet})
     send(stack_pid, {:smolnet_ingress, make_ref(), packet})
 
+    assert GenServer.call(stack_pid, {:ingress, make_ref(), packet}) ==
+             {:error, :invalid_ingress}
+
     assert {:ok, info} = SmolNet.stack_info(stack)
     assert info.processed_ingress == 0
-    assert info.ingress.packets == 0
-    assert info.ingress.bytes == 0
+    assert info.ingress == %{mode: :single_feeder, rejected: 0}
   end
 
   test "timer generations reject stale messages and poll with no new ingress" do
@@ -325,8 +399,7 @@ defmodule SmolNet.StackLinkTest do
     assert SmolNet.start_stack(routes: [{@address_a, 64, {0, 0, 0, 0, 0, 0, 0, 0}}]) ==
              {:error, :invalid_routes}
 
-    assert SmolNet.start_stack(ingress_queue: [:invalid]) ==
-             {:error, :invalid_ingress_queue}
+    assert SmolNet.start_stack(ingress_queue: [:invalid]) == {:error, :invalid_options}
 
     assert SmolNet.start_stack(link_down: :restart) ==
              {:error, :invalid_link_down_policy}
@@ -358,7 +431,7 @@ defmodule SmolNet.StackLinkTest do
        result: :ok,
        output: Keyword.get(options, :output, []),
        poll_at: Keyword.get(options, :poll_at),
-       more: false
+       more: Keyword.get(options, :more, false)
      }}
   end
 

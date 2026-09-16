@@ -38,7 +38,15 @@ defmodule SmolNet.Test.NativeDouble do
     test = Application.fetch_env!(:smolnet, :native_test_process)
     send(test, {:native_stack_poll, self(), now})
 
-    Application.get_env(:smolnet, :native_poll_result, empty_effects())
+    case Application.get_env(:smolnet, :native_poll_result, empty_effects()) do
+      :wait ->
+        receive do
+          {:native_poll_reply, reply} -> reply
+        end
+
+      reply ->
+        reply
+    end
   end
 
   def stack_snapshot(_resource) do

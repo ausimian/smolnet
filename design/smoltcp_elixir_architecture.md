@@ -158,7 +158,8 @@ Representative state:
 Its responsibilities are:
 
 - serialize all socket operations for the stack through its mailbox;
-- feed one inbound raw IP packet to each bounded ingress invocation;
+- accept one inbound raw IP packet at a time from the stack's serialized link
+  feeder and pass it to one bounded ingress invocation;
 - emit outbound raw IP packets to the configured link-layer recipient;
 - schedule and replace the next BEAM timer from native `poll_at` data;
 - invoke a bounded native timer poll when that timer fires;
@@ -334,19 +335,18 @@ mailbox protocol:
 SmolNet.Stack.ingress(stack, raw_ip_packet)
 ```
 
-This function enqueues the packet to the owning `SmolNet.Stack`; it does not call
-the NIF from the transport process. The packet must begin with an IPv4 or IPv6
-header. Link framing, stream reassembly, checksums belonging to the link,
-reconnect behavior, and extraction of individual IP packets are responsibilities
-of the external adapter.
+This function synchronously hands the packet to the owning `SmolNet.Stack`; it
+does not call the NIF from the transport process. The packet must begin with an
+IPv4 or IPv6 header. Link framing, stream reassembly, checksums belonging to the
+link, reconnect behavior, extraction of individual IP packets, and upstream
+backpressure are responsibilities of the external adapter.
 
-Ingress is asynchronous at the link boundary. Ordering is the order in which
-one sender enqueues packets to the stack process. If multiple ingress producers
-are permitted, the caller must not assume a total order across producers.
-
-The API must validate packet type and configured limits before admitting work.
-Queue limits/backpressure policy must be explicit in the implementation plan so
-an unbounded transport cannot grow the stack mailbox indefinitely.
+Each stack has exactly one serialized ingress feeder. The call waits until the
+stack validates and accepts the packet, then returns before bounded native
+processing runs in a GenServer continuation. The same feeder may have one later
+call waiting. If native `more` work remains, the stack retains that call without
+acknowledging it until immediate native polling finishes. Thus at most one packet
+is in native processing and one later packet is waiting at the stack boundary.
 
 ### Outbound contract
 
@@ -787,7 +787,8 @@ are otherwise identical to TCP.
 ```text
 external raw-IP link adapter
   → calls SmolNet.Stack.ingress(stack, raw_ip_packet)
-  → public ingress function enqueues one packet to SmolNet.Stack
+  → stack validates and accepts one packet from its serialized feeder
+  → stack replies, then enters an ingress continuation before another message
   → SmolNet.Stack invokes Native.ingress(stack, one_packet, now)
   → native code try-locks stack
   → place packet in BeamDevice RX token/path
@@ -800,11 +801,14 @@ external raw-IP link adapter
   → unlock/return
   → SmolNet.Stack sends one outbound message per packet to configured egress PID
   → SmolNet.Stack replaces its timer from poll_at
+  → any native `more` work drains before a waiting feeder call is acknowledged
   → SmolNet.Stack returns to mailbox
 ```
 
 There is no native loop over all pending ingress packets. Additional packets are
-separate mailbox events/NIF calls, preserving BEAM scheduling fairness.
+separate serialized feeder calls and NIF invocations. The feeder owns upstream
+transport backpressure, while bounded native continuations preserve scheduling
+fairness without a separate ingress queue.
 
 ### Readiness delivery and retry
 
@@ -1035,7 +1039,7 @@ The architecture is settled, but the plan must resolve these concrete details:
 - whether low-level ownership/lifetime monitoring belongs in `SmolNet.Stack`,
   the inet adapter, or both;
 - maximum bytes/packets emitted or copied per NIF invocation;
-- ingress queue and outbound mailbox backpressure/overflow policy;
+- outbound mailbox backpressure/overflow policy;
 - egress message tag, opaque link identity, monitoring, and link-down policy;
 - native TCP/UDP buffer defaults and configurable limits;
 - close semantics and how long a graceful TCP close remains in the native set;
