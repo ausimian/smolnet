@@ -70,6 +70,34 @@ defmodule SmolNet.Native do
   @spec tcp_close(reference(), map(), integer()) :: {:ok, map()} | {:error, atom()}
   def tcp_close(_stack, _identity, _now), do: :erlang.nif_error(:nif_not_loaded)
 
+  @spec udp_open(reference(), :inet | :inet6) :: {:ok, map()} | {:error, atom()}
+  def udp_open(_stack, _family), do: :erlang.nif_error(:nif_not_loaded)
+
+  @spec udp_bind(reference(), map(), map()) :: {:ok, map()} | {:error, atom()}
+  def udp_bind(_stack, _identity, _endpoint), do: :erlang.nif_error(:nif_not_loaded)
+
+  @spec udp_connect(reference(), map(), map()) :: {:ok, map()} | {:error, atom()}
+  def udp_connect(_stack, _identity, _endpoint), do: :erlang.nif_error(:nif_not_loaded)
+
+  @spec udp_sendto(reference(), map(), map(), binary(), pid(), reference(), integer()) ::
+          {:ok, map()} | {:error, atom()}
+  def udp_sendto(_stack, _identity, _endpoint, _data, _pid, _reference, _now),
+    do: :erlang.nif_error(:nif_not_loaded)
+
+  @spec udp_recvfrom(reference(), map(), non_neg_integer(), pid(), reference(), integer()) ::
+          {:ok, map()} | {:error, atom()}
+  def udp_recvfrom(_stack, _identity, _length, _pid, _reference, _now),
+    do: :erlang.nif_error(:nif_not_loaded)
+
+  @spec udp_sockname(reference(), map()) :: {:ok, map()} | {:error, atom()}
+  def udp_sockname(_stack, _identity), do: :erlang.nif_error(:nif_not_loaded)
+
+  @spec udp_peername(reference(), map()) :: {:ok, map()} | {:error, atom()}
+  def udp_peername(_stack, _identity), do: :erlang.nif_error(:nif_not_loaded)
+
+  @spec udp_close(reference(), map(), integer()) :: {:ok, map()} | {:error, atom()}
+  def udp_close(_stack, _identity, _now), do: :erlang.nif_error(:nif_not_loaded)
+
   @spec stack_snapshot(reference()) :: {:ok, map()} | {:error, atom()}
   def stack_snapshot(_stack), do: :erlang.nif_error(:nif_not_loaded)
 

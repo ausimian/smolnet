@@ -20,7 +20,7 @@ defmodule SmolNet do
   Stable validation and bind errors are `:unsupported_family`,
   `:unsupported_socket`, `:invalid_options`, `:invalid_address`,
   `:invalid_port`, `:invalid_backlog`, `:invalid_data`, `:invalid_length`,
-  `:invalid_timeout`,
+  `:invalid_timeout`, `:message_too_large`,
   `:invalid_how`, `:scope_required`, `:invalid_scope`, `:address_in_use`,
   `:address_not_available`, and `:ephemeral_ports_exhausted`. Connection and
   stream lifecycle errors are
@@ -78,20 +78,20 @@ defmodule SmolNet do
   defdelegate cancel(socket, select_info), to: Socket
 
   @doc """
-  Opens a bounded low-level IPv4 or IPv6 TCP stream socket on `stack`.
+  Opens a bounded low-level TCP stream or IPv6 UDP datagram socket on `stack`.
 
-  Family is explicit and immutable. Other socket kinds fail explicitly.
+  Family and kind are explicit and immutable. IPv4 UDP remains unsupported.
   """
-  @spec open(:inet6 | :inet, :stream, :tcp, keyword()) ::
+  @spec open(:inet6 | :inet, :stream | :dgram, :tcp | :udp, keyword()) ::
           {:ok, Socket.t()} | {:error, atom()}
   defdelegate open(domain, type, protocol, options), to: Socket
 
   @doc """
-  Binds a TCP socket to an endpoint of its family.
+  Binds a TCP or UDP socket to an endpoint of its family.
 
   Port zero allocates from the bounded range 49152..50175. Ports are unique
-  within one address family, and allocation failure is reported as
-  `:ephemeral_ports_exhausted`.
+  within one protocol and address family, so TCP and UDP may share a numeric
+  port. Allocation failure is reported as `:ephemeral_ports_exhausted`.
   """
   @spec bind(Socket.t(), Socket.sockaddr_in() | Socket.sockaddr_in6()) ::
           :ok | {:error, atom()}
@@ -121,16 +121,18 @@ defmodule SmolNet do
           {:ok, Socket.t()} | {:select, :socket.select_info()} | {:error, atom()}
   defdelegate accept(listener, timeout_or_nowait), to: Socket
 
-  @doc "Connects a TCP socket, waiting indefinitely by default."
+  @doc "Connects a TCP or UDP socket, waiting indefinitely by default."
   @spec connect(Socket.t(), Socket.sockaddr_in() | Socket.sockaddr_in6()) ::
           :ok | {:error, atom()}
   defdelegate connect(socket, address), to: Socket
 
   @doc """
-  Connects a TCP socket with a finite, infinite, or nonblocking timeout.
+  Connects a TCP or UDP socket with a finite, infinite, or nonblocking timeout.
 
-  `:nowait` returns a one-shot `{:select, select_info}` retry hint. Finite and
-  infinite waits run entirely in the caller and monitor the owning stack.
+  TCP `:nowait` returns a one-shot `{:select, select_info}` retry hint. Finite
+  and infinite waits run entirely in the caller and monitor the owning stack.
+  UDP connect stores a peer immediately; connected sends must use that peer and
+  received datagrams from other peers are discarded.
   """
   @spec connect(Socket.t(), Socket.sockaddr_in() | Socket.sockaddr_in6(), :nowait | timeout()) ::
           :ok | {:select, :socket.select_info()} | {:error, atom()}
@@ -174,6 +176,36 @@ defmodule SmolNet do
           | {:error, atom() | {atom(), binary()}}
   defdelegate recv(socket, length, timeout_or_nowait), to: Socket
 
+  @doc "Sends one complete IPv6 UDP datagram, waiting indefinitely by default."
+  @spec sendto(Socket.t(), iodata(), Socket.sockaddr_in6()) :: :ok | {:error, atom()}
+  defdelegate sendto(socket, data, address), to: Socket
+
+  @doc """
+  Sends one complete IPv6 UDP datagram with a finite, infinite, or nonblocking timeout.
+
+  The datagram is either accepted in full or not accepted. `:nowait` returns a
+  write-direction select hint when the bounded native transmit ring is full.
+  """
+  @spec sendto(Socket.t(), iodata(), Socket.sockaddr_in6(), :nowait | timeout()) ::
+          :ok | {:select, :socket.select_info()} | {:error, atom()}
+  defdelegate sendto(socket, data, address, timeout_or_nowait), to: Socket
+
+  @doc "Receives one IPv6 UDP datagram, waiting indefinitely by default."
+  @spec recvfrom(Socket.t(), non_neg_integer()) ::
+          {:ok, Socket.datagram()} | {:error, atom()}
+  defdelegate recvfrom(socket, length), to: Socket
+
+  @doc """
+  Receives one IPv6 UDP datagram with a finite, infinite, or nonblocking timeout.
+
+  Length zero returns the complete datagram. A positive length truncates a
+  larger datagram, discards its remainder, and sets `truncated: true`. Source
+  and actual local-destination endpoints are always returned.
+  """
+  @spec recvfrom(Socket.t(), non_neg_integer(), :nowait | timeout()) ::
+          {:ok, Socket.datagram()} | {:select, :socket.select_info()} | {:error, atom()}
+  defdelegate recvfrom(socket, length, timeout_or_nowait), to: Socket
+
   @doc """
   Shuts down the read half, write half, or both halves of a TCP socket.
 
@@ -183,17 +215,17 @@ defmodule SmolNet do
   @spec shutdown(Socket.t(), :read | :write | :read_write) :: :ok | {:error, atom()}
   defdelegate shutdown(socket, how), to: Socket
 
-  @doc "Returns the bound endpoint for a TCP socket."
+  @doc "Returns the bound endpoint for a TCP or UDP socket."
   @spec sockname(Socket.t()) ::
           {:ok, Socket.sockaddr_in() | Socket.sockaddr_in6()} | {:error, atom()}
   defdelegate sockname(socket), to: Socket
 
-  @doc "Returns the peer endpoint while a TCP connection is pending or established."
+  @doc "Returns the peer endpoint for a connected TCP or UDP socket."
   @spec peername(Socket.t()) ::
           {:ok, Socket.sockaddr_in() | Socket.sockaddr_in6()} | {:error, atom()}
   defdelegate peername(socket), to: Socket
 
-  @doc "Gracefully closes a TCP connection and permanently invalidates its public handle."
+  @doc "Closes a socket and permanently invalidates its public handle."
   @spec close(Socket.t()) :: :ok | {:error, atom()}
   defdelegate close(socket), to: Socket
 end

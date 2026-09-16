@@ -159,6 +159,23 @@ impl SocketTable {
         Ok(entry)
     }
 
+    pub fn validate_any(&self, identity: SocketIdentity) -> Result<&SocketEntry, SocketError> {
+        let (generation, entry) = self
+            .entries
+            .get(&identity.id)
+            .ok_or(SocketError::InvalidSocket)?;
+
+        if *generation != identity.generation {
+            return Err(SocketError::InvalidSocket);
+        }
+
+        if entry.lifecycle != SocketLifecycle::Open {
+            return Err(SocketError::InvalidState);
+        }
+
+        Ok(entry)
+    }
+
     pub fn ready_flag(
         &self,
         identity: SocketIdentity,
@@ -551,6 +568,7 @@ pub enum SocketError {
     InvalidOperation,
     Busy,
     SystemLimit,
+    UnsupportedFamily,
     InvalidAddress,
     InvalidPort,
     InvalidBacklog,
@@ -566,6 +584,7 @@ pub enum SocketError {
     ConnectionRefused,
     ConnectionReset,
     ConnectionTimeout,
+    MessageTooLarge,
 }
 
 #[cfg(test)]

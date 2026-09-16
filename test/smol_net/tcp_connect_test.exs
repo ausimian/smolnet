@@ -268,7 +268,8 @@ defmodule SmolNet.TcpConnectTest do
     {:ok, socket} = SmolNet.open(:inet6, :stream, :tcp, stack: stack)
 
     assert {:ok, ipv4_socket} = SmolNet.open(:inet, :stream, :tcp, stack: stack)
-    assert {:error, :unsupported_socket} = SmolNet.open(:inet6, :dgram, :udp, stack: stack)
+    assert {:ok, datagram} = SmolNet.open(:inet6, :dgram, :udp, stack: stack)
+    assert :ok = SmolNet.close(datagram)
     assert {:error, :invalid_options} = SmolNet.open(:inet6, :stream, :tcp, [])
 
     assert {:error, :invalid_address} =

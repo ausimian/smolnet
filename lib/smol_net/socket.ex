@@ -17,14 +17,15 @@ defmodule SmolNet.Socket do
   @max_timeout 4_294_967_295
   @max_backlog 128
 
-  @enforce_keys [:stack, :id, :generation, :family]
-  defstruct [:stack, :id, :generation, :family]
+  @enforce_keys [:stack, :id, :generation, :family, :kind]
+  defstruct [:stack, :id, :generation, :family, :kind]
 
   @type t :: %__MODULE__{
           stack: pid(),
           id: pos_integer(),
           generation: pos_integer(),
-          family: :inet | :inet6
+          family: :inet | :inet6,
+          kind: :stream | :datagram
         }
 
   @type ipv4_address :: {0..255, 0..255, 0..255, 0..255}
@@ -46,15 +47,30 @@ defmodule SmolNet.Socket do
           optional(:scope_id) => 0..4_294_967_295
         }
 
+  @type datagram :: %{
+          required(:source) => sockaddr_in6(),
+          required(:destination) => sockaddr_in6(),
+          required(:data) => binary(),
+          required(:truncated) => boolean()
+        }
+
   @doc false
   @spec open(atom(), atom(), atom(), keyword()) ::
           {:ok, t()}
           | {:error, :unsupported_family | :unsupported_socket | :invalid_options | atom()}
   def open(family, :stream, :tcp, stack: stack) when family in [:inet, :inet6],
-    do: Stack.socket_open(stack, family)
+    do: Stack.socket_open(stack, family, :stream)
+
+  def open(:inet6, :dgram, :udp, stack: stack),
+    do: Stack.socket_open(stack, :inet6, :datagram)
+
+  def open(:inet, :dgram, :udp, _options),
+    do: {:error, :unsupported_family}
 
   def open(family, :stream, :tcp, _options) when family in [:inet, :inet6],
     do: {:error, :invalid_options}
+
+  def open(:inet6, :dgram, :udp, _options), do: {:error, :invalid_options}
 
   def open(family, _type, _protocol, _options) when family in [:inet, :inet6],
     do: {:error, :unsupported_socket}
@@ -82,12 +98,16 @@ defmodule SmolNet.Socket do
   @doc false
   @spec listen(t(), pos_integer()) :: :ok | {:error, atom()}
   def listen(%__MODULE__{} = socket, backlog)
-      when is_integer(backlog) and backlog in 1..@max_backlog do
+      when socket.kind == :stream and is_integer(backlog) and backlog in 1..@max_backlog do
     if valid?(socket), do: Stack.socket_listen(socket, backlog), else: {:error, :invalid_socket}
   end
 
   def listen(%__MODULE__{} = socket, _backlog) do
-    if valid?(socket), do: {:error, :invalid_backlog}, else: {:error, :invalid_socket}
+    cond do
+      not valid?(socket) -> {:error, :invalid_socket}
+      socket.kind != :stream -> {:error, :invalid_socket_state}
+      true -> {:error, :invalid_backlog}
+    end
   end
 
   def listen(_socket, _backlog), do: {:error, :invalid_socket}
@@ -100,18 +120,22 @@ defmodule SmolNet.Socket do
   @spec accept(t(), :nowait | timeout()) ::
           {:ok, t()} | {:select, :socket.select_info()} | {:error, atom()}
   def accept(%__MODULE__{} = socket, :nowait) do
-    if valid?(socket), do: Stack.socket_accept(socket), else: {:error, :invalid_socket}
+    cond do
+      not valid?(socket) -> {:error, :invalid_socket}
+      socket.kind != :stream -> {:error, :invalid_socket_state}
+      true -> Stack.socket_accept(socket)
+    end
   end
 
   def accept(%__MODULE__{} = socket, timeout)
       when timeout == :infinity or
              (is_integer(timeout) and timeout >= 0 and timeout <= @max_timeout) do
-    if valid?(socket) do
+    if valid?(socket) and socket.kind == :stream do
       synchronous(socket, timeout, fn deadline, monitor ->
         accept_loop(socket, deadline, monitor, 0)
       end)
     else
-      {:error, :invalid_socket}
+      if valid?(socket), do: {:error, :invalid_socket_state}, else: {:error, :invalid_socket}
     end
   end
 
@@ -133,7 +157,7 @@ defmodule SmolNet.Socket do
          {:ok, endpoint} <- encode_endpoint(address, :remote, socket.family) do
       Stack.socket_connect(socket, endpoint)
     else
-      false -> {:error, :invalid_socket}
+      false -> invalid_socket_or_kind(socket, :stream)
       {:error, _reason} = error -> error
     end
   end
@@ -147,7 +171,7 @@ defmodule SmolNet.Socket do
         connect_loop(socket, endpoint, deadline, monitor, 0)
       end)
     else
-      false -> {:error, :invalid_socket}
+      false -> invalid_socket_or_kind(socket, :stream)
       {:error, _reason} = error -> error
     end
   end
@@ -168,11 +192,11 @@ defmodule SmolNet.Socket do
           | {:select, {:socket.select_info(), binary()}}
           | {:error, atom() | {atom(), binary()}}
   def send(%__MODULE__{} = socket, data, :nowait) do
-    with true <- valid?(socket),
+    with true <- valid?(socket) and socket.kind == :stream,
          {:ok, binary} <- encode_data(data) do
       Stack.socket_send(socket, binary)
     else
-      false -> {:error, :invalid_socket}
+      false -> invalid_socket_or_kind(socket, :stream)
       {:error, _reason} = error -> error
     end
   end
@@ -180,13 +204,13 @@ defmodule SmolNet.Socket do
   def send(%__MODULE__{} = socket, data, timeout)
       when timeout == :infinity or
              (is_integer(timeout) and timeout >= 0 and timeout <= @max_timeout) do
-    with true <- valid?(socket),
+    with true <- valid?(socket) and socket.kind == :stream,
          {:ok, binary} <- encode_data(data) do
       synchronous(socket, timeout, fn deadline, monitor ->
         send_loop(socket, binary, deadline, monitor, false, 0)
       end)
     else
-      false -> {:error, :invalid_socket}
+      false -> invalid_socket_or_kind(socket, :stream)
       {:error, _reason} = error -> error
     end
   end
@@ -209,26 +233,26 @@ defmodule SmolNet.Socket do
           | {:select, {:socket.select_info(), binary()}}
           | {:error, atom() | {atom(), binary()}}
   def recv(%__MODULE__{} = socket, length, :nowait) do
-    with true <- valid?(socket),
+    with true <- valid?(socket) and socket.kind == :stream,
          true <- valid_length?(length) do
       socket
       |> Stack.socket_recv(length)
       |> normalize_nowait_recv()
     else
-      false -> invalid_socket_or_length(socket, length)
+      false -> invalid_socket_or_length(socket, length, :stream)
     end
   end
 
   def recv(%__MODULE__{} = socket, length, timeout)
       when timeout == :infinity or
              (is_integer(timeout) and timeout >= 0 and timeout <= @max_timeout) do
-    with true <- valid?(socket),
+    with true <- valid?(socket) and socket.kind == :stream,
          true <- valid_length?(length) do
       synchronous(socket, timeout, fn deadline, monitor ->
         recv_loop(socket, length, deadline, monitor, [], 0)
       end)
     else
-      false -> invalid_socket_or_length(socket, length)
+      false -> invalid_socket_or_length(socket, length, :stream)
     end
   end
 
@@ -239,13 +263,103 @@ defmodule SmolNet.Socket do
   def recv(_socket, _length, _timeout), do: {:error, :invalid_socket}
 
   @doc false
+  @spec sendto(t(), iodata(), sockaddr_in6()) :: :ok | {:error, atom()}
+  def sendto(socket, data, address), do: sendto(socket, data, address, :infinity)
+
+  @doc false
+  @spec sendto(t(), iodata(), sockaddr_in6(), :nowait | timeout()) ::
+          :ok | {:select, :socket.select_info()} | {:error, atom()}
+  def sendto(%__MODULE__{kind: :datagram} = socket, data, address, :nowait) do
+    with true <- valid?(socket),
+         {:ok, binary} <- encode_data(data),
+         {:ok, endpoint} <- encode_endpoint(address, :remote, socket.family) do
+      Stack.socket_sendto(socket, endpoint, binary)
+    else
+      false -> {:error, :invalid_socket}
+      {:error, _reason} = error -> error
+    end
+  end
+
+  def sendto(%__MODULE__{kind: :datagram} = socket, data, address, timeout)
+      when timeout == :infinity or
+             (is_integer(timeout) and timeout >= 0 and timeout <= @max_timeout) do
+    with true <- valid?(socket),
+         {:ok, binary} <- encode_data(data),
+         {:ok, endpoint} <- encode_endpoint(address, :remote, socket.family) do
+      synchronous(socket, timeout, fn deadline, monitor ->
+        sendto_loop(socket, endpoint, binary, deadline, monitor, 0)
+      end)
+    else
+      false -> {:error, :invalid_socket}
+      {:error, _reason} = error -> error
+    end
+  end
+
+  def sendto(%__MODULE__{kind: :datagram} = socket, _data, _address, _timeout) do
+    if valid?(socket), do: {:error, :invalid_timeout}, else: {:error, :invalid_socket}
+  end
+
+  def sendto(%__MODULE__{} = socket, _data, _address, _timeout) do
+    if valid?(socket), do: {:error, :invalid_socket_state}, else: {:error, :invalid_socket}
+  end
+
+  def sendto(_socket, _data, _address, _timeout), do: {:error, :invalid_socket}
+
+  @doc false
+  @spec recvfrom(t(), non_neg_integer()) :: {:ok, datagram()} | {:error, atom()}
+  def recvfrom(socket, length), do: recvfrom(socket, length, :infinity)
+
+  @doc false
+  @spec recvfrom(t(), non_neg_integer(), :nowait | timeout()) ::
+          {:ok, datagram()} | {:select, :socket.select_info()} | {:error, atom()}
+  def recvfrom(%__MODULE__{kind: :datagram} = socket, length, :nowait) do
+    with true <- valid?(socket),
+         true <- valid_length?(length) do
+      Stack.socket_recvfrom(socket, length)
+    else
+      false -> invalid_socket_or_length(socket, length, :datagram)
+    end
+  end
+
+  def recvfrom(%__MODULE__{kind: :datagram} = socket, length, timeout)
+      when timeout == :infinity or
+             (is_integer(timeout) and timeout >= 0 and timeout <= @max_timeout) do
+    with true <- valid?(socket),
+         true <- valid_length?(length) do
+      synchronous(socket, timeout, fn deadline, monitor ->
+        recvfrom_loop(socket, length, deadline, monitor, 0)
+      end)
+    else
+      false -> invalid_socket_or_length(socket, length, :datagram)
+    end
+  end
+
+  def recvfrom(%__MODULE__{kind: :datagram} = socket, _length, _timeout) do
+    if valid?(socket), do: {:error, :invalid_timeout}, else: {:error, :invalid_socket}
+  end
+
+  def recvfrom(%__MODULE__{} = socket, _length, _timeout) do
+    if valid?(socket), do: {:error, :invalid_socket_state}, else: {:error, :invalid_socket}
+  end
+
+  def recvfrom(_socket, _length, _timeout), do: {:error, :invalid_socket}
+
+  @doc false
   @spec shutdown(t(), :read | :write | :read_write) :: :ok | {:error, atom()}
   def shutdown(%__MODULE__{} = socket, how) when how in [:read, :write, :read_write] do
-    if valid?(socket), do: Stack.socket_shutdown(socket, how), else: {:error, :invalid_socket}
+    cond do
+      not valid?(socket) -> {:error, :invalid_socket}
+      socket.kind != :stream -> {:error, :invalid_socket_state}
+      true -> Stack.socket_shutdown(socket, how)
+    end
   end
 
   def shutdown(%__MODULE__{} = socket, _how) do
-    if valid?(socket), do: {:error, :invalid_how}, else: {:error, :invalid_socket}
+    cond do
+      not valid?(socket) -> {:error, :invalid_socket}
+      socket.kind != :stream -> {:error, :invalid_socket_state}
+      true -> {:error, :invalid_how}
+    end
   end
 
   def shutdown(_socket, _how), do: {:error, :invalid_socket}
@@ -275,13 +389,13 @@ defmodule SmolNet.Socket do
   def close(_socket), do: {:error, :invalid_socket}
 
   @doc false
-  @spec new(pid(), map(), :inet | :inet6) :: t()
-  def new(stack, identity, family \\ :inet6)
+  @spec new(pid(), map(), :inet | :inet6, :stream | :datagram) :: t()
+  def new(stack, identity, family \\ :inet6, kind \\ :stream)
 
-  def new(stack, %{id: id, generation: generation}, family)
+  def new(stack, %{id: id, generation: generation}, family, kind)
       when is_pid(stack) and id in 1..@max_identity and generation in 1..@max_identity and
-             family in [:inet, :inet6] do
-    %__MODULE__{stack: stack, id: id, generation: generation, family: family}
+             family in [:inet, :inet6] and kind in [:stream, :datagram] do
+    %__MODULE__{stack: stack, id: id, generation: generation, family: family, kind: kind}
   end
 
   @doc """
@@ -312,9 +426,15 @@ defmodule SmolNet.Socket do
 
   @doc false
   @spec valid?(term()) :: boolean()
-  def valid?(%__MODULE__{stack: stack, id: id, generation: generation, family: family}) do
+  def valid?(%__MODULE__{
+        stack: stack,
+        id: id,
+        generation: generation,
+        family: family,
+        kind: kind
+      }) do
     is_pid(stack) and id in 1..@max_identity and generation in 1..@max_identity and
-      family in [:inet, :inet6]
+      family in [:inet, :inet6] and kind in [:stream, :datagram]
   end
 
   def valid?(_socket), do: false
@@ -402,6 +522,65 @@ defmodule SmolNet.Socket do
 
   defp continue_connect({:error, reason}, _socket, _endpoint, _deadline, _monitor, _retries),
     do: {:error, reason}
+
+  defp sendto_loop(socket, endpoint, data, deadline, monitor, retries) do
+    case prepare_retry(deadline, retries) do
+      :ok ->
+        socket
+        |> Stack.socket_sendto(endpoint, data)
+        |> handle_sendto_result(socket, endpoint, data, deadline, monitor, retries)
+
+      :timeout ->
+        {:error, :timeout}
+    end
+  end
+
+  defp handle_sendto_result(
+         {:select, select_info},
+         socket,
+         endpoint,
+         data,
+         deadline,
+         monitor,
+         retries
+       ) do
+    case await_select(socket, select_info, deadline, monitor) do
+      :ready -> sendto_loop(socket, endpoint, data, deadline, monitor, retries + 1)
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp handle_sendto_result(result, _socket, _endpoint, _data, _deadline, _monitor, _retries),
+    do: result
+
+  defp recvfrom_loop(socket, length, deadline, monitor, retries) do
+    case prepare_retry(deadline, retries) do
+      :ok ->
+        socket
+        |> Stack.socket_recvfrom(length)
+        |> handle_recvfrom_result(socket, length, deadline, monitor, retries)
+
+      :timeout ->
+        {:error, :timeout}
+    end
+  end
+
+  defp handle_recvfrom_result(
+         {:select, select_info},
+         socket,
+         length,
+         deadline,
+         monitor,
+         retries
+       ) do
+    case await_select(socket, select_info, deadline, monitor) do
+      :ready -> recvfrom_loop(socket, length, deadline, monitor, retries + 1)
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp handle_recvfrom_result(result, _socket, _length, _deadline, _monitor, _retries),
+    do: result
 
   defp send_loop(socket, data, deadline, monitor, sent?, retries) do
     case prepare_retry(deadline, retries) do
@@ -652,9 +831,17 @@ defmodule SmolNet.Socket do
 
   defp valid_length?(length), do: is_integer(length) and length in 0..@max_identity
 
-  defp invalid_socket_or_length(socket, length) do
-    if valid?(socket) and not valid_length?(length),
-      do: {:error, :invalid_length},
+  defp invalid_socket_or_length(socket, length, kind) do
+    cond do
+      not valid?(socket) -> {:error, :invalid_socket}
+      socket.kind != kind -> {:error, :invalid_socket_state}
+      not valid_length?(length) -> {:error, :invalid_length}
+    end
+  end
+
+  defp invalid_socket_or_kind(socket, kind) do
+    if valid?(socket) and socket.kind != kind,
+      do: {:error, :invalid_socket_state},
       else: {:error, :invalid_socket}
   end
 

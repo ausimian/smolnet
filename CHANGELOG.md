@@ -34,3 +34,7 @@ and this project adheres to
 - Add IPv4 and dual-family TCP parity across raw packet admission, stack
   addresses and routes, low-level clients and listeners, and the `gen_tcp`
   adapter, with explicit family isolation and IPv4 fragment rejection.
+- Add bounded IPv6 UDP sockets with atomic datagram send/receive, source and
+  destination metadata, connected-peer filtering, shared readiness and
+  cancellation, and a supervised `gen_udp` adapter with passive, active, and
+  controlling-process behavior.

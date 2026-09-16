@@ -8,6 +8,7 @@ use rustler::{
 };
 use smoltcp::iface::{Config, Interface, PollResult, Route, SocketHandle, SocketSet};
 use smoltcp::socket::tcp::{self, ConnectError, ListenError};
+use smoltcp::socket::udp::{self, BindError as UdpBindError, SendError as UdpSendError};
 use smoltcp::time::Duration;
 use smoltcp::time::Instant;
 use smoltcp::wire::{
@@ -25,6 +26,7 @@ use crate::tcp::{
     self as tcp_support, AddressFamily, ConnectFailure, ConnectPhase, EncodedEndpoint,
     ListenerRecord, ShutdownHow, TcpEndpoint, TcpRecord, ValidatedEndpoint,
 };
+use crate::udp::{self as udp_support, UdpRecord};
 use crate::waiter::{
     ArmPoint, Direction, Operation, ReadinessCounters, ReadyKey, ReadyQueue, SocketIdentity, Waiter,
 };
@@ -98,6 +100,7 @@ pub struct NativeStack {
     tcp_records: BTreeMap<u64, TcpRecord>,
     tcp_listeners: BTreeMap<u64, ListenerRecord>,
     tcp_connections: BTreeMap<ConnectionKey, SocketIdentity>,
+    udp_records: BTreeMap<u64, UdpRecord>,
     closing_tcp: BTreeSet<u64>,
     closing_deadlines: BTreeSet<(Instant, u64)>,
     closing_sweep_cursor: Option<u64>,
@@ -105,6 +108,7 @@ pub struct NativeStack {
     closing_cleanup_resweep: bool,
     maintenance_cleanup_turn: bool,
     next_ephemeral_port: u16,
+    next_udp_ephemeral_port: u16,
     listener_scan_cursor: Option<ListenerMemberKey>,
     listener_scan_pending: bool,
     listener_scan_resweep: bool,
@@ -159,6 +163,7 @@ impl NativeStack {
             tcp_records: BTreeMap::new(),
             tcp_listeners: BTreeMap::new(),
             tcp_connections: BTreeMap::new(),
+            udp_records: BTreeMap::new(),
             closing_tcp: BTreeSet::new(),
             closing_deadlines: BTreeSet::new(),
             closing_sweep_cursor: None,
@@ -166,6 +171,7 @@ impl NativeStack {
             closing_cleanup_resweep: false,
             maintenance_cleanup_turn: false,
             next_ephemeral_port: tcp_support::EPHEMERAL_PORT_FIRST,
+            next_udp_ephemeral_port: tcp_support::EPHEMERAL_PORT_FIRST,
             listener_scan_cursor: None,
             listener_scan_pending: false,
             listener_scan_resweep: false,
@@ -213,12 +219,16 @@ impl NativeStack {
                 native_socket_count: self.sockets.iter().count(),
                 tcp_socket_count: self.tcp_records.len(),
                 tcp_listener_count: self.tcp_listeners.len(),
+                udp_socket_count: self.udp_records.len(),
                 listener_pool_socket_count,
                 listener_pool_target_count,
                 accepted_queue_count,
                 listener_backlog_capacity,
                 closing_tcp_socket_count: self.closing_tcp.len(),
                 tcp_buffer_bytes: tcp_support::BUFFER_BYTES,
+                udp_packet_capacity: udp_support::PACKET_CAPACITY,
+                udp_payload_bytes: udp_support::PAYLOAD_BYTES,
+                udp_max_datagram_bytes: udp_support::max_datagram_bytes(self.mtu),
                 waiter_count: self.socket_table.waiter_count(),
                 read_waiter_count: read_waiters,
                 write_waiter_count: write_waiters,
@@ -280,10 +290,10 @@ impl NativeStack {
         &mut self,
         env: Env<'_>,
         identity: SocketIdentity,
-    ) -> Result<Envelope<Atom>, SocketError> {
+    ) -> Result<Envelope<SocketKind>, SocketError> {
         self.ensure_running()?;
-        self.socket_table.validate(identity, SocketKind::Tcp)?;
-        Ok(self.finish_call(env, crate::atoms::ok(), Effects::empty(), Vec::new()))
+        let kind = self.socket_table.validate_any(identity)?.kind;
+        Ok(self.finish_call(env, kind, Effects::empty(), Vec::new()))
     }
 
     pub fn tcp_bind(
@@ -881,6 +891,348 @@ impl NativeStack {
         Ok(self.finish_call(env, crate::atoms::ok(), effects, aborts))
     }
 
+    pub fn udp_open(
+        &mut self,
+        env: Env<'_>,
+        family: AddressFamily,
+    ) -> Result<Envelope<SocketIdentity>, SocketError> {
+        self.ensure_running()?;
+
+        if family != AddressFamily::Inet6 {
+            return Err(SocketError::UnsupportedFamily);
+        }
+
+        let handle = self.sockets.add(udp_support::socket());
+        let identity = match self.socket_table.insert(SocketKind::Udp, 0) {
+            Ok(identity) => identity,
+            Err(error) => {
+                self.sockets.remove(handle);
+                return Err(error);
+            }
+        };
+
+        self.udp_records
+            .insert(identity.id, UdpRecord::new(identity, handle, family));
+
+        Ok(self.finish_call(env, identity, Effects::empty(), Vec::new()))
+    }
+
+    pub fn udp_bind(
+        &mut self,
+        env: Env<'_>,
+        identity: SocketIdentity,
+        endpoint: TcpEndpoint,
+    ) -> Result<Envelope<Atom>, SocketError> {
+        self.ensure_running()?;
+        self.socket_table.validate(identity, SocketKind::Udp)?;
+        let mut endpoint = endpoint.bind_endpoint()?;
+        let record = *self.udp_record(identity)?;
+
+        if record.local.is_some() {
+            return Err(SocketError::InvalidState);
+        }
+
+        if !record.family.matches(endpoint.address) {
+            return Err(SocketError::InvalidAddress);
+        }
+
+        if !endpoint.address.is_unspecified() && !self.has_ip_address(endpoint.address) {
+            return Err(SocketError::AddressNotAvailable);
+        }
+
+        endpoint.port = if endpoint.port == 0 {
+            self.allocate_udp_ephemeral_port(record.family)?
+        } else {
+            if self.udp_port_in_use(endpoint.port, record.family, Some(identity)) {
+                return Err(SocketError::AddressInUse);
+            }
+            endpoint.port
+        };
+
+        match self
+            .sockets
+            .get_mut::<udp::Socket<'static>>(record.handle)
+            .bind(endpoint.listen_endpoint())
+        {
+            Ok(()) => {}
+            Err(UdpBindError::InvalidState) => return Err(SocketError::InvalidState),
+            Err(UdpBindError::Unaddressable) => return Err(SocketError::InvalidAddress),
+        }
+
+        self.udp_record_mut(identity)?.local = Some(endpoint);
+        Ok(self.finish_call(env, crate::atoms::ok(), Effects::empty(), Vec::new()))
+    }
+
+    pub fn udp_connect(
+        &mut self,
+        env: Env<'_>,
+        identity: SocketIdentity,
+        endpoint: TcpEndpoint,
+    ) -> Result<Envelope<Atom>, SocketError> {
+        self.ensure_running()?;
+        self.socket_table.validate(identity, SocketKind::Udp)?;
+        let remote = endpoint.remote_endpoint()?;
+        let record = *self.udp_record(identity)?;
+
+        if record.local.is_none() {
+            return Err(SocketError::NotBound);
+        }
+
+        if !record.family.matches(remote.address) {
+            return Err(SocketError::InvalidAddress);
+        }
+
+        if !self.reachable(remote.address) {
+            return Err(SocketError::NetworkUnreachable);
+        }
+
+        self.udp_record_mut(identity)?.peer = Some(remote);
+        Ok(self.finish_call(env, crate::atoms::ok(), Effects::empty(), Vec::new()))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn udp_sendto<'a>(
+        &mut self,
+        env: Env<'a>,
+        identity: SocketIdentity,
+        endpoint: TcpEndpoint,
+        data: &[u8],
+        pid: LocalPid,
+        reference: Reference<'a>,
+        now: Instant,
+    ) -> Result<Envelope<Term<'a>>, SocketError> {
+        self.ensure_running()?;
+        self.socket_table.validate(identity, SocketKind::Udp)?;
+
+        if self
+            .socket_table
+            .has_waiter(identity, SocketKind::Udp, Direction::Write)?
+        {
+            return Err(SocketError::Busy);
+        }
+
+        let remote = endpoint.remote_endpoint()?;
+        let record = *self.udp_record(identity)?;
+
+        if record.local.is_none() {
+            return Err(SocketError::NotBound);
+        }
+
+        if !record.family.matches(remote.address) {
+            return Err(SocketError::InvalidAddress);
+        }
+
+        if record.peer.is_some_and(|peer| peer != remote) {
+            return Err(SocketError::InvalidState);
+        }
+
+        if !self.reachable(remote.address) {
+            return Err(SocketError::NetworkUnreachable);
+        }
+
+        if data.len() > udp_support::max_datagram_bytes(self.mtu) {
+            return Err(SocketError::MessageTooLarge);
+        }
+
+        let send_result = self
+            .sockets
+            .get_mut::<udp::Socket<'static>>(record.handle)
+            .send_slice(data, remote.ip_endpoint());
+
+        match send_result {
+            Ok(()) => {
+                let effects = self
+                    .drive(now, Some(data.len()))
+                    .expect("UDP send without ingress cannot fail");
+                Ok(self.finish_call(env, crate::atoms::ok().encode(env), effects, Vec::new()))
+            }
+            Err(UdpSendError::BufferFull) => {
+                self.arm_udp_waiter(
+                    env,
+                    identity,
+                    record.handle,
+                    Direction::Write,
+                    Operation::Sendto,
+                    pid,
+                    reference,
+                    false,
+                )?;
+                let result = (crate::atoms::select(), Operation::Sendto, reference).encode(env);
+                let effects = self
+                    .drive(now, None)
+                    .expect("UDP send retry without ingress cannot fail");
+                Ok(self.finish_call(env, result, effects, Vec::new()))
+            }
+            Err(UdpSendError::Unaddressable) => Err(SocketError::InvalidAddress),
+        }
+    }
+
+    pub fn udp_recvfrom<'a>(
+        &mut self,
+        env: Env<'a>,
+        identity: SocketIdentity,
+        length: usize,
+        pid: LocalPid,
+        reference: Reference<'a>,
+        now: Instant,
+    ) -> Result<Envelope<Term<'a>>, SocketError> {
+        self.ensure_running()?;
+        self.socket_table.validate(identity, SocketKind::Udp)?;
+
+        if self
+            .socket_table
+            .has_waiter(identity, SocketKind::Udp, Direction::Read)?
+        {
+            return Err(SocketError::Busy);
+        }
+
+        let record = *self.udp_record(identity)?;
+        let local = record.local.ok_or(SocketError::NotBound)?;
+        let mut received = None;
+
+        for _ in 0..udp_support::PACKET_CAPACITY {
+            let next = {
+                let socket = self.sockets.get_mut::<udp::Socket<'static>>(record.handle);
+
+                match socket.recv() {
+                    Ok((payload, metadata)) => {
+                        let destination_address = metadata.local_address.unwrap_or(local.address);
+                        let matching_family = record.family.matches(metadata.endpoint.addr)
+                            && record.family.matches(destination_address);
+                        let matching_peer = record
+                            .peer
+                            .is_none_or(|peer| peer.ip_endpoint() == metadata.endpoint);
+
+                        if matching_family && matching_peer {
+                            let copied = if length == 0 {
+                                payload.len()
+                            } else {
+                                length.min(payload.len())
+                            };
+                            let truncated = copied < payload.len();
+                            let binary: Term<'a> =
+                                NewBinary::from_iter(env, payload.iter().copied().take(copied))
+                                    .into();
+                            let source = EncodedEndpoint::new(metadata.endpoint, local.scope_id);
+                            let destination = EncodedEndpoint::new(
+                                IpEndpoint::new(destination_address, local.port),
+                                local.scope_id,
+                            );
+
+                            Some(Some((binary, source, destination, truncated, copied)))
+                        } else {
+                            Some(None)
+                        }
+                    }
+                    Err(udp::RecvError::Exhausted) => None,
+                    Err(udp::RecvError::Truncated) => {
+                        unreachable!("recv without a slice cannot truncate")
+                    }
+                }
+            };
+
+            let Some(candidate) = next else {
+                break;
+            };
+
+            if let Some(datagram) = candidate {
+                received = Some(datagram);
+                break;
+            }
+        }
+
+        if let Some((binary, source, destination, truncated, copied)) = received {
+            let result = (crate::atoms::ok(), source, destination, binary, truncated).encode(env);
+            let effects = self
+                .drive(now, Some(copied))
+                .expect("UDP receive without ingress cannot fail");
+            Ok(self.finish_call(env, result, effects, Vec::new()))
+        } else {
+            self.arm_udp_waiter(
+                env,
+                identity,
+                record.handle,
+                Direction::Read,
+                Operation::Recvfrom,
+                pid,
+                reference,
+                false,
+            )?;
+            let result = (crate::atoms::select(), Operation::Recvfrom, reference).encode(env);
+            let effects = self
+                .drive(now, None)
+                .expect("UDP receive retry without ingress cannot fail");
+            Ok(self.finish_call(env, result, effects, Vec::new()))
+        }
+    }
+
+    pub fn udp_sockname(
+        &mut self,
+        env: Env<'_>,
+        identity: SocketIdentity,
+    ) -> Result<Envelope<EncodedEndpoint>, SocketError> {
+        self.ensure_running()?;
+        self.socket_table.validate(identity, SocketKind::Udp)?;
+        let local = self
+            .udp_record(identity)?
+            .local
+            .ok_or(SocketError::NotBound)?;
+
+        Ok(self.finish_call(
+            env,
+            EncodedEndpoint::new(local.ip_endpoint(), local.scope_id),
+            Effects::empty(),
+            Vec::new(),
+        ))
+    }
+
+    pub fn udp_peername(
+        &mut self,
+        env: Env<'_>,
+        identity: SocketIdentity,
+    ) -> Result<Envelope<EncodedEndpoint>, SocketError> {
+        self.ensure_running()?;
+        self.socket_table.validate(identity, SocketKind::Udp)?;
+        let peer = self
+            .udp_record(identity)?
+            .peer
+            .ok_or(SocketError::NotConnected)?;
+
+        Ok(self.finish_call(
+            env,
+            EncodedEndpoint::new(peer.ip_endpoint(), peer.scope_id),
+            Effects::empty(),
+            Vec::new(),
+        ))
+    }
+
+    pub fn udp_close(
+        &mut self,
+        env: Env<'_>,
+        identity: SocketIdentity,
+        now: Instant,
+    ) -> Result<Envelope<Atom>, SocketError> {
+        self.ensure_running()?;
+        self.socket_table.validate(identity, SocketKind::Udp)?;
+        let record = *self.udp_record(identity)?;
+        let waiters = self.socket_table.close(identity)?;
+        let aborts = waiters
+            .into_iter()
+            .map(|(direction, waiter)| PendingNotification {
+                identity,
+                direction,
+                waiter,
+            })
+            .collect();
+
+        self.sockets.remove(record.handle);
+        self.udp_records.remove(&identity.id);
+        let effects = self
+            .drive(now, None)
+            .expect("UDP close without ingress cannot fail");
+        Ok(self.finish_call(env, crate::atoms::ok(), effects, aborts))
+    }
+
     pub fn ingress(&mut self, packet: &[u8], now: Instant) -> Result<Effects, StackError> {
         self.validate_packet(packet)?;
         self.retarget_wildcard_listener(packet);
@@ -976,6 +1328,9 @@ impl NativeStack {
             for handle in listener.pool {
                 self.sockets.remove(handle);
             }
+        }
+        for record in std::mem::take(&mut self.udp_records).into_values() {
+            self.sockets.remove(record.handle);
         }
         self.tcp_connections.clear();
         self.closing_tcp.clear();
@@ -1338,6 +1693,54 @@ impl NativeStack {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn arm_udp_waiter<'a>(
+        &mut self,
+        env: Env<'a>,
+        identity: SocketIdentity,
+        handle: SocketHandle,
+        direction: Direction,
+        operation: Operation,
+        pid: LocalPid,
+        reference: Reference<'a>,
+        immediately_ready: bool,
+    ) -> Result<(), SocketError> {
+        let flag = self
+            .socket_table
+            .ready_flag(identity, SocketKind::Udp, direction)?;
+        self.socket_table.install_waiter(
+            env,
+            WaiterRegistration {
+                identity,
+                expected_kind: SocketKind::Udp,
+                direction,
+                pid,
+                operation,
+                reference,
+            },
+        )?;
+
+        let waker = self.ready.waker(
+            ReadyKey {
+                identity,
+                direction,
+            },
+            flag,
+        );
+        let socket = self.sockets.get_mut::<udp::Socket<'static>>(handle);
+
+        match direction {
+            Direction::Read => socket.register_recv_waker(&waker),
+            Direction::Write => socket.register_send_waker(&waker),
+        }
+
+        if immediately_ready {
+            waker.wake_by_ref();
+        }
+
+        Ok(())
+    }
+
     fn ensure_connected(&self, record: TcpRecord) -> Result<(), SocketError> {
         match record.phase {
             ConnectPhase::Connected => Ok(()),
@@ -1359,6 +1762,20 @@ impl NativeStack {
 
         self.tcp_records
             .get(&identity.id)
+            .filter(|record| record.identity == identity)
+            .ok_or(SocketError::InvalidSocket)
+    }
+
+    fn udp_record(&self, identity: SocketIdentity) -> Result<&UdpRecord, SocketError> {
+        self.udp_records
+            .get(&identity.id)
+            .filter(|record| record.identity == identity)
+            .ok_or(SocketError::InvalidSocket)
+    }
+
+    fn udp_record_mut(&mut self, identity: SocketIdentity) -> Result<&mut UdpRecord, SocketError> {
+        self.udp_records
+            .get_mut(&identity.id)
             .filter(|record| record.identity == identity)
             .ok_or(SocketError::InvalidSocket)
     }
@@ -1829,6 +2246,40 @@ impl NativeStack {
             tcp_support::EPHEMERAL_PORT_LAST,
         )?;
         self.next_ephemeral_port = if port == tcp_support::EPHEMERAL_PORT_LAST {
+            tcp_support::EPHEMERAL_PORT_FIRST
+        } else {
+            port + 1
+        };
+        Ok(port)
+    }
+
+    fn udp_port_in_use(
+        &self,
+        port: u16,
+        family: AddressFamily,
+        excluding: Option<SocketIdentity>,
+    ) -> bool {
+        self.udp_records.values().any(|record| {
+            Some(record.identity) != excluding
+                && record.family == family
+                && record.local.is_some_and(|local| local.port == port)
+        })
+    }
+
+    fn allocate_udp_ephemeral_port(&mut self, family: AddressFamily) -> Result<u16, SocketError> {
+        let used = self
+            .udp_records
+            .values()
+            .filter(|record| record.family == family)
+            .filter_map(|record| record.local.map(|local| local.port))
+            .collect::<BTreeSet<_>>();
+        let port = tcp_support::allocate_ephemeral(
+            &used,
+            self.next_udp_ephemeral_port,
+            tcp_support::EPHEMERAL_PORT_FIRST,
+            tcp_support::EPHEMERAL_PORT_LAST,
+        )?;
+        self.next_udp_ephemeral_port = if port == tcp_support::EPHEMERAL_PORT_LAST {
             tcp_support::EPHEMERAL_PORT_FIRST
         } else {
             port + 1
@@ -2484,12 +2935,16 @@ pub struct Snapshot {
     native_socket_count: usize,
     tcp_socket_count: usize,
     tcp_listener_count: usize,
+    udp_socket_count: usize,
     listener_pool_socket_count: usize,
     listener_pool_target_count: usize,
     accepted_queue_count: usize,
     listener_backlog_capacity: usize,
     closing_tcp_socket_count: usize,
     tcp_buffer_bytes: usize,
+    udp_packet_capacity: usize,
+    udp_payload_bytes: usize,
+    udp_max_datagram_bytes: usize,
     waiter_count: usize,
     read_waiter_count: usize,
     write_waiter_count: usize,
