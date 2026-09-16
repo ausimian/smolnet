@@ -1,0 +1,18 @@
+[package]
+name = "smolnet_nif"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.91"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+rustler = "=0.38.0"
+smoltcp = { version = "=0.14.0", default-features = false, features = [
+  "std",
+  "medium-ip",
+  "proto-ipv6",
+  "socket-tcp",
+] }

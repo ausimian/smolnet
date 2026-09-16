@@ -1,0 +1,10 @@
+[workspace]
+resolver = "3"
+members = ["smolnet_nif"]
+
+[profile.release]
+opt-level = "s"
+lto = "fat"
+codegen-units = 1
+strip = "symbols"
+panic = "unwind"
