@@ -17,6 +17,7 @@ smoltcp = { version = "=0.14.0", default-features = false, features = [
   "proto-ipv6",
   "auto-icmp-echo-reply",
   "async",
+  "iface-max-addr-count-8",
   "socket-tcp",
   "socket-udp",
 ] }

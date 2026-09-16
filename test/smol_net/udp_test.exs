@@ -20,9 +20,6 @@ defmodule SmolNet.UdpTest do
     {:ok, client} = SmolNet.open(:inet6, :dgram, :udp, stack: client_stack)
     :ok = SmolNet.bind(client, endpoint(@client, 0))
 
-    assert {:error, :unsupported_family} =
-             SmolNet.open(:inet, :dgram, :udp, stack: client_stack)
-
     assert {:select, select} = SmolNet.recvfrom(server, 0, :nowait)
     assert :ok = SmolNet.cancel(server, select)
 
@@ -59,6 +56,7 @@ defmodule SmolNet.UdpTest do
     assert native.udp_packet_capacity == 16
     assert native.udp_payload_bytes == 16_384
     assert native.udp_max_datagram_bytes == 1_452
+    assert native.udp_ipv4_max_datagram_bytes == 1_472
     assert native.counters.max_bytes_copied <= native.limits.bytes_copied
   end
 
@@ -443,9 +441,18 @@ defmodule SmolNet.UdpTest do
   test "UDP options, wrong-kind calls, and adapter errors are explicit" do
     {server_stack, _client_stack, _link} = stacks()
 
+    assert {:error, :eaddrnotavail} =
+             Udp.open(0, [
+               :inet,
+               {:smolnet_stack, server_stack},
+               :binary,
+               {:active, false}
+             ])
+
     assert {:error, :eafnosupport} =
              Udp.open(0, [
                :inet,
+               :inet6,
                {:smolnet_stack, server_stack},
                :binary,
                {:active, false}

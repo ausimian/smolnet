@@ -742,7 +742,6 @@ fn socket_error_atom(error: SocketError) -> Atom {
         SocketError::InvalidOperation => atoms::invalid_operation(),
         SocketError::Busy => atoms::busy(),
         SocketError::SystemLimit => atoms::system_limit(),
-        SocketError::UnsupportedFamily => atoms::unsupported_family(),
         SocketError::MessageTooLarge => atoms::message_too_large(),
         SocketError::InvalidAddress => atoms::invalid_address(),
         SocketError::InvalidPort => atoms::invalid_port(),

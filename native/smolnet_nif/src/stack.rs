@@ -12,8 +12,8 @@ use smoltcp::socket::udp::{self, BindError as UdpBindError, SendError as UdpSend
 use smoltcp::time::Duration;
 use smoltcp::time::Instant;
 use smoltcp::wire::{
-    HardwareAddress, IpAddress, IpCidr, IpEndpoint, IpProtocol, Ipv4Address, Ipv4Cidr, Ipv4Packet,
-    Ipv6Address, Ipv6Cidr, Ipv6ExtHeader, Ipv6Packet, TcpPacket,
+    HardwareAddress, IpAddress, IpCidr, IpEndpoint, IpListenEndpoint, IpProtocol, Ipv4Address,
+    Ipv4Cidr, Ipv4Packet, Ipv6Address, Ipv6Cidr, Ipv6ExtHeader, Ipv6Packet, TcpPacket,
 };
 
 use crate::device::BeamDevice;
@@ -228,7 +228,14 @@ impl NativeStack {
                 tcp_buffer_bytes: tcp_support::BUFFER_BYTES,
                 udp_packet_capacity: udp_support::PACKET_CAPACITY,
                 udp_payload_bytes: udp_support::PAYLOAD_BYTES,
-                udp_max_datagram_bytes: udp_support::max_datagram_bytes(self.mtu),
+                udp_max_datagram_bytes: udp_support::max_datagram_bytes(
+                    self.mtu,
+                    AddressFamily::Inet6,
+                ),
+                udp_ipv4_max_datagram_bytes: udp_support::max_datagram_bytes(
+                    self.mtu,
+                    AddressFamily::Inet,
+                ),
                 waiter_count: self.socket_table.waiter_count(),
                 read_waiter_count: read_waiters,
                 write_waiter_count: write_waiters,
@@ -898,10 +905,6 @@ impl NativeStack {
     ) -> Result<Envelope<SocketIdentity>, SocketError> {
         self.ensure_running()?;
 
-        if family != AddressFamily::Inet6 {
-            return Err(SocketError::UnsupportedFamily);
-        }
-
         let handle = self.sockets.add(udp_support::socket());
         let identity = match self.socket_table.insert(SocketKind::Udp, 0) {
             Ok(identity) => identity,
@@ -926,7 +929,7 @@ impl NativeStack {
         self.ensure_running()?;
         self.socket_table.validate(identity, SocketKind::Udp)?;
         let mut endpoint = endpoint.bind_endpoint()?;
-        let record = *self.udp_record(identity)?;
+        let record = self.udp_record(identity)?.clone();
 
         if record.local.is_some() {
             return Err(SocketError::InvalidState);
@@ -949,17 +952,57 @@ impl NativeStack {
             endpoint.port
         };
 
-        match self
-            .sockets
-            .get_mut::<udp::Socket<'static>>(record.handle)
-            .bind(endpoint.listen_endpoint())
-        {
-            Ok(()) => {}
-            Err(UdpBindError::InvalidState) => return Err(SocketError::InvalidState),
-            Err(UdpBindError::Unaddressable) => return Err(SocketError::InvalidAddress),
+        let addresses = if endpoint.address.is_unspecified() {
+            self.interface
+                .ip_addrs()
+                .iter()
+                .map(IpCidr::address)
+                .filter(|address| record.family.matches(*address) && !address.is_unspecified())
+                .collect::<Vec<_>>()
+        } else {
+            vec![endpoint.address]
+        };
+
+        if addresses.is_empty() {
+            return Err(SocketError::AddressNotAvailable);
         }
 
-        self.udp_record_mut(identity)?.local = Some(endpoint);
+        let mut handles = Vec::with_capacity(addresses.len());
+
+        for address in addresses {
+            let handle = self.sockets.add(udp_support::socket());
+            let bind_result =
+                self.sockets
+                    .get_mut::<udp::Socket<'static>>(handle)
+                    .bind(IpListenEndpoint {
+                        addr: Some(address),
+                        port: endpoint.port,
+                    });
+
+            match bind_result {
+                Ok(()) => handles.push(handle),
+                Err(error) => {
+                    self.sockets.remove(handle);
+                    for handle in handles {
+                        self.sockets.remove(handle);
+                    }
+
+                    return Err(match error {
+                        UdpBindError::InvalidState => SocketError::InvalidState,
+                        UdpBindError::Unaddressable => SocketError::InvalidAddress,
+                    });
+                }
+            }
+        }
+
+        for handle in record.handles {
+            self.sockets.remove(handle);
+        }
+
+        let record = self.udp_record_mut(identity)?;
+        record.handles = handles;
+        record.local = Some(endpoint);
+        record.receive_cursor = 0;
         Ok(self.finish_call(env, crate::atoms::ok(), Effects::empty(), Vec::new()))
     }
 
@@ -972,7 +1015,7 @@ impl NativeStack {
         self.ensure_running()?;
         self.socket_table.validate(identity, SocketKind::Udp)?;
         let remote = endpoint.remote_endpoint()?;
-        let record = *self.udp_record(identity)?;
+        let record = self.udp_record(identity)?.clone();
 
         if record.local.is_none() {
             return Err(SocketError::NotBound);
@@ -1012,7 +1055,7 @@ impl NativeStack {
         }
 
         let remote = endpoint.remote_endpoint()?;
-        let record = *self.udp_record(identity)?;
+        let record = self.udp_record(identity)?.clone();
 
         if record.local.is_none() {
             return Err(SocketError::NotBound);
@@ -1030,14 +1073,30 @@ impl NativeStack {
             return Err(SocketError::NetworkUnreachable);
         }
 
-        if data.len() > udp_support::max_datagram_bytes(self.mtu) {
+        if data.len() > udp_support::max_datagram_bytes(self.mtu, record.family) {
             return Err(SocketError::MessageTooLarge);
         }
 
+        let local = record
+            .local
+            .expect("a UDP record checked as bound has a local endpoint");
+        let source_address = if local.address.is_unspecified() {
+            self.interface
+                .get_source_address(&remote.address)
+                .filter(|address| record.family.matches(*address))
+                .ok_or(SocketError::NetworkUnreachable)?
+        } else {
+            local.address
+        };
+        let metadata = udp::UdpMetadata {
+            endpoint: remote.ip_endpoint(),
+            local_address: Some(source_address),
+            meta: Default::default(),
+        };
         let send_result = self
             .sockets
-            .get_mut::<udp::Socket<'static>>(record.handle)
-            .send_slice(data, remote.ip_endpoint());
+            .get_mut::<udp::Socket<'static>>(record.primary_handle())
+            .send_slice(data, metadata);
 
         match send_result {
             Ok(()) => {
@@ -1050,7 +1109,7 @@ impl NativeStack {
                 self.arm_udp_waiter(
                     env,
                     identity,
-                    record.handle,
+                    &[record.primary_handle()],
                     Direction::Write,
                     Operation::Sendto,
                     pid,
@@ -1086,60 +1145,78 @@ impl NativeStack {
             return Err(SocketError::Busy);
         }
 
-        let record = *self.udp_record(identity)?;
+        let record = self.udp_record(identity)?.clone();
         let local = record.local.ok_or(SocketError::NotBound)?;
         let mut received = None;
+        let mut inspected = 0;
+        let handle_count = record.handles.len();
+        let start = record.receive_cursor % handle_count;
+        let mut next_receive_cursor = start;
 
-        for _ in 0..udp_support::PACKET_CAPACITY {
-            let next = {
-                let socket = self.sockets.get_mut::<udp::Socket<'static>>(record.handle);
+        for offset in 0..handle_count {
+            let handle_index = (start + offset) % handle_count;
+            let handle = record.handles[handle_index];
+            while inspected < udp_support::PACKET_CAPACITY {
+                let next = {
+                    let socket = self.sockets.get_mut::<udp::Socket<'static>>(handle);
 
-                match socket.recv() {
-                    Ok((payload, metadata)) => {
-                        let destination_address = metadata.local_address.unwrap_or(local.address);
-                        let matching_family = record.family.matches(metadata.endpoint.addr)
-                            && record.family.matches(destination_address);
-                        let matching_peer = record
-                            .peer
-                            .is_none_or(|peer| peer.ip_endpoint() == metadata.endpoint);
+                    match socket.recv() {
+                        Ok((payload, metadata)) => {
+                            inspected += 1;
+                            let destination_address =
+                                metadata.local_address.unwrap_or(local.address);
+                            let matching_family = record.family.matches(metadata.endpoint.addr)
+                                && record.family.matches(destination_address);
+                            let matching_peer = record
+                                .peer
+                                .is_none_or(|peer| peer.ip_endpoint() == metadata.endpoint);
 
-                        if matching_family && matching_peer {
-                            let copied = if length == 0 {
-                                payload.len()
+                            if matching_family && matching_peer {
+                                let copied = if length == 0 {
+                                    payload.len()
+                                } else {
+                                    length.min(payload.len())
+                                };
+                                let truncated = copied < payload.len();
+                                let binary: Term<'a> =
+                                    NewBinary::from_iter(env, payload.iter().copied().take(copied))
+                                        .into();
+                                let source =
+                                    EncodedEndpoint::new(metadata.endpoint, local.scope_id);
+                                let destination = EncodedEndpoint::new(
+                                    IpEndpoint::new(destination_address, local.port),
+                                    local.scope_id,
+                                );
+
+                                Some(Some((binary, source, destination, truncated, copied)))
                             } else {
-                                length.min(payload.len())
-                            };
-                            let truncated = copied < payload.len();
-                            let binary: Term<'a> =
-                                NewBinary::from_iter(env, payload.iter().copied().take(copied))
-                                    .into();
-                            let source = EncodedEndpoint::new(metadata.endpoint, local.scope_id);
-                            let destination = EncodedEndpoint::new(
-                                IpEndpoint::new(destination_address, local.port),
-                                local.scope_id,
-                            );
-
-                            Some(Some((binary, source, destination, truncated, copied)))
-                        } else {
-                            Some(None)
+                                Some(None)
+                            }
+                        }
+                        Err(udp::RecvError::Exhausted) => None,
+                        Err(udp::RecvError::Truncated) => {
+                            unreachable!("recv without a slice cannot truncate")
                         }
                     }
-                    Err(udp::RecvError::Exhausted) => None,
-                    Err(udp::RecvError::Truncated) => {
-                        unreachable!("recv without a slice cannot truncate")
-                    }
+                };
+
+                let Some(candidate) = next else {
+                    break;
+                };
+
+                if let Some(datagram) = candidate {
+                    received = Some(datagram);
+                    break;
                 }
-            };
+            }
 
-            let Some(candidate) = next else {
-                break;
-            };
-
-            if let Some(datagram) = candidate {
-                received = Some(datagram);
+            if received.is_some() || inspected == udp_support::PACKET_CAPACITY {
+                next_receive_cursor = (handle_index + 1) % handle_count;
                 break;
             }
         }
+
+        self.udp_record_mut(identity)?.receive_cursor = next_receive_cursor;
 
         if let Some((binary, source, destination, truncated, copied)) = received {
             let result = (crate::atoms::ok(), source, destination, binary, truncated).encode(env);
@@ -1148,15 +1225,19 @@ impl NativeStack {
                 .expect("UDP receive without ingress cannot fail");
             Ok(self.finish_call(env, result, effects, Vec::new()))
         } else {
+            let immediately_ready = record
+                .handles
+                .iter()
+                .any(|handle| self.sockets.get::<udp::Socket<'static>>(*handle).can_recv());
             self.arm_udp_waiter(
                 env,
                 identity,
-                record.handle,
+                &record.handles,
                 Direction::Read,
                 Operation::Recvfrom,
                 pid,
                 reference,
-                false,
+                immediately_ready,
             )?;
             let result = (crate::atoms::select(), Operation::Recvfrom, reference).encode(env);
             let effects = self
@@ -1214,7 +1295,7 @@ impl NativeStack {
     ) -> Result<Envelope<Atom>, SocketError> {
         self.ensure_running()?;
         self.socket_table.validate(identity, SocketKind::Udp)?;
-        let record = *self.udp_record(identity)?;
+        let record = self.udp_record(identity)?.clone();
         let waiters = self.socket_table.close(identity)?;
         let aborts = waiters
             .into_iter()
@@ -1225,7 +1306,9 @@ impl NativeStack {
             })
             .collect();
 
-        self.sockets.remove(record.handle);
+        for handle in record.handles {
+            self.sockets.remove(handle);
+        }
         self.udp_records.remove(&identity.id);
         let effects = self
             .drive(now, None)
@@ -1330,7 +1413,9 @@ impl NativeStack {
             }
         }
         for record in std::mem::take(&mut self.udp_records).into_values() {
-            self.sockets.remove(record.handle);
+            for handle in record.handles {
+                self.sockets.remove(handle);
+            }
         }
         self.tcp_connections.clear();
         self.closing_tcp.clear();
@@ -1698,7 +1783,7 @@ impl NativeStack {
         &mut self,
         env: Env<'a>,
         identity: SocketIdentity,
-        handle: SocketHandle,
+        handles: &[SocketHandle],
         direction: Direction,
         operation: Operation,
         pid: LocalPid,
@@ -1727,11 +1812,13 @@ impl NativeStack {
             },
             flag,
         );
-        let socket = self.sockets.get_mut::<udp::Socket<'static>>(handle);
+        for handle in handles {
+            let socket = self.sockets.get_mut::<udp::Socket<'static>>(*handle);
 
-        match direction {
-            Direction::Read => socket.register_recv_waker(&waker),
-            Direction::Write => socket.register_send_waker(&waker),
+            match direction {
+                Direction::Read => socket.register_recv_waker(&waker),
+                Direction::Write => socket.register_send_waker(&waker),
+            }
         }
 
         if immediately_ready {
@@ -2945,6 +3032,7 @@ pub struct Snapshot {
     udp_packet_capacity: usize,
     udp_payload_bytes: usize,
     udp_max_datagram_bytes: usize,
+    udp_ipv4_max_datagram_bytes: usize,
     waiter_count: usize,
     read_waiter_count: usize,
     write_waiter_count: usize,

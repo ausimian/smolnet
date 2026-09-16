@@ -1,13 +1,17 @@
 defmodule SmolNet.InetBackend.Udp do
   @moduledoc """
-  IPv6 UDP adapter for Erlang `:gen_udp` and `:inet`.
+  Shared UDP adapter for Erlang `:gen_udp` and `:inet`.
 
   Select this callback with `{:udp_module, SmolNet.InetBackend.Udp}` and pass
   the target stack with `{:smolnet_stack, stack}`. Each returned OTP socket is
   backed by one temporary `:gen_statem` child of the stack's inet supervisor.
 
-  Datagram boundaries are preserved. IPv4, ancillary data, multicast, and file
-  descriptors are intentionally unsupported in this phase.
+  `SmolNet.InetBackend.Udp` is the IPv6 callback. The IPv4 callback
+  `SmolNet.InetBackend.Udp4` selects the other address family and delegates its
+  socket operations here, so both families have identical bounded behaviour.
+
+  Datagram boundaries are preserved. Ancillary data, multicast, and file
+  descriptors are intentionally unsupported.
   """
 
   @behaviour :gen_statem
@@ -47,12 +51,8 @@ defmodule SmolNet.InetBackend.Udp do
 
   @spec open(:inet.port_number(), list()) :: {:ok, socket_term()} | {:error, atom()}
   def open(port, options) do
-    with {:ok, parsed} <- Options.parse_udp(options, port),
-         true <- parsed.family == :inet6 do
+    with {:ok, parsed} <- Options.parse_udp(options, port) do
       start_socket(parsed)
-    else
-      false -> {:error, :eafnosupport}
-      {:error, _reason} = error -> error
     end
   end
 
@@ -63,11 +63,7 @@ defmodule SmolNet.InetBackend.Udp do
   def send(socket, packet), do: socket_call(socket, {:send, :connected, packet})
 
   @spec send(socket_term(), term(), iodata()) :: :ok | {:error, atom()}
-  def send(socket, destination, packet) do
-    with {:ok, endpoint} <- endpoint(destination) do
-      socket_call(socket, {:send, endpoint, packet})
-    end
-  end
+  def send(socket, destination, packet), do: socket_call(socket, {:send, destination, packet})
 
   @spec send(socket_term(), term(), term(), iodata()) :: :ok | {:error, atom()}
   def send(socket, destination, ancillary, packet) when is_list(ancillary) do
@@ -83,9 +79,7 @@ defmodule SmolNet.InetBackend.Udp do
       do: send(socket, destination, packet)
 
   def send(socket, address, port, packet) do
-    with {:ok, endpoint} <- endpoint(address, port) do
-      socket_call(socket, {:send, endpoint, packet})
-    end
+    socket_call(socket, {:send, {:address_port, address, port}, packet})
   end
 
   @spec send(socket_term(), term(), term(), list(), iodata()) :: :ok | {:error, atom()}
@@ -100,12 +94,12 @@ defmodule SmolNet.InetBackend.Udp do
   def send(_socket, _address, _port, _ancillary, _packet), do: {:error, :einval}
 
   @spec recv(socket_term(), non_neg_integer()) ::
-          {:ok, {:inet.ip6_address(), :inet.port_number(), binary() | list()}}
+          {:ok, {:inet.ip_address(), :inet.port_number(), binary() | list()}}
           | {:error, atom()}
   def recv(socket, length), do: recv(socket, length, :infinity)
 
   @spec recv(socket_term(), non_neg_integer(), timeout()) ::
-          {:ok, {:inet.ip6_address(), :inet.port_number(), binary() | list()}}
+          {:ok, {:inet.ip_address(), :inet.port_number(), binary() | list()}}
           | {:error, atom()}
   def recv(socket, length, timeout)
       when is_integer(length) and length >= 0 and
@@ -117,18 +111,11 @@ defmodule SmolNet.InetBackend.Udp do
   def recv(_socket, _length, _timeout), do: {:error, :einval}
 
   @spec connect(socket_term(), map()) :: :ok | {:error, atom()}
-  def connect(socket, sockaddr) do
-    with {:ok, endpoint} <- endpoint(sockaddr) do
-      socket_call(socket, {:connect, endpoint})
-    end
-  end
+  def connect(socket, sockaddr), do: socket_call(socket, {:connect, sockaddr})
 
   @spec connect(socket_term(), term(), term()) :: :ok | {:error, atom()}
-  def connect(socket, address, port) do
-    with {:ok, endpoint} <- endpoint(address, port) do
-      socket_call(socket, {:connect, endpoint})
-    end
-  end
+  def connect(socket, address, port),
+    do: socket_call(socket, {:connect, {:address_port, address, port}})
 
   @spec close(socket_term()) :: :ok
   def close(socket) do
@@ -177,11 +164,11 @@ defmodule SmolNet.InetBackend.Udp do
   def getopts(socket, names), do: socket_call(socket, {:getopts, names})
 
   @spec sockname(socket_term()) ::
-          {:ok, {:inet.ip6_address(), :inet.port_number()}} | {:error, atom()}
+          {:ok, {:inet.ip_address(), :inet.port_number()}} | {:error, atom()}
   def sockname(socket), do: socket_call(socket, :sockname)
 
   @spec peername(socket_term()) ::
-          {:ok, {:inet.ip6_address(), :inet.port_number()}} | {:error, atom()}
+          {:ok, {:inet.ip_address(), :inet.port_number()}} | {:error, atom()}
   def peername(socket), do: socket_call(socket, :peername)
 
   @spec info(socket_term()) :: map() | {:error, atom()}
@@ -246,7 +233,7 @@ defmodule SmolNet.InetBackend.Udp do
   @impl true
   def handle_event(:internal, :continue_setup, :opening, data) do
     result =
-      with {:ok, socket} <- SmolNet.open(:inet6, :dgram, :udp, stack: data.stack),
+      with {:ok, socket} <- SmolNet.open(data.options.family, :dgram, :udp, stack: data.stack),
            :ok <- Stack.socket_watch_owner(socket, self()),
            :ok <- SmolNet.bind(socket, local_endpoint(data.options)) do
         {:ok, socket}
@@ -291,13 +278,13 @@ defmodule SmolNet.InetBackend.Udp do
         {:keep_state_and_data, [{:reply, from, {:error, :enotconn}}]}
 
       true ->
-        endpoint = if destination == :connected, do: data.peer, else: destination
+        destination = if destination == :connected, do: data.peer, else: destination
 
-        case to_binary(packet) do
-          {:ok, binary} ->
-            data = %{data | write: %{from: from, endpoint: endpoint, data: binary, select: nil}}
-            data |> drive_write() |> state_return()
-
+        with {:ok, endpoint} <- endpoint(destination, data.options.family),
+             {:ok, binary} <- to_binary(packet) do
+          data = %{data | write: %{from: from, endpoint: endpoint, data: binary, select: nil}}
+          data |> drive_write() |> state_return()
+        else
           {:error, reason} ->
             {:keep_state_and_data, [{:reply, from, {:error, reason}}]}
         end
@@ -330,11 +317,11 @@ defmodule SmolNet.InetBackend.Udp do
     end
   end
 
-  def handle_event({:call, from}, {:connect, endpoint}, :open, data) do
-    case SmolNet.connect(data.low_socket, endpoint) do
-      :ok ->
-        {:keep_state, %{data | peer: endpoint}, [{:reply, from, :ok}]}
-
+  def handle_event({:call, from}, {:connect, destination}, :open, data) do
+    with {:ok, endpoint} <- endpoint(destination, data.options.family),
+         :ok <- SmolNet.connect(data.low_socket, endpoint) do
+      {:keep_state, %{data | peer: endpoint}, [{:reply, from, :ok}]}
+    else
       {:error, reason} ->
         {:keep_state_and_data, [{:reply, from, {:error, translate_reason(reason)}}]}
     end
@@ -508,13 +495,15 @@ defmodule SmolNet.InetBackend.Udp do
   end
 
   defp local_endpoint(options) do
-    %{
-      family: :inet6,
-      addr: options.bind_address || {0, 0, 0, 0, 0, 0, 0, 0},
-      port: options.bind_port,
-      flowinfo: 0,
-      scope_id: options.bind_scope_id
+    endpoint = %{
+      family: options.family,
+      addr: options.bind_address || any_address(options.family),
+      port: options.bind_port
     }
+
+    if options.family == :inet6,
+      do: Map.merge(endpoint, %{flowinfo: 0, scope_id: options.bind_scope_id}),
+      else: endpoint
   end
 
   defp drive_write(%{write: nil} = data), do: {:keep, data}
@@ -775,20 +764,26 @@ defmodule SmolNet.InetBackend.Udp do
     put_in(data, [:read, :select], nil)
   end
 
-  defp endpoint(address, port) do
-    with {:ok, resolved} <- getaddr(address),
-         {:ok, resolved_port} <- getserv(port) do
-      endpoint(%{family: :inet6, addr: resolved, port: resolved_port})
+  defp endpoint({:address_port, address, port}, family), do: endpoint(address, port, family)
+  defp endpoint({family, {address, port}}, family), do: endpoint(address, port, family)
+
+  defp endpoint({other_family, {_address, _port}}, family)
+       when other_family in [:inet, :inet6] and other_family != family,
+       do: {:error, :eafnosupport}
+
+  defp endpoint({address, port}, family), do: endpoint(address, port, family)
+
+  defp endpoint(%{family: :inet, addr: address, port: port}, :inet)
+       when is_tuple(address) and tuple_size(address) == 4 and is_integer(port) and
+              port in 1..65_535 do
+    if address |> Tuple.to_list() |> Enum.all?(&(is_integer(&1) and &1 in 0..255)) do
+      {:ok, %{family: :inet, addr: address, port: port}}
     else
-      {:error, :einval} -> {:error, :einval}
-      {:error, _reason} = error -> error
+      {:error, :einval}
     end
   end
 
-  defp endpoint({:inet6, {address, port}}), do: endpoint(address, port)
-  defp endpoint({address, port}), do: endpoint(address, port)
-
-  defp endpoint(%{family: :inet6, addr: address, port: port} = sockaddr)
+  defp endpoint(%{family: :inet6, addr: address, port: port} = sockaddr, :inet6)
        when is_tuple(address) and tuple_size(address) == 8 and is_integer(port) and
               port in 1..65_535 do
     if address |> Tuple.to_list() |> Enum.all?(&(is_integer(&1) and &1 in 0..65_535)) do
@@ -805,10 +800,39 @@ defmodule SmolNet.InetBackend.Udp do
     end
   end
 
-  defp endpoint(%{family: family}) when family in [:inet, :inet6],
-    do: {:error, :eafnosupport}
+  defp endpoint(%{family: family}, expected)
+       when family in [:inet, :inet6] and family != expected,
+       do: {:error, :eafnosupport}
 
-  defp endpoint(_destination), do: {:error, :einval}
+  defp endpoint(_destination, _family), do: {:error, :einval}
+
+  defp endpoint(address, port, family) do
+    with {:ok, resolved} <- resolver_call(udp_module(family), :getaddr, address),
+         {:ok, resolved_port} <- resolver_call(udp_module(family), :getserv, port) do
+      endpoint(%{family: family, addr: resolved, port: resolved_port}, family)
+    else
+      {:error, :einval} -> {:error, :einval}
+      {:error, _reason} = error -> error
+    end
+  end
+
+  defp any_address(:inet), do: {0, 0, 0, 0}
+  defp any_address(:inet6), do: {0, 0, 0, 0, 0, 0, 0, 0}
+
+  defp udp_module(:inet), do: :inet_udp
+  defp udp_module(:inet6), do: :inet6_udp
+
+  defp resolver_call(module, function, argument) do
+    case apply(module, function, [argument]) do
+      {:ok, _value} = ok -> ok
+      {:error, _reason} = error -> error
+      _other -> {:error, :einval}
+    end
+  rescue
+    _error -> {:error, :einval}
+  catch
+    _kind, _reason -> {:error, :einval}
+  end
 
   defp endpoint_result({:ok, %{addr: address, port: port}}), do: {:ok, {address, port}}
   defp endpoint_result({:error, reason}), do: {:error, translate_reason(reason)}
