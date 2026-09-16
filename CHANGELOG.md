@@ -38,3 +38,6 @@ and this project adheres to
   destination metadata, connected-peer filtering, shared readiness and
   cancellation, and a supervised `gen_udp` adapter with passive, active, and
   controlling-process behavior.
+- Add IPv4 UDP parity across low-level and `gen_udp` APIs, including
+  family-specific MTU limits and checksum handling, dual-family protocol
+  coexistence, and an explicit TCP/UDP inet option contract.

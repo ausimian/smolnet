@@ -630,6 +630,9 @@ semantics.
 ## UDP considerations
 
 - TCP and UDP sockets share the same `SocketSet` and stack-driving machinery.
+- IPv4 and IPv6 UDP use one native record type, waiter path, and adapter state
+  machine. Family is immutable per socket and is validated before native
+  mutation; the IPv4 `Udp4` callback only selects `:inet` resolution.
 - UDP preserves datagram boundaries and source/destination metadata.
 - `sendto` is all-or-error at the public datagram level unless target OTP
   semantics require another explicit convention; it must not expose a partial
@@ -637,8 +640,18 @@ semantics.
 - `recvfrom` returns one datagram plus peer address metadata.
 - Native UDP packet buffers remain bounded; readiness and retry provide
   backpressure.
-- Datagram truncation behavior, zero-length datagrams, connected UDP, and
-  oversize handling must be matched to the chosen OTP-facing contract.
+- A wildcard logical socket has one exact-address smoltcp backing socket for
+  each configured address in its family, bounded by the eight-address stack
+  limit. This prevents smoltcp's family-neutral wildcard endpoint from routing
+  an IPv4 datagram into an IPv6 socket (or the reverse). The backing sockets
+  share one public identity and waiter, and one receive call inspects at most
+  the fixed packet-capacity bound across them.
+- A zero-length datagram is distinct from no datagram. A positive receive
+  length truncates one datagram and discards its remainder. Connected UDP
+  rejects a different send destination and filters packets from other peers.
+- Maximum payload is the smaller of the 16 KiB payload ring and MTU minus 28
+  bytes for IPv4 or 48 bytes for IPv6. IPv4 accepts its standard zero UDP
+  checksum; invalid nonzero checksums and invalid IPv6 checksums are discarded.
 
 ## Detailed operation sequencing
 

@@ -78,9 +78,10 @@ defmodule SmolNet do
   defdelegate cancel(socket, select_info), to: Socket
 
   @doc """
-  Opens a bounded low-level TCP stream or IPv6 UDP datagram socket on `stack`.
+  Opens a bounded low-level TCP stream or UDP datagram socket on `stack`.
 
-  Family and kind are explicit and immutable. IPv4 UDP remains unsupported.
+  Family and kind are explicit and immutable. TCP and UDP support both IPv4
+  and IPv6.
   """
   @spec open(:inet6 | :inet, :stream | :dgram, :tcp | :udp, keyword()) ::
           {:ok, Socket.t()} | {:error, atom()}
@@ -176,27 +177,33 @@ defmodule SmolNet do
           | {:error, atom() | {atom(), binary()}}
   defdelegate recv(socket, length, timeout_or_nowait), to: Socket
 
-  @doc "Sends one complete IPv6 UDP datagram, waiting indefinitely by default."
-  @spec sendto(Socket.t(), iodata(), Socket.sockaddr_in6()) :: :ok | {:error, atom()}
+  @doc "Sends one complete UDP datagram, waiting indefinitely by default."
+  @spec sendto(Socket.t(), iodata(), Socket.sockaddr_in() | Socket.sockaddr_in6()) ::
+          :ok | {:error, atom()}
   defdelegate sendto(socket, data, address), to: Socket
 
   @doc """
-  Sends one complete IPv6 UDP datagram with a finite, infinite, or nonblocking timeout.
+  Sends one complete UDP datagram with a finite, infinite, or nonblocking timeout.
 
   The datagram is either accepted in full or not accepted. `:nowait` returns a
   write-direction select hint when the bounded native transmit ring is full.
   """
-  @spec sendto(Socket.t(), iodata(), Socket.sockaddr_in6(), :nowait | timeout()) ::
+  @spec sendto(
+          Socket.t(),
+          iodata(),
+          Socket.sockaddr_in() | Socket.sockaddr_in6(),
+          :nowait | timeout()
+        ) ::
           :ok | {:select, :socket.select_info()} | {:error, atom()}
   defdelegate sendto(socket, data, address, timeout_or_nowait), to: Socket
 
-  @doc "Receives one IPv6 UDP datagram, waiting indefinitely by default."
+  @doc "Receives one UDP datagram, waiting indefinitely by default."
   @spec recvfrom(Socket.t(), non_neg_integer()) ::
           {:ok, Socket.datagram()} | {:error, atom()}
   defdelegate recvfrom(socket, length), to: Socket
 
   @doc """
-  Receives one IPv6 UDP datagram with a finite, infinite, or nonblocking timeout.
+  Receives one UDP datagram with a finite, infinite, or nonblocking timeout.
 
   Length zero returns the complete datagram. A positive length truncates a
   larger datagram, discards its remainder, and sets `truncated: true`. Source

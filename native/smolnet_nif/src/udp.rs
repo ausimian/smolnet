@@ -7,24 +7,33 @@ use crate::waiter::SocketIdentity;
 pub const PACKET_CAPACITY: usize = 16;
 pub const PAYLOAD_BYTES: usize = 16 * 1024;
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct UdpRecord {
     pub identity: SocketIdentity,
-    pub handle: SocketHandle,
+    pub handles: Vec<SocketHandle>,
     pub family: AddressFamily,
     pub local: Option<ValidatedEndpoint>,
     pub peer: Option<ValidatedEndpoint>,
+    pub receive_cursor: usize,
 }
 
 impl UdpRecord {
     pub fn new(identity: SocketIdentity, handle: SocketHandle, family: AddressFamily) -> Self {
         Self {
             identity,
-            handle,
+            handles: vec![handle],
             family,
             local: None,
             peer: None,
+            receive_cursor: 0,
         }
+    }
+
+    pub fn primary_handle(&self) -> SocketHandle {
+        *self
+            .handles
+            .first()
+            .expect("every live UDP record has a native backing socket")
     }
 }
 
@@ -41,13 +50,18 @@ pub fn socket() -> udp::Socket<'static> {
     udp::Socket::new(receive, transmit)
 }
 
-pub fn max_datagram_bytes(mtu: usize) -> usize {
-    mtu.saturating_sub(48).min(PAYLOAD_BYTES)
+pub fn max_datagram_bytes(mtu: usize, family: AddressFamily) -> usize {
+    let header_bytes = match family {
+        AddressFamily::Inet => 28,
+        AddressFamily::Inet6 => 48,
+    };
+
+    mtu.saturating_sub(header_bytes).min(PAYLOAD_BYTES)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{PACKET_CAPACITY, PAYLOAD_BYTES, max_datagram_bytes, socket};
+    use super::{AddressFamily, PACKET_CAPACITY, PAYLOAD_BYTES, max_datagram_bytes, socket};
     use smoltcp::socket::udp::SendError;
     use smoltcp::wire::{IpAddress, IpEndpoint, Ipv6Address};
 
@@ -59,8 +73,16 @@ mod tests {
         assert_eq!(socket.packet_send_capacity(), PACKET_CAPACITY);
         assert_eq!(socket.payload_recv_capacity(), PAYLOAD_BYTES);
         assert_eq!(socket.payload_send_capacity(), PAYLOAD_BYTES);
-        assert_eq!(max_datagram_bytes(1_500), 1_452);
-        assert_eq!(max_datagram_bytes(65_575), PAYLOAD_BYTES);
+        assert_eq!(max_datagram_bytes(1_500, AddressFamily::Inet6), 1_452);
+        assert_eq!(max_datagram_bytes(1_500, AddressFamily::Inet), 1_472);
+        assert_eq!(
+            max_datagram_bytes(65_575, AddressFamily::Inet6),
+            PAYLOAD_BYTES
+        );
+        assert_eq!(
+            max_datagram_bytes(65_575, AddressFamily::Inet),
+            PAYLOAD_BYTES
+        );
     }
 
     #[test]

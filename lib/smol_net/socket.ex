@@ -48,8 +48,8 @@ defmodule SmolNet.Socket do
         }
 
   @type datagram :: %{
-          required(:source) => sockaddr_in6(),
-          required(:destination) => sockaddr_in6(),
+          required(:source) => sockaddr_in() | sockaddr_in6(),
+          required(:destination) => sockaddr_in() | sockaddr_in6(),
           required(:data) => binary(),
           required(:truncated) => boolean()
         }
@@ -61,16 +61,14 @@ defmodule SmolNet.Socket do
   def open(family, :stream, :tcp, stack: stack) when family in [:inet, :inet6],
     do: Stack.socket_open(stack, family, :stream)
 
-  def open(:inet6, :dgram, :udp, stack: stack),
-    do: Stack.socket_open(stack, :inet6, :datagram)
-
-  def open(:inet, :dgram, :udp, _options),
-    do: {:error, :unsupported_family}
+  def open(family, :dgram, :udp, stack: stack) when family in [:inet, :inet6],
+    do: Stack.socket_open(stack, family, :datagram)
 
   def open(family, :stream, :tcp, _options) when family in [:inet, :inet6],
     do: {:error, :invalid_options}
 
-  def open(:inet6, :dgram, :udp, _options), do: {:error, :invalid_options}
+  def open(family, :dgram, :udp, _options) when family in [:inet, :inet6],
+    do: {:error, :invalid_options}
 
   def open(family, _type, _protocol, _options) when family in [:inet, :inet6],
     do: {:error, :unsupported_socket}
@@ -263,11 +261,11 @@ defmodule SmolNet.Socket do
   def recv(_socket, _length, _timeout), do: {:error, :invalid_socket}
 
   @doc false
-  @spec sendto(t(), iodata(), sockaddr_in6()) :: :ok | {:error, atom()}
+  @spec sendto(t(), iodata(), sockaddr_in() | sockaddr_in6()) :: :ok | {:error, atom()}
   def sendto(socket, data, address), do: sendto(socket, data, address, :infinity)
 
   @doc false
-  @spec sendto(t(), iodata(), sockaddr_in6(), :nowait | timeout()) ::
+  @spec sendto(t(), iodata(), sockaddr_in() | sockaddr_in6(), :nowait | timeout()) ::
           :ok | {:select, :socket.select_info()} | {:error, atom()}
   def sendto(%__MODULE__{kind: :datagram} = socket, data, address, :nowait) do
     with true <- valid?(socket),

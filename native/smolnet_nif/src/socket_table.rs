@@ -568,7 +568,6 @@ pub enum SocketError {
     InvalidOperation,
     Busy,
     SystemLimit,
-    UnsupportedFamily,
     InvalidAddress,
     InvalidPort,
     InvalidBacklog,
