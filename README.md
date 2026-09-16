@@ -4,12 +4,12 @@ SmolNet is an Elixir library that embeds the Rust
 [`smoltcp`](https://github.com/smoltcp-rs/smoltcp) TCP/IP stack behind a
 deliberately small Rustler NIF.
 
-The project is under initial development. Phase 6 provides independent raw-IP
+The project is under initial development. Phase 7 provides independent raw-IP
 IPv6 stacks plus low-level IPv6 TCP open, bind, connect, bounded stream I/O,
-half-close, endpoint queries, cancellation, and graceful close. Outbound IPv6
-TCP is also available through `:gen_tcp` with passive and active delivery,
-bounded packet framing, and normal controlling-process ownership. Listening,
-IPv4, and UDP arrive in later phases.
+listen, accept, half-close, endpoint queries, cancellation, and graceful close.
+IPv6 TCP clients and servers are also available through `:gen_tcp` with passive
+and active delivery, bounded packet framing, and normal controlling-process
+ownership. IPv4 and UDP arrive in later phases.
 
 `SmolNet.start_stack/1` creates an independent native stack and returns an
 opaque reference. A transport-neutral link process supplies complete IPv6
@@ -46,8 +46,10 @@ supervision bundle.
 Low-level socket values are lightweight `%SmolNet.Socket{}` structs. Native
 socket IDs and generations are globally monotonic, never reused, and capped at
 `2^59 - 1` so they remain immediate integers on the supported 64-bit BEAM
-targets. Each stack also caps live socket entries at its `:ready_events` limit;
-opening beyond that bound returns `{:error, :system_limit}`. A blocked
+targets. Each stack also caps live public socket entries at its `:ready_events`
+limit; opening or promoting an accepted child beyond that bound returns or
+applies the documented bounded-overflow policy. A listener may own up to four
+additional internal pool sockets per public listener identity. A blocked
 nonblocking operation returns `{:select_info, operation, reference}`; its
 one-shot message has this shape:
 
@@ -111,7 +113,8 @@ error follows partial progress, send returns the unsent remainder and receive
 returns accumulated data in `{reason, continuation}`.
 
 Each TCP socket has fixed 4096-byte native RX and TX buffers. Automatic ports
-come from the bounded `49152..50175` range and are unique within one stack.
+come from the bounded `49152..50175` range. Bind reservations are unique within
+one stack; accepted children intentionally retain their listener's local port.
 Link-local `fe80::/10` endpoints require a positive integer `scope_id`; global
 addresses use scope zero. The native layer never stores arbitrary unsent
 payloads or exact-receive accumulation. Established close invalidates the
@@ -121,7 +124,42 @@ the close call; closing records continue to count against the socket limit.
 The public module documentation lists the stable validation, timeout,
 connection, stream, lifecycle, and handle errors.
 
-## `gen_tcp` IPv6 clients
+## Low-level IPv6 TCP listeners
+
+A bound stream socket becomes a reusable listener with `SmolNet.listen/2`.
+Backlogs are integers in `1..128`. Each listener maintains
+`min(backlog, 4)` native listening sockets so one `smoltcp` socket can be
+promoted into a connected child without pretending that it remains reusable.
+Every promoted child receives a fresh public socket ID and generation, and the
+native pool is replenished. Half-open handshakes expire after 30 seconds and
+their pool slots are replenished from timer-driven maintenance.
+
+```elixir
+{:ok, listener} = SmolNet.open(:inet6, :stream, :tcp, stack: stack)
+:ok = SmolNet.bind(listener, %{family: :inet6, addr: local, port: 8080})
+:ok = SmolNet.listen(listener, 16)
+
+{:ok, child} = SmolNet.accept(listener, 5_000)
+{:ok, request} = SmolNet.recv(child, 0, 5_000)
+:ok = SmolNet.send(child, request, 5_000)
+```
+
+`SmolNet.accept/2` supports finite and infinite waits plus `:nowait`, using the
+same read-direction select/cancel contract as receive. The accepted-child queue
+never exceeds the requested backlog. If another connection becomes established
+while that queue is full—or the public socket table cannot allocate its child
+identity—the newest child is dropped and its pool slot is replenished. The peer
+may observe handshake completion first; its next traffic receives a reset from
+the now-unmatched connection. Listener scans and replenishment are charged to
+the stack's `maintenance_work` bound and expose pool, queue, promotion, refill,
+and overflow metrics through `SmolNet.stack_info/1`.
+
+Closing a listener aborts a pending accept and immediately releases queued
+children and listening or half-open pool members. Already-returned children are
+independent and remain usable. Stack shutdown releases both listener and child
+state.
+
+## `gen_tcp` IPv6 clients and servers
 
 Select the SmolNet backend with `{:tcp_module, SmolNet.InetBackend.Tcp}` and
 identify the target stack with `{:smolnet_stack, stack}`. The returned socket
@@ -145,6 +183,19 @@ options = [
 :ok = :gen_tcp.close(socket)
 ```
 
+The same options can create a server. `backlog` defaults to 5 and accepts
+values in `1..128`; accepted sockets inherit the listener's supported active,
+mode, packet, packet-size, receive-buffer, and send-timeout options.
+
+```elixir
+server_options = [{:backlog, 16} | options]
+
+{:ok, listener} = :gen_tcp.listen(8080, server_options)
+{:ok, socket} = :gen_tcp.accept(listener, 5_000)
+{:ok, request} = :gen_tcp.recv(socket, 0, 5_000)
+:ok = :gen_tcp.send(socket, request)
+```
+
 The adapter supports `:binary` and `:list`, packet modes `:raw`, `:line`, `1`,
 `2`, and `4`, and `active: false | true | :once | N` for `N` in
 `1..32_767`. Counted active mode counts complete logical packets and emits
@@ -162,8 +213,9 @@ Each OTP socket is a temporary process under its stack bundle. The controlling
 process owns active messages, and `:gen_tcp.controlling_process/2` transfers
 queued and future messages in order. Owner death, adapter death, or stack
 failure closes the low-level socket without affecting independent stack
-bundles. This phase deliberately reports IPv4 as `:eafnosupport` and
-listen/accept as `:enotsup`.
+bundles. A listener has its own adapter state, while each accepted child gets a
+separate connected-stream adapter owned by the process that called
+`:gen_tcp.accept/2`. This phase deliberately reports IPv4 as `:eafnosupport`.
 
 ## Development
 

@@ -36,6 +36,7 @@ mod atoms {
         unsupported_socket,
         invalid_address,
         invalid_port,
+        invalid_backlog,
         scope_required,
         invalid_scope,
         address_in_use,
@@ -152,6 +153,22 @@ fn socket_cancel<'a>(
 }
 
 #[rustler::nif]
+fn socket_validate<'a>(
+    env: Env<'a>,
+    resource: ResourceArc<StackResource>,
+    identity: SocketIdentity,
+) -> Term<'a> {
+    let result = catch_operation(|| {
+        resource
+            .with_stack(|stack| stack.socket_validate(env, identity))
+            .map_err(|_| atoms::ownership_invariant_violation())?
+            .map_err(socket_error_atom)
+    });
+
+    encode_envelope_result(env, result)
+}
+
+#[rustler::nif]
 fn tcp_open<'a>(env: Env<'a>, resource: ResourceArc<StackResource>) -> Term<'a> {
     let result = catch_operation(|| {
         resource
@@ -174,6 +191,45 @@ fn tcp_bind<'a>(
         let endpoint = decode_tcp_endpoint(endpoint_term).map_err(socket_error_atom)?;
         resource
             .with_stack(|stack| stack.tcp_bind(env, identity, endpoint))
+            .map_err(|_| atoms::ownership_invariant_violation())?
+            .map_err(socket_error_atom)
+    });
+
+    encode_envelope_result(env, result)
+}
+
+#[rustler::nif]
+fn tcp_listen<'a>(
+    env: Env<'a>,
+    resource: ResourceArc<StackResource>,
+    identity: SocketIdentity,
+    backlog: usize,
+    now_millis: i64,
+) -> Term<'a> {
+    let result = catch_operation(|| {
+        let now = time::instant_from_millis(now_millis).map_err(|_| atoms::time_overflow())?;
+        resource
+            .with_stack(|stack| stack.tcp_listen(env, identity, backlog, now))
+            .map_err(|_| atoms::ownership_invariant_violation())?
+            .map_err(socket_error_atom)
+    });
+
+    encode_envelope_result(env, result)
+}
+
+#[rustler::nif]
+fn tcp_accept<'a>(
+    env: Env<'a>,
+    resource: ResourceArc<StackResource>,
+    identity: SocketIdentity,
+    pid: LocalPid,
+    reference: Reference<'a>,
+    now_millis: i64,
+) -> Term<'a> {
+    let result = catch_operation(|| {
+        let now = time::instant_from_millis(now_millis).map_err(|_| atoms::time_overflow())?;
+        resource
+            .with_stack(|stack| stack.tcp_accept(env, identity, pid, reference, now))
             .map_err(|_| atoms::ownership_invariant_violation())?
             .map_err(socket_error_atom)
     });
@@ -525,6 +581,7 @@ fn socket_error_atom(error: SocketError) -> Atom {
         SocketError::SystemLimit => atoms::system_limit(),
         SocketError::InvalidAddress => atoms::invalid_address(),
         SocketError::InvalidPort => atoms::invalid_port(),
+        SocketError::InvalidBacklog => atoms::invalid_backlog(),
         SocketError::ScopeRequired => atoms::scope_required(),
         SocketError::InvalidScope => atoms::invalid_scope(),
         SocketError::AddressInUse => atoms::address_in_use(),

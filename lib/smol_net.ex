@@ -18,7 +18,8 @@ defmodule SmolNet do
 
   Stable validation and bind errors are `:unsupported_family`,
   `:unsupported_socket`, `:invalid_options`, `:invalid_address`,
-  `:invalid_port`, `:invalid_data`, `:invalid_length`, `:invalid_timeout`,
+  `:invalid_port`, `:invalid_backlog`, `:invalid_data`, `:invalid_length`,
+  `:invalid_timeout`,
   `:invalid_how`, `:scope_required`, `:invalid_scope`, `:address_in_use`,
   `:address_not_available`, and `:ephemeral_ports_exhausted`. Connection and
   stream lifecycle errors are
@@ -93,6 +94,30 @@ defmodule SmolNet do
   """
   @spec bind(Socket.t(), Socket.sockaddr_in6()) :: :ok | {:error, atom()}
   defdelegate bind(socket, address), to: Socket
+
+  @doc """
+  Turns a bound IPv6 TCP socket into a reusable bounded listener.
+
+  Backlog must be in `1..128`. The accepted-child queue is capped at that
+  value, while the native listening pool is capped at four sockets.
+  """
+  @spec listen(Socket.t(), pos_integer()) :: :ok | {:error, atom()}
+  defdelegate listen(socket, backlog), to: Socket
+
+  @doc "Accepts an IPv6 TCP child, waiting indefinitely by default."
+  @spec accept(Socket.t()) :: {:ok, Socket.t()} | {:error, atom()}
+  defdelegate accept(listener), to: Socket
+
+  @doc """
+  Accepts with a finite, infinite, or nonblocking timeout.
+
+  `:nowait` returns a read-direction `{:select, select_info}` retry hint. Each
+  accepted child has a fresh stable identity and is independent of the
+  listener after it is returned.
+  """
+  @spec accept(Socket.t(), :nowait | timeout()) ::
+          {:ok, Socket.t()} | {:select, :socket.select_info()} | {:error, atom()}
+  defdelegate accept(listener, timeout_or_nowait), to: Socket
 
   @doc "Connects an IPv6 TCP socket, waiting indefinitely by default."
   @spec connect(Socket.t(), Socket.sockaddr_in6()) :: :ok | {:error, atom()}

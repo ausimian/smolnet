@@ -28,3 +28,6 @@ and this project adheres to
 - Add an outbound IPv6 `gen_tcp` backend with passive and bounded active modes,
   raw, line, and length-prefixed framing, binary/list representation, socket
   ownership transfer, adapter deadlines, and isolated lifecycle cleanup.
+- Add bounded reusable IPv6 TCP listeners, low-level and `gen_tcp` accept,
+  stable accepted-child identities, inherited inet options, explicit backlog
+  overflow behavior, and race-safe listener, queue, and half-open cleanup.

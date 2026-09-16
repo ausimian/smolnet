@@ -78,6 +78,35 @@ defmodule SmolNet.Stack do
   end
 
   @doc false
+  @spec socket_listen(Socket.t(), pos_integer()) :: :ok | {:error, atom()}
+  def socket_listen(%Socket{stack: stack, id: id, generation: generation}, backlog) do
+    GenServer.call(stack, {:socket_listen, id, generation, backlog})
+  catch
+    :exit, _reason -> {:error, :closed}
+  end
+
+  @doc false
+  @spec socket_accept(Socket.t()) ::
+          {:ok, Socket.t()} | {:select, :socket.select_info()} | {:error, atom()}
+  def socket_accept(%Socket{stack: stack, id: id, generation: generation}) do
+    reference = make_ref()
+    GenServer.call(stack, {:socket_accept, id, generation, reference})
+  catch
+    :exit, _reason -> {:error, :closed}
+  end
+
+  @doc false
+  @spec socket_accept(Socket.t(), pid()) ::
+          {:ok, Socket.t()} | {:select, :socket.select_info()} | {:error, atom()}
+  def socket_accept(%Socket{stack: stack, id: id, generation: generation}, owner)
+      when is_pid(owner) do
+    reference = make_ref()
+    GenServer.call(stack, {:socket_accept_owned, id, generation, reference, owner})
+  catch
+    :exit, _reason -> {:error, :closed}
+  end
+
+  @doc false
   @spec socket_connect(Socket.t(), map()) ::
           :ok | {:select, :socket.select_info()} | {:error, atom()}
   def socket_connect(%Socket{stack: stack, id: id, generation: generation}, endpoint) do
@@ -258,7 +287,8 @@ defmodule SmolNet.Stack do
       dropped_egress: 0,
       native_continuation: false,
       pending_ingress: nil,
-      socket_owner_monitors: %{}
+      socket_owner_monitors: %{},
+      socket_owner_monitors_by_identity: %{}
     }
 
     {:ok, state, {:continue, :create_native_stack}}
@@ -347,7 +377,13 @@ defmodule SmolNet.Stack do
         {:noreply, state}
 
       {identity, monitors} ->
-        state = %{state | socket_owner_monitors: monitors}
+        state = %{
+          state
+          | socket_owner_monitors: monitors,
+            socket_owner_monitors_by_identity:
+              Map.delete(state.socket_owner_monitors_by_identity, identity_key(identity))
+        }
+
         close_owned_socket(state, identity)
     end
   end
@@ -421,6 +457,46 @@ defmodule SmolNet.Stack do
     |> reply_native(state, &Function.identity/1, :preserve_timer)
   end
 
+  def handle_call({:socket_listen, id, generation, backlog}, _from, state) do
+    state.native_module.tcp_listen(
+      state.native,
+      %{id: id, generation: generation},
+      backlog,
+      state.clock.now()
+    )
+    |> reply_native(state)
+  end
+
+  def handle_call(
+        {:socket_accept, id, generation, reference},
+        {caller, _tag},
+        state
+      ) do
+    state.native_module.tcp_accept(
+      state.native,
+      %{id: id, generation: generation},
+      caller,
+      reference,
+      state.clock.now()
+    )
+    |> reply_native(state, &normalize_accept_result(&1, self()))
+  end
+
+  def handle_call(
+        {:socket_accept_owned, id, generation, reference, owner},
+        {caller, _tag},
+        state
+      ) do
+    state.native_module.tcp_accept(
+      state.native,
+      %{id: id, generation: generation},
+      caller,
+      reference,
+      state.clock.now()
+    )
+    |> reply_owned_accept(state, owner)
+  end
+
   def handle_call(
         {:socket_connect, id, generation, endpoint, reference},
         {caller, _tag},
@@ -490,19 +566,31 @@ defmodule SmolNet.Stack do
   end
 
   def handle_call({:socket_close, id, generation}, _from, state) do
-    state.native_module.tcp_close(
-      state.native,
-      %{id: id, generation: generation},
-      state.clock.now()
-    )
-    |> reply_native(state)
+    identity = %{id: id, generation: generation}
+
+    case state.native_module.tcp_close(state.native, identity, state.clock.now()) do
+      {:ok, envelope} ->
+        state = state |> unwatch_socket_owner(identity) |> apply_effects(envelope)
+        {:reply, Map.fetch!(envelope, :result), state}
+
+      {:error, reason} ->
+        {:reply, {:error, reason}, state}
+    end
   end
 
   def handle_call({:socket_watch_owner, id, generation, owner}, _from, state) do
-    monitor = Process.monitor(owner)
     identity = %{id: id, generation: generation}
-    monitors = Map.put(state.socket_owner_monitors, monitor, identity)
-    {:reply, :ok, %{state | socket_owner_monitors: monitors}}
+
+    case state.native_module.socket_validate(state.native, identity) do
+      {:ok, envelope} ->
+        state =
+          state |> apply_effects(envelope, :preserve_timer) |> watch_socket_owner(identity, owner)
+
+        {:reply, :ok, state}
+
+      {:error, reason} ->
+        {:reply, {:error, reason}, state}
+    end
   end
 
   def handle_call({:test_socket_open, internal_handle}, _from, state) do
@@ -768,11 +856,34 @@ defmodule SmolNet.Stack do
     {:reply, {:error, reason}, state}
   end
 
+  defp reply_owned_accept({:ok, envelope}, state, owner) do
+    case Map.fetch!(envelope, :result) do
+      {:ok, identity} ->
+        state = state |> apply_effects(envelope) |> watch_socket_owner(identity, owner)
+        {:reply, {:ok, Socket.new(self(), identity)}, state}
+
+      result ->
+        {:reply, normalize_accept_result(result, self()), apply_effects(state, envelope)}
+    end
+  end
+
+  defp reply_owned_accept({:error, reason}, state, _owner) do
+    {:reply, {:error, reason}, state}
+  end
+
   defp normalize_wait_result(:ready), do: :ready
   defp normalize_wait_result(:ok), do: :ok
 
   defp normalize_wait_result({:select, operation, reference}) do
     {:select, {:select_info, operation, reference}}
+  end
+
+  defp normalize_accept_result({:ok, identity}, stack) do
+    {:ok, Socket.new(stack, identity)}
+  end
+
+  defp normalize_accept_result({:select, :accept, reference}, _stack) do
+    {:select, {:select_info, :accept, reference}}
   end
 
   defp normalize_send_result(:ok, _data), do: :ok
@@ -794,4 +905,37 @@ defmodule SmolNet.Stack do
   end
 
   defp normalize_endpoint(endpoint), do: {:ok, Socket.endpoint_from_native(endpoint)}
+
+  defp watch_socket_owner(state, identity, owner) do
+    state = unwatch_socket_owner(state, identity)
+    key = identity_key(identity)
+    monitor = Process.monitor(owner)
+
+    %{
+      state
+      | socket_owner_monitors: Map.put(state.socket_owner_monitors, monitor, identity),
+        socket_owner_monitors_by_identity:
+          Map.put(state.socket_owner_monitors_by_identity, key, monitor)
+    }
+  end
+
+  defp unwatch_socket_owner(state, identity) do
+    key = identity_key(identity)
+
+    case Map.pop(state.socket_owner_monitors_by_identity, key) do
+      {nil, _monitors_by_identity} ->
+        state
+
+      {monitor, monitors_by_identity} ->
+        Process.demonitor(monitor, [:flush])
+
+        %{
+          state
+          | socket_owner_monitors: Map.delete(state.socket_owner_monitors, monitor),
+            socket_owner_monitors_by_identity: monitors_by_identity
+        }
+    end
+  end
+
+  defp identity_key(%{id: id, generation: generation}), do: {id, generation}
 end

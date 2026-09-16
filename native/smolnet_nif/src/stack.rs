@@ -1,13 +1,13 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::ops::Bound::{Excluded, Unbounded};
+use std::ops::Bound::{Excluded, Included, Unbounded};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Mutex, TryLockError};
 
 use rustler::{
     Atom, Encoder, Env, LocalPid, NewBinary, NifMap, Reference, Resource, ResourceArc, Term,
 };
-use smoltcp::iface::{Config, Interface, PollResult, Route, SocketSet};
-use smoltcp::socket::tcp::{self, ConnectError};
+use smoltcp::iface::{Config, Interface, PollResult, Route, SocketHandle, SocketSet};
+use smoltcp::socket::tcp::{self, ConnectError, ListenError};
 use smoltcp::time::Duration;
 use smoltcp::time::Instant;
 use smoltcp::wire::{
@@ -22,8 +22,8 @@ use crate::socket_table::{
     WaiterRegistration,
 };
 use crate::tcp::{
-    self as tcp_support, ConnectFailure, ConnectPhase, EncodedEndpoint, ShutdownHow, TcpEndpoint,
-    TcpRecord, ValidatedEndpoint,
+    self as tcp_support, ConnectFailure, ConnectPhase, EncodedEndpoint, ListenerRecord,
+    ShutdownHow, TcpEndpoint, TcpRecord, ValidatedEndpoint,
 };
 use crate::waiter::{
     ArmPoint, Direction, Operation, ReadinessCounters, ReadyKey, ReadyQueue, SocketIdentity, Waiter,
@@ -96,6 +96,7 @@ pub struct NativeStack {
     device: BeamDevice,
     socket_table: SocketTable,
     tcp_records: BTreeMap<u64, TcpRecord>,
+    tcp_listeners: BTreeMap<u64, ListenerRecord>,
     tcp_connections: BTreeMap<ConnectionKey, SocketIdentity>,
     closing_tcp: BTreeSet<u64>,
     closing_deadlines: BTreeSet<(Instant, u64)>,
@@ -104,6 +105,10 @@ pub struct NativeStack {
     closing_cleanup_resweep: bool,
     maintenance_cleanup_turn: bool,
     next_ephemeral_port: u16,
+    listener_scan_cursor: Option<ListenerMemberKey>,
+    listener_scan_pending: bool,
+    listener_scan_resweep: bool,
+    listener_maintenance_turn: bool,
     ready: ReadyQueue,
     ready_sweep: bool,
     ready_sweep_cursor: Option<ReadyKey>,
@@ -152,6 +157,7 @@ impl NativeStack {
             device,
             socket_table: SocketTable::new(limits.ready_events, limits.ready_events),
             tcp_records: BTreeMap::new(),
+            tcp_listeners: BTreeMap::new(),
             tcp_connections: BTreeMap::new(),
             closing_tcp: BTreeSet::new(),
             closing_deadlines: BTreeSet::new(),
@@ -160,6 +166,10 @@ impl NativeStack {
             closing_cleanup_resweep: false,
             maintenance_cleanup_turn: false,
             next_ephemeral_port: tcp_support::EPHEMERAL_PORT_FIRST,
+            listener_scan_cursor: None,
+            listener_scan_pending: false,
+            listener_scan_resweep: false,
+            listener_maintenance_turn: true,
             ready: ReadyQueue::new((limits.ready_events / 2).max(1)),
             ready_sweep: false,
             ready_sweep_cursor: None,
@@ -174,6 +184,26 @@ impl NativeStack {
     pub fn snapshot(&self) -> Envelope<Snapshot> {
         let (receive_packets, transmit_packets) = self.device.queued_packets();
         let (read_waiters, write_waiters) = self.socket_table.waiter_counts();
+        let listener_pool_socket_count = self
+            .tcp_listeners
+            .values()
+            .map(|listener| listener.pool.len())
+            .sum();
+        let listener_pool_target_count = self
+            .tcp_listeners
+            .values()
+            .map(|listener| listener.pool_target)
+            .sum();
+        let accepted_queue_count = self
+            .tcp_listeners
+            .values()
+            .map(|listener| listener.accepted.len())
+            .sum();
+        let listener_backlog_capacity = self
+            .tcp_listeners
+            .values()
+            .map(|listener| listener.backlog)
+            .sum();
 
         Envelope {
             result: Snapshot {
@@ -182,6 +212,11 @@ impl NativeStack {
                 socket_count: self.socket_table.len(),
                 native_socket_count: self.sockets.iter().count(),
                 tcp_socket_count: self.tcp_records.len(),
+                tcp_listener_count: self.tcp_listeners.len(),
+                listener_pool_socket_count,
+                listener_pool_target_count,
+                accepted_queue_count,
+                listener_backlog_capacity,
                 closing_tcp_socket_count: self.closing_tcp.len(),
                 tcp_buffer_bytes: tcp_support::BUFFER_BYTES,
                 waiter_count: self.socket_table.waiter_count(),
@@ -237,6 +272,16 @@ impl NativeStack {
         Ok(self.finish_call(env, identity, Effects::empty(), Vec::new()))
     }
 
+    pub fn socket_validate(
+        &mut self,
+        env: Env<'_>,
+        identity: SocketIdentity,
+    ) -> Result<Envelope<Atom>, SocketError> {
+        self.ensure_running()?;
+        self.socket_table.validate(identity, SocketKind::Tcp)?;
+        Ok(self.finish_call(env, crate::atoms::ok(), Effects::empty(), Vec::new()))
+    }
+
     pub fn tcp_bind(
         &mut self,
         env: Env<'_>,
@@ -273,6 +318,120 @@ impl NativeStack {
         record.local_scope_id = endpoint.scope_id;
 
         Ok(self.finish_call(env, crate::atoms::ok(), Effects::empty(), Vec::new()))
+    }
+
+    pub fn tcp_listen(
+        &mut self,
+        env: Env<'_>,
+        identity: SocketIdentity,
+        backlog: usize,
+        now: Instant,
+    ) -> Result<Envelope<Atom>, SocketError> {
+        self.ensure_running()?;
+        self.socket_table.validate(identity, SocketKind::Tcp)?;
+
+        if !(1..=tcp_support::LISTENER_BACKLOG_MAX).contains(&backlog) {
+            return Err(SocketError::InvalidBacklog);
+        }
+
+        if self.tcp_listeners.contains_key(&identity.id) {
+            return Err(SocketError::InvalidState);
+        }
+
+        let record = *self.tcp_record(identity)?;
+
+        if record.phase != ConnectPhase::Bound {
+            return Err(SocketError::NotBound);
+        }
+
+        let local = record.local.ok_or(SocketError::NotBound)?;
+        let IpAddress::Ipv6(address) = local.addr;
+        let endpoint = ValidatedEndpoint {
+            address,
+            port: local.port,
+            scope_id: record.local_scope_id,
+        };
+        let pool_target = backlog.min(tcp_support::LISTENER_POOL_MAX);
+        let mut handles = vec![record.handle];
+
+        for _ in 1..pool_target {
+            handles.push(self.sockets.add(tcp_support::socket()));
+        }
+
+        for handle in &handles {
+            let socket = self.sockets.get_mut::<tcp::Socket<'static>>(*handle);
+            socket.set_timeout(Some(Duration::from_millis(
+                tcp_support::CONNECT_TIMEOUT_MILLIS,
+            )));
+
+            match socket.listen(endpoint.listen_endpoint()) {
+                Ok(()) => {}
+                Err(ListenError::InvalidState) => return Err(SocketError::InvalidState),
+                Err(ListenError::Unaddressable) => return Err(SocketError::InvalidAddress),
+            }
+        }
+
+        self.remove_tcp_record(record);
+        self.tcp_listeners.insert(
+            identity.id,
+            ListenerRecord::new(identity, endpoint, local, backlog, handles),
+        );
+        self.request_listener_scan();
+
+        let effects = self
+            .drive(now, None)
+            .expect("TCP listen without ingress cannot fail");
+        Ok(self.finish_call(env, crate::atoms::ok(), effects, Vec::new()))
+    }
+
+    pub fn tcp_accept<'a>(
+        &mut self,
+        env: Env<'a>,
+        identity: SocketIdentity,
+        pid: LocalPid,
+        reference: Reference<'a>,
+        now: Instant,
+    ) -> Result<Envelope<Term<'a>>, SocketError> {
+        self.ensure_running()?;
+        self.socket_table.validate(identity, SocketKind::Tcp)?;
+
+        if self
+            .tcp_listeners
+            .get(&identity.id)
+            .is_none_or(|listener| listener.identity != identity)
+        {
+            return if self.tcp_records.contains_key(&identity.id) {
+                Err(SocketError::InvalidState)
+            } else {
+                Err(SocketError::InvalidSocket)
+            };
+        }
+
+        if self
+            .socket_table
+            .has_waiter(identity, SocketKind::Tcp, Direction::Read)?
+        {
+            return Err(SocketError::Busy);
+        }
+
+        self.request_listener_scan();
+        let (scan_work, scan_more) = self.refresh_listeners(self.limits.maintenance_work);
+        let accepted = self
+            .tcp_listeners
+            .get_mut(&identity.id)
+            .and_then(|listener| listener.accepted.pop_front());
+
+        let result = if let Some(child) = accepted {
+            (crate::atoms::ok(), child).encode(env)
+        } else {
+            self.arm_listener_waiter(env, identity, pid, reference)?;
+            (crate::atoms::select(), Operation::Accept, reference).encode(env)
+        };
+
+        let mut effects = self.current_effects(now);
+        effects.more |= scan_more;
+        effects.maintenance_work = scan_work;
+        Ok(self.finish_call(env, result, effects, Vec::new()))
     }
 
     pub fn tcp_connect<'a>(
@@ -377,6 +536,16 @@ impl NativeStack {
     ) -> Result<Envelope<EncodedEndpoint>, SocketError> {
         self.ensure_running()?;
         self.socket_table.validate(identity, SocketKind::Tcp)?;
+
+        if let Some(listener) = self
+            .tcp_listeners
+            .get(&identity.id)
+            .filter(|listener| listener.identity == identity)
+        {
+            let result = EncodedEndpoint::new(listener.local, listener.endpoint.scope_id);
+            return Ok(self.finish_call(env, result, Effects::empty(), Vec::new()));
+        }
+
         let record = self.tcp_record(identity)?;
         let local = record.local.ok_or(SocketError::NotBound)?;
         let result = EncodedEndpoint::new(local, record.local_scope_id);
@@ -391,6 +560,15 @@ impl NativeStack {
     ) -> Result<Envelope<EncodedEndpoint>, SocketError> {
         self.ensure_running()?;
         self.socket_table.validate(identity, SocketKind::Tcp)?;
+
+        if self
+            .tcp_listeners
+            .get(&identity.id)
+            .is_some_and(|listener| listener.identity == identity)
+        {
+            return Err(SocketError::NotConnected);
+        }
+
         let record = self.tcp_record(identity)?;
 
         if !matches!(
@@ -417,6 +595,7 @@ impl NativeStack {
     ) -> Result<Envelope<Term<'a>>, SocketError> {
         self.ensure_running()?;
         self.socket_table.validate(identity, SocketKind::Tcp)?;
+        let record = *self.tcp_record(identity)?;
 
         if self
             .socket_table
@@ -425,7 +604,6 @@ impl NativeStack {
             return Err(SocketError::Busy);
         }
 
-        let record = *self.tcp_record(identity)?;
         self.ensure_connected(record)?;
 
         if record.write_shutdown {
@@ -489,6 +667,7 @@ impl NativeStack {
     ) -> Result<Envelope<Term<'a>>, SocketError> {
         self.ensure_running()?;
         self.socket_table.validate(identity, SocketKind::Tcp)?;
+        let record = *self.tcp_record(identity)?;
 
         if self
             .socket_table
@@ -497,7 +676,6 @@ impl NativeStack {
             return Err(SocketError::Busy);
         }
 
-        let record = *self.tcp_record(identity)?;
         self.ensure_connected(record)?;
 
         if record.read_shutdown {
@@ -591,6 +769,7 @@ impl NativeStack {
     ) -> Result<Envelope<Atom>, SocketError> {
         self.ensure_running()?;
         self.socket_table.validate(identity, SocketKind::Tcp)?;
+
         let record = *self.tcp_record(identity)?;
         self.ensure_connected(record)?;
         let shutdown_read = matches!(how, ShutdownHow::Read | ShutdownHow::ReadWrite);
@@ -640,6 +819,15 @@ impl NativeStack {
     ) -> Result<Envelope<Atom>, SocketError> {
         self.ensure_running()?;
         self.socket_table.validate(identity, SocketKind::Tcp)?;
+
+        if self
+            .tcp_listeners
+            .get(&identity.id)
+            .is_some_and(|listener| listener.identity == identity)
+        {
+            return self.tcp_listener_close(env, identity, now);
+        }
+
         let record = *self.tcp_record(identity)?;
         let waiters = self.socket_table.close(identity)?;
         let aborts = waiters
@@ -772,12 +960,20 @@ impl NativeStack {
         for record in std::mem::take(&mut self.tcp_records).into_values() {
             self.sockets.remove(record.handle);
         }
+        for listener in std::mem::take(&mut self.tcp_listeners).into_values() {
+            for handle in listener.pool {
+                self.sockets.remove(handle);
+            }
+        }
         self.tcp_connections.clear();
         self.closing_tcp.clear();
         self.closing_deadlines.clear();
         self.closing_sweep_cursor = None;
         self.closing_cleanup_pending = false;
         self.closing_cleanup_resweep = false;
+        self.listener_scan_cursor = None;
+        self.listener_scan_pending = false;
+        self.listener_scan_resweep = false;
 
         let waiters = self.socket_table.close_all();
         debug_assert!(waiters.len() <= self.limits.ready_events);
@@ -1002,6 +1198,66 @@ impl NativeStack {
         }
     }
 
+    fn arm_listener_waiter<'a>(
+        &mut self,
+        env: Env<'a>,
+        identity: SocketIdentity,
+        pid: LocalPid,
+        reference: Reference<'a>,
+    ) -> Result<(), SocketError> {
+        let handles = self
+            .tcp_listeners
+            .get(&identity.id)
+            .filter(|listener| listener.identity == identity)
+            .map(|listener| listener.pool.iter().copied().collect::<Vec<_>>())
+            .ok_or(SocketError::InvalidSocket)?;
+        let immediately_ready = self
+            .tcp_listeners
+            .get(&identity.id)
+            .is_some_and(|listener| !listener.accepted.is_empty())
+            || handles.iter().any(|handle| {
+                matches!(
+                    self.sockets.get::<tcp::Socket<'static>>(*handle).state(),
+                    tcp::State::Established | tcp::State::CloseWait
+                )
+            });
+        let flag = self
+            .socket_table
+            .ready_flag(identity, SocketKind::Tcp, Direction::Read)?;
+
+        self.socket_table.install_waiter(
+            env,
+            WaiterRegistration {
+                identity,
+                expected_kind: SocketKind::Tcp,
+                direction: Direction::Read,
+                pid,
+                operation: Operation::Accept,
+                reference,
+            },
+        )?;
+
+        let waker = self.ready.waker(
+            ReadyKey {
+                identity,
+                direction: Direction::Read,
+            },
+            flag,
+        );
+
+        for handle in handles {
+            self.sockets
+                .get_mut::<tcp::Socket<'static>>(handle)
+                .register_recv_waker(&waker);
+        }
+
+        if immediately_ready {
+            waker.wake_by_ref();
+        }
+
+        Ok(())
+    }
+
     fn arm_connect<'a>(
         &mut self,
         env: Env<'a>,
@@ -1081,6 +1337,14 @@ impl NativeStack {
     }
 
     fn tcp_record(&self, identity: SocketIdentity) -> Result<&TcpRecord, SocketError> {
+        if self
+            .tcp_listeners
+            .get(&identity.id)
+            .is_some_and(|listener| listener.identity == identity)
+        {
+            return Err(SocketError::InvalidState);
+        }
+
         self.tcp_records
             .get(&identity.id)
             .filter(|record| record.identity == identity)
@@ -1088,6 +1352,14 @@ impl NativeStack {
     }
 
     fn tcp_record_mut(&mut self, identity: SocketIdentity) -> Result<&mut TcpRecord, SocketError> {
+        if self
+            .tcp_listeners
+            .get(&identity.id)
+            .is_some_and(|listener| listener.identity == identity)
+        {
+            return Err(SocketError::InvalidState);
+        }
+
         self.tcp_records
             .get_mut(&identity.id)
             .filter(|record| record.identity == identity)
@@ -1111,6 +1383,222 @@ impl NativeStack {
                 .remove(&(deadline, record.identity.id));
         }
         self.remove_tcp_record(record);
+        self.request_listener_scan();
+    }
+
+    fn tcp_listener_close(
+        &mut self,
+        env: Env<'_>,
+        identity: SocketIdentity,
+        now: Instant,
+    ) -> Result<Envelope<Atom>, SocketError> {
+        let listener = self
+            .tcp_listeners
+            .remove(&identity.id)
+            .filter(|listener| listener.identity == identity)
+            .ok_or(SocketError::InvalidSocket)?;
+        let waiters = self.socket_table.close(identity)?;
+        let mut aborts = waiters
+            .into_iter()
+            .map(|(direction, waiter)| PendingNotification {
+                identity,
+                direction,
+                waiter,
+            })
+            .collect::<Vec<_>>();
+
+        for handle in listener.pool {
+            self.sockets.remove(handle);
+        }
+
+        for child in listener.accepted {
+            if let Ok(waiters) = self.socket_table.close(child) {
+                aborts.extend(
+                    waiters
+                        .into_iter()
+                        .map(|(direction, waiter)| PendingNotification {
+                            identity: child,
+                            direction,
+                            waiter,
+                        }),
+                );
+            }
+
+            if let Ok(record) = self.tcp_record(child).copied() {
+                self.sockets.remove(record.handle);
+                self.remove_tcp_record(record);
+            }
+        }
+
+        self.listener_scan_cursor = None;
+        self.listener_scan_pending = !self.tcp_listeners.is_empty();
+        self.listener_scan_resweep = false;
+        let effects = self
+            .drive(now, None)
+            .expect("TCP listener close without ingress cannot fail");
+        Ok(self.finish_call(env, crate::atoms::ok(), effects, aborts))
+    }
+
+    fn request_listener_scan(&mut self) {
+        if self.tcp_listeners.is_empty() {
+            return;
+        }
+
+        if self.listener_scan_pending {
+            self.listener_scan_resweep = true;
+        } else {
+            self.listener_scan_pending = true;
+            self.listener_scan_cursor = None;
+        }
+    }
+
+    fn refresh_listeners(&mut self, limit: usize) -> (usize, bool) {
+        if self.tcp_listeners.is_empty() {
+            self.listener_scan_cursor = None;
+            self.listener_scan_pending = false;
+            self.listener_scan_resweep = false;
+            return (0, false);
+        }
+
+        if limit == 0 || !self.listener_scan_pending {
+            return (0, self.listener_scan_pending);
+        }
+
+        let cursor = self.listener_scan_cursor;
+        let listener_start = cursor.map_or(Unbounded, |key| Included(key.listener_id));
+        let mut keys = Vec::with_capacity(limit.saturating_add(1));
+
+        'listeners: for (&listener_id, listener) in
+            self.tcp_listeners.range((listener_start, Unbounded))
+        {
+            let member_start = cursor
+                .filter(|key| key.listener_id == listener_id)
+                .map_or(Unbounded, |key| Excluded(key.handle));
+
+            for &handle in listener.pool.range((member_start, Unbounded)) {
+                keys.push(ListenerMemberKey {
+                    listener_id,
+                    handle,
+                });
+
+                if keys.len() > limit {
+                    break 'listeners;
+                }
+            }
+        }
+
+        let mut more = keys.len() > limit;
+        keys.truncate(limit);
+        let work = keys.len();
+
+        for key in &keys {
+            self.refresh_listener_member(*key);
+        }
+
+        if more {
+            self.listener_scan_cursor = keys.last().copied();
+        } else if self.listener_scan_resweep {
+            self.listener_scan_cursor = None;
+            self.listener_scan_resweep = false;
+            more = true;
+        } else {
+            self.listener_scan_cursor = None;
+            self.listener_scan_pending = false;
+        }
+
+        (work, more)
+    }
+
+    fn refresh_listener_member(&mut self, key: ListenerMemberKey) {
+        let Some(mut listener) = self.tcp_listeners.remove(&key.listener_id) else {
+            return;
+        };
+
+        if !listener.pool.contains(&key.handle) {
+            self.tcp_listeners.insert(key.listener_id, listener);
+            return;
+        }
+
+        let socket = self.sockets.get::<tcp::Socket<'static>>(key.handle);
+        let state = socket.state();
+        let endpoints = socket.local_endpoint().zip(socket.remote_endpoint());
+
+        if matches!(state, tcp::State::Established | tcp::State::CloseWait)
+            && let Some((local, remote)) = endpoints
+        {
+            let can_queue = listener.accepted.len() < listener.backlog;
+            let child = can_queue
+                .then(|| self.socket_table.insert(SocketKind::Tcp, 0))
+                .transpose();
+
+            match child {
+                Ok(Some(child)) => {
+                    self.sockets
+                        .get_mut::<tcp::Socket<'static>>(key.handle)
+                        .set_timeout(None);
+                    let record = TcpRecord::accepted(
+                        child,
+                        key.handle,
+                        local,
+                        remote,
+                        listener.endpoint.scope_id,
+                    );
+                    self.tcp_connections
+                        .insert(ConnectionKey::new(local, remote), child);
+                    self.tcp_records.insert(child.id, record);
+                    listener.accepted.push_back(child);
+                    listener.pool.remove(&key.handle);
+                    self.add_listener_member(&mut listener);
+                    self.counters.listener_promotions += 1;
+                    self.mark_listener_ready(listener.identity);
+                }
+                Ok(None) | Err(SocketError::SystemLimit) => {
+                    self.recycle_listener_member(&mut listener, key.handle);
+                    self.counters.listener_overflow_drops += 1;
+                }
+                Err(_error) => unreachable!("TCP child identity allocation has one failure mode"),
+            }
+        } else if !matches!(state, tcp::State::Listen | tcp::State::SynReceived) {
+            self.recycle_listener_member(&mut listener, key.handle);
+        }
+
+        self.tcp_listeners.insert(key.listener_id, listener);
+    }
+
+    fn recycle_listener_member(&mut self, listener: &mut ListenerRecord, handle: SocketHandle) {
+        listener.pool.remove(&handle);
+        self.sockets.remove(handle);
+        self.add_listener_member(listener);
+    }
+
+    fn add_listener_member(&mut self, listener: &mut ListenerRecord) {
+        let handle = self.sockets.add(tcp_support::socket());
+        let socket = self.sockets.get_mut::<tcp::Socket<'static>>(handle);
+        socket.set_timeout(Some(Duration::from_millis(
+            tcp_support::CONNECT_TIMEOUT_MILLIS,
+        )));
+        socket
+            .listen(listener.endpoint.listen_endpoint())
+            .expect("validated listener endpoint remains listenable");
+        listener.pool.insert(handle);
+        self.counters.listener_refills += 1;
+    }
+
+    fn mark_listener_ready(&mut self, identity: SocketIdentity) {
+        if let Ok(flag) = self
+            .socket_table
+            .ready_flag(identity, SocketKind::Tcp, Direction::Read)
+        {
+            self.ready
+                .waker(
+                    ReadyKey {
+                        identity,
+                        direction: Direction::Read,
+                    },
+                    flag,
+                )
+                .wake();
+        }
     }
 
     fn reap_closing_tcp(&mut self, now: Instant, limit: usize) -> (usize, bool) {
@@ -1238,8 +1726,12 @@ impl NativeStack {
     fn port_in_use(&self, port: u16, excluding: Option<SocketIdentity>) -> bool {
         self.tcp_records.values().any(|record| {
             Some(record.identity) != excluding
+                && !record.accepted
                 && record.local.is_some_and(|local| local.port == port)
-        })
+        }) || self
+            .tcp_listeners
+            .values()
+            .any(|listener| Some(listener.identity) != excluding && listener.local.port == port)
     }
 
     fn allocate_ephemeral_port(&mut self) -> Result<u16, SocketError> {
@@ -1247,6 +1739,11 @@ impl NativeStack {
             .tcp_records
             .values()
             .filter_map(|record| record.local.map(|local| local.port))
+            .chain(
+                self.tcp_listeners
+                    .values()
+                    .map(|listener| listener.local.port),
+            )
             .collect::<BTreeSet<_>>();
         let port = tcp_support::allocate_ephemeral(
             &used,
@@ -1407,6 +1904,7 @@ impl NativeStack {
                 .interface
                 .poll_ingress_single(now, &mut self.device, &mut self.sockets);
             self.request_closing_cleanup();
+            self.request_listener_scan();
         }
 
         self.interface.poll_maintenance(now);
@@ -1422,6 +1920,9 @@ impl NativeStack {
         let mut egress_may_remain = false;
         let mut cleanup_more = false;
         let mut cleanup_ran = false;
+        let mut listener_more = false;
+        let mut listener_ran = false;
+        let mut egress_attempted = false;
 
         if self.maintenance_cleanup_turn && self.closing_cleanup_pending {
             let cleanup_limit = self.limits.maintenance_work.min(1);
@@ -1431,10 +1932,31 @@ impl NativeStack {
             cleanup_ran = cleanup_work > 0;
         }
 
+        let remaining_maintenance = self
+            .limits
+            .maintenance_work
+            .saturating_sub(maintenance_work);
+
+        if self.listener_scan_pending
+            && remaining_maintenance > 0
+            && (remaining_maintenance > 1 || self.listener_maintenance_turn)
+        {
+            let listener_limit = if remaining_maintenance == 1 {
+                1
+            } else {
+                (remaining_maintenance / 2).max(1)
+            };
+            let (listener_work, more) = self.refresh_listeners(listener_limit);
+            maintenance_work += listener_work;
+            listener_more = more;
+            listener_ran = listener_work > 0;
+        }
+
         while maintenance_work < self.limits.maintenance_work
             && self.device.queued_packets().1 < self.limits.output_packets
         {
             maintenance_work += 1;
+            egress_attempted = true;
 
             match self
                 .interface
@@ -1447,8 +1969,13 @@ impl NativeStack {
                 PollResult::SocketStateChanged => {
                     egress_may_remain = true;
                     self.request_closing_cleanup();
+                    self.request_listener_scan();
                 }
             }
+        }
+
+        if !egress_attempted && maintenance_work == self.limits.maintenance_work {
+            egress_may_remain = true;
         }
 
         let remaining_packets = self.limits.output_packets.saturating_sub(output.len());
@@ -1469,13 +1996,27 @@ impl NativeStack {
             cleanup_ran = cleanup_work > 0;
         }
 
+        if !listener_ran && self.listener_scan_pending {
+            let remaining_maintenance = self
+                .limits
+                .maintenance_work
+                .saturating_sub(maintenance_work);
+            let (listener_work, more) = self.refresh_listeners(remaining_maintenance);
+            maintenance_work += listener_work;
+            listener_more |= more;
+            listener_ran = listener_work > 0;
+        }
+
         self.maintenance_cleanup_turn = !cleanup_ran && self.closing_cleanup_pending;
+        self.listener_maintenance_turn = !listener_ran && self.listener_scan_pending;
         let output_packets = output.len();
         let more = self.device.has_receive()
             || self.device.has_transmit()
             || egress_may_remain
             || cleanup_more
-            || self.closing_cleanup_pending;
+            || self.closing_cleanup_pending
+            || listener_more
+            || self.listener_scan_pending;
         let poll_at = if more {
             Some(now.total_millis())
         } else {
@@ -1648,6 +2189,12 @@ struct ConnectionKey {
     remote_port: u16,
 }
 
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct ListenerMemberKey {
+    listener_id: u64,
+    handle: SocketHandle,
+}
+
 impl ConnectionKey {
     fn new(local: IpEndpoint, remote: IpEndpoint) -> Self {
         let IpAddress::Ipv6(local_address) = local.addr;
@@ -1708,6 +2255,9 @@ pub struct Counters {
     notifications_delivered: usize,
     notifications_dropped: usize,
     readiness_dropped: usize,
+    listener_promotions: usize,
+    listener_refills: usize,
+    listener_overflow_drops: usize,
 }
 
 impl Counters {
@@ -1756,6 +2306,11 @@ pub struct Snapshot {
     socket_count: usize,
     native_socket_count: usize,
     tcp_socket_count: usize,
+    tcp_listener_count: usize,
+    listener_pool_socket_count: usize,
+    listener_pool_target_count: usize,
+    accepted_queue_count: usize,
+    listener_backlog_capacity: usize,
     closing_tcp_socket_count: usize,
     tcp_buffer_bytes: usize,
     waiter_count: usize,
