@@ -8,6 +8,11 @@ The project is under initial development. No networking API is available yet.
 The first implementation target is TCP over IPv6, followed by TCP over IPv4,
 then UDP over IPv6 and IPv4.
 
+Phase 1 provides stack lifecycle only. `SmolNet.start_stack/1` creates an
+independent native stack and returns an opaque reference; `SmolNet.stop_stack/1`
+stops its complete temporary supervision bundle. Packet ingress and sockets are
+not available yet.
+
 ## Development
 
 The supported development baseline is Elixir 1.19.5, Erlang/OTP 28.3, and Rust

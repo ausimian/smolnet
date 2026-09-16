@@ -5,4 +5,22 @@ defmodule SmolNet.Native do
 
   @spec health() :: :ok
   def health, do: :erlang.nif_error(:nif_not_loaded)
+
+  @spec stack_new(map(), integer()) :: {:ok, map()} | {:error, atom()}
+  def stack_new(_limits, _now), do: :erlang.nif_error(:nif_not_loaded)
+
+  @spec stack_snapshot(reference()) :: {:ok, map()} | {:error, atom()}
+  def stack_snapshot(_stack), do: :erlang.nif_error(:nif_not_loaded)
+
+  @spec stack_time_until(integer(), integer()) :: {:ok, non_neg_integer()} | {:error, atom()}
+  def stack_time_until(_now, _deadline), do: :erlang.nif_error(:nif_not_loaded)
+
+  @spec resource_counts() :: map()
+  def resource_counts, do: :erlang.nif_error(:nif_not_loaded)
+
+  @spec test_contention(reference()) :: {:error, :ownership_invariant_violation}
+  def test_contention(_stack), do: :erlang.nif_error(:nif_not_loaded)
+
+  @spec test_bounded_work(reference(), map()) :: {:ok, map()} | {:error, atom()}
+  def test_bounded_work(_stack, _requested), do: :erlang.nif_error(:nif_not_loaded)
 end
