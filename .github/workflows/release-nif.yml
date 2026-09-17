@@ -1,0 +1,288 @@
+name: Release NIF
+
+on:
+  push:
+    tags: ['[0-9]*.[0-9]*.[0-9]*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  prepare-release:
+    runs-on: ubuntu-22.04
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Resolve and validate version
+        id: version
+        shell: bash
+        run: |
+          if [[ "${{ github.event_name }}" == "push" ]]; then
+            version="$GITHUB_REF_NAME"
+          else
+            version=$(sed -n 's/^[[:space:]]*@version "\([^"]*\)"/\1/p' mix.exs)
+          fi
+
+          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "error: NIF releases require a bare stable-semver version, got $version" >&2
+            exit 1
+          fi
+
+          project_version=$(sed -n 's/^[[:space:]]*@version "\([^"]*\)"/\1/p' mix.exs)
+          if [[ "$version" != "$project_version" ]]; then
+            echo "error: tag $version does not match mix.exs version $project_version" >&2
+            exit 1
+          fi
+
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Create or reuse draft release
+        if: github.event_name == 'push'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          draft=$(gh release view "$VERSION" --repo "$REPOSITORY" --json isDraft --jq .isDraft 2>/dev/null || true)
+          if [[ -z "$draft" ]]; then
+            gh release create "$VERSION" --repo "$REPOSITORY" --draft \
+              --title "SmolNet $VERSION" \
+              --notes "Precompiled NIFs for GNU/Linux x86_64/AArch64 and Apple Silicon macOS."
+          elif [[ "$draft" != "true" ]]; then
+            echo "error: release $VERSION already exists and is not a draft" >&2
+            exit 1
+          fi
+
+  build:
+    needs: prepare-release
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {runner: ubuntu-22.04, platform: linux, architecture: x86_64, target: x86_64-unknown-linux-gnu}
+          - {runner: ubuntu-22.04-arm, platform: linux, architecture: aarch64, target: aarch64-unknown-linux-gnu}
+          - {runner: macos-14, platform: macos, architecture: aarch64, target: aarch64-apple-darwin}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    env:
+      VERSION: ${{ needs.prepare-release.outputs.version }}
+      VERSION_OVERRIDE: ${{ needs.prepare-release.outputs.version }}
+      MACOSX_DEPLOYMENT_TARGET: ${{ matrix.platform == 'macos' && '14.0' || '' }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - uses: erlef/setup-beam@54075bcc5e249e4758d363f27d099f55d843f124 # v1
+        with:
+          elixir-version: "1.19.5"
+          otp-version: "28.3"
+
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          toolchain: 1.94.0
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          workspaces: native -> target
+
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: deps
+          key: >-
+            nif-${{ runner.os }}-${{ runner.arch }}-1.19.5-28.3-
+            ${{ hashFiles('mix.lock', 'native/Cargo.lock') }}
+
+      - run: mix local.hex --force
+      - run: mix local.rebar --force
+      - run: mix deps.get
+
+      - name: Build release NIF
+        run: MIX_ENV=prod mix compile --warnings-as-errors
+
+      - name: Package and inspect release NIF
+        id: package
+        env:
+          ARCHITECTURE: ${{ matrix.architecture }}
+          PLATFORM: ${{ matrix.platform }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          library="libsmolnet_nif-v${VERSION}-nif-2.15-${TARGET}.so"
+          asset="${library}.tar.gz"
+          mkdir -p artifact
+          cp _build/prod/lib/smolnet/priv/native/smolnet_nif.so "artifact/$library"
+          if [[ "$PLATFORM" == "macos" ]]; then
+            scripts/verify-nif-macos.sh "artifact/$library"
+          else
+            scripts/verify-nif-linux.sh "artifact/$library" "$ARCHITECTURE"
+          fi
+          tar -czf "$asset" -C artifact "$library"
+          if command -v sha256sum >/dev/null; then
+            sha256sum "$asset" > "${asset}.sha256"
+          else
+            shasum -a 256 "$asset" > "${asset}.sha256"
+          fi
+          echo "asset=$asset" >> "$GITHUB_OUTPUT"
+
+      - name: Run integration suite against packaged bytes
+        env:
+          ASSET: ${{ steps.package.outputs.asset }}
+        run: |
+          MIX_ENV=test mix compile --warnings-as-errors
+          entry=${ASSET%.tar.gz}
+          tar -xzf "$ASSET" -C artifact
+          cp "artifact/$entry" _build/test/lib/smolnet/priv/native/smolnet_nif.so
+          MIX_ENV=test mix run --no-compile -e 'unless SmolNet.Native.health() == :ok, do: raise("NIF health check failed")'
+          MIX_ENV=test mix test --no-compile --warnings-as-errors
+
+      - name: Smoke-test the Hex consumer path
+        env:
+          ASSET: ${{ steps.package.outputs.asset }}
+        run: scripts/smoke-test-package.sh "$ASSET"
+
+      - name: Upload to draft release
+        if: github.event_name == 'push'
+        env:
+          ASSET: ${{ steps.package.outputs.asset }}
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+        run: gh release upload "$VERSION" "$ASSET" "${ASSET}.sha256" --repo "$REPOSITORY" --clobber
+
+      - name: Upload workflow artifact
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ${{ steps.package.outputs.asset }}
+          path: |
+            ${{ steps.package.outputs.asset }}
+            ${{ steps.package.outputs.asset }}.sha256
+          retention-days: 90
+
+  publish-release:
+    needs: [prepare-release, build]
+    if: github.event_name == 'push'
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Publish complete release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          VERSION: ${{ needs.prepare-release.outputs.version }}
+        run: gh release edit "$VERSION" --repo "$REPOSITORY" --draft=false
+
+  generate-hex-checksums:
+    needs: [prepare-release, publish-release]
+    if: github.event_name == 'push'
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - uses: erlef/setup-beam@54075bcc5e249e4758d363f27d099f55d843f124 # v1
+        with:
+          elixir-version: "1.19.5"
+          otp-version: "28.3"
+
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          toolchain: 1.94.0
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          workspaces: native -> target
+
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: deps
+          key: >-
+            nif-checksums-${{ runner.os }}-1.19.5-28.3-
+            ${{ hashFiles('mix.lock', 'native/Cargo.lock') }}
+
+      - run: mix local.hex --force
+      - run: mix local.rebar --force
+      - run: mix deps.get
+
+      - name: Hash published NIF assets
+        run: mix rustler_precompiled.download SmolNet.Native --all --print
+
+      - name: Verify complete checksum manifest
+        run: |
+          manifest=checksum-Elixir.SmolNet.Native.exs
+          test "$(grep -c '=> "sha256:' "$manifest")" -eq 3
+          grep -q 'x86_64-unknown-linux-gnu' "$manifest"
+          grep -q 'aarch64-unknown-linux-gnu' "$manifest"
+          grep -q 'aarch64-apple-darwin' "$manifest"
+
+      - name: Retain checksum manifest for Hex publication
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: hex-checksum-manifest
+          path: checksum-Elixir.SmolNet.Native.exs
+          if-no-files-found: error
+          retention-days: 30
+
+  publish-hex:
+    needs: [prepare-release, generate-hex-checksums]
+    if: github.event_name == 'push'
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    env:
+      VERSION_OVERRIDE: ${{ needs.prepare-release.outputs.version }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - uses: erlef/setup-beam@54075bcc5e249e4758d363f27d099f55d843f124 # v1
+        with:
+          elixir-version: "1.19.5"
+          otp-version: "28.3"
+
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          toolchain: 1.94.0
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          workspaces: native -> target
+
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: deps
+          key: >-
+            hex-publish-${{ runner.os }}-1.19.5-28.3-
+            ${{ hashFiles('mix.lock', 'native/Cargo.lock') }}
+
+      - name: Download generated checksum manifest
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: hex-checksum-manifest
+          path: .
+
+      - run: mix local.hex --force
+      - run: mix local.rebar --force
+      - run: mix deps.get
+
+      - name: Validate Hex package inputs
+        run: |
+          manifest=checksum-Elixir.SmolNet.Native.exs
+          test "$(grep -c '=> "sha256:' "$manifest")" -eq 3
+          grep -q 'x86_64-unknown-linux-gnu' "$manifest"
+          grep -q 'aarch64-unknown-linux-gnu' "$manifest"
+          grep -q 'aarch64-apple-darwin' "$manifest"
+          mix hex.build --unpack --output tmp/hex-preview
+          test -f tmp/hex-preview/checksum-Elixir.SmolNet.Native.exs
+          test ! -d tmp/hex-preview/native
+          if find tmp/hex-preview -type f \( -name '*.so' -o -name '*.dylib' \) | grep -q .; then
+            echo "error: Hex package contains a native binary" >&2
+            exit 1
+          fi
+
+      - name: Publish package and documentation to Hex
+        env:
+          HEX_API_KEY: ${{ secrets.HEX_API_KEY }}
+        run: |
+          if [[ -z "$HEX_API_KEY" ]]; then
+            echo "error: configure the HEX_API_KEY repository Actions secret" >&2
+            exit 1
+          fi
+          mix hex.publish --yes

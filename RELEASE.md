@@ -1,5 +1,8 @@
 ### Added
 
+- Distribute checksum-pinned precompiled NIFs for glibc 2.35+ GNU/Linux on
+  x86_64/AArch64 and Apple Silicon on macOS 14+, with strict archive and
+  native-dependency validation.
 - Expose native lifecycle, call-budget, deadline-yield, scheduler-timeslice,
   and maximum native-call duration telemetry through `SmolNet.stack_info/1`.
 

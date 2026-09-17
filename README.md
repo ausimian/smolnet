@@ -440,9 +440,9 @@ This is the first public release candidate, so there is no earlier supported
 release API to migrate from. Users of development snapshots should update to
 the explicit IPv4/IPv6 endpoint maps and inet backend modules shown above,
 remove assumptions that socket IDs can be reused, and handle nowait operations
-through their returned select continuations. The release candidate continues
-to compile its NIF from source; precompiled distribution is deferred until the
-release-assets workflow is introduced.
+through their returned select continuations. Repository checkouts continue to
+compile the NIF from source. Hex consumers on supported GNU/Linux and Apple
+Silicon macOS targets download a checksum-pinned precompiled NIF.
 
 ## Development
 
@@ -456,16 +456,26 @@ Run the complete local quality gate before committing:
 mix precommit
 ```
 
+Maintainers cutting a release should follow the complete Publisho, native
+asset, checksum, and Hex sequence in [MAINTAINING.md](MAINTAINING.md).
+
 ## Native builds
 
-SmolNet currently builds its NIF from source. Building requires Rust 1.91 or
-newer; Rust 1.94.0 is the pinned development version. The package retains the
-complete `smolnet_core` and `smolnet_nif` workspace required by Rustler.
+Hex consumers on GNU/Linux x86_64/AArch64 and Apple Silicon macOS download a
+precompiled NIF for the exact SmolNet version. Each archive is verified against
+the checksum pinned inside the Hex package, validated to contain exactly one
+regular NIF file, and then extracted. Linux assets target glibc 2.35 or newer
+and may depend only on glibc's standard `libc`, `libm`, `libdl`, `libpthread`,
+and `librt` libraries plus `libgcc_s`. The Apple Silicon asset targets macOS
+14 or newer and may depend only on `libSystem`. Alpine, other musl systems, and
+Intel macOS are unsupported as Hex-package targets.
 
-Precompiled GNU/Linux x86_64 and AArch64 libraries will be distributed as
-verified release assets rather than committed to the Git repository. Until
-that workflow lands, consumers need a Rust toolchain, platform C linker, and
-Erlang development files. Alpine and other musl systems remain unsupported.
+Repository checkouts and CI always compile from source so native changes cannot
+be hidden by a restored or downloaded artifact. Source builds require Rust
+1.91 or newer, a platform C linker, and Erlang development files; Rust 1.94.0
+is the pinned development version. Hex packages intentionally omit the Rust
+workspace. Unsupported Hex-consumer targets fail with a list of supported
+targets and should use a source checkout if they need to build locally.
 
 Every native stack call has a 1 ms normal-scheduler target. Native work stops
 at a monotonic 750 microsecond deadline, reserving 250 microseconds for result
@@ -506,6 +516,10 @@ socket, waiter, and packet capacities and is included in the benchmark.
 
 - If a source build fails, confirm Rust 1.91 or newer is active and that the
   platform C linker and Erlang development files are installed.
+- If a Hex dependency reports that no precompiled NIF is available, confirm
+  the host is glibc-based GNU/Linux on x86_64/AArch64 or Apple Silicon running
+  macOS 14 or newer. Other targets require a source checkout; there is no
+  implicit source fallback in the Hex package.
 - If ingress returns a validation error, supply exactly one complete IPv4 or
   IPv6 packet within the configured MTU. Ethernet frames and fragmented IPv4
   packets are not accepted.

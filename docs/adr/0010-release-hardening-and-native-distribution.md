@@ -86,18 +86,32 @@ invocation.
 
 ## Native distribution decision
 
-The release candidate keeps source compilation through Rustler and contains no
-generated `.so` or `.dylib` files. The complete Rust workspace remains in the
-package so the NIF can be built during dependency compilation.
+Repository checkouts keep source compilation through Rustler and contain no
+generated `.so` or `.dylib` files. Hex packages omit the Rust workspace and use
+`rustler_precompiled` target naming, checksum verification, and loading for
+GNU/Linux x86_64/AArch64 and Apple Silicon macOS assets. The checksum manifest
+is generated from the published bytes and shipped inside the immutable Hex
+package rather than trusted from the mutable GitHub release.
 
-Precompiled GNU/Linux x86_64 and AArch64 libraries are deferred to a dedicated
-release-assets workflow. That workflow will build on matching native runners,
-publish checksummed assets outside Git history, and integrate them through
-`rustler_precompiled` before the first release is cut.
+The consumer compiler adds an archive-validation step before
+`rustler_precompiled` extracts anything. An archive must contain exactly the
+one expected regular NIF file; links, devices, directories, traversal paths,
+absolute paths, duplicate entries, and unexpected files are rejected.
+
+The release workflow builds Linux assets on native Ubuntu 22.04 runners,
+establishing glibc 2.35 as the compatibility floor. It rejects imports newer
+than that floor and dependencies outside `libc`, `libgcc_s`, `libm`, `libdl`,
+`libpthread`, and `librt`. Apple Silicon builds on a native `macos-14` runner,
+records a macOS 14 deployment target, and permits only `libSystem`. Each
+packaged artifact is loaded by a real BEAM at its platform floor and run
+through `health/0`, the public integration suite, and a package-consumer smoke
+test. Unsupported Hex-consumer targets fail with an actionable error instead
+of falling back to source that is not present in the package.
 
 ## Consequences
 
 The release candidate has no intentionally unbounded packet, socket, waiter,
-queue, decoder, or native-wait path. Supported platforms currently require a
-source build. Precompiled distribution, musl, and other libc targets remain
-explicitly deferred.
+queue, decoder, or native-wait path. Supported glibc Linux and Apple Silicon
+macOS consumers do not need a Rust toolchain. Source checkouts remain portable
+source builds; musl, Intel macOS Hex packages, and other targets remain
+explicitly unsupported.
