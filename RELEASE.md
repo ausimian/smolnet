@@ -1,16 +1,16 @@
+# Initial release
+
+SmolNet embeds the Rust `smoltcp` network stack in an OTP-friendly Elixir
+library with explicitly bounded native work.
+
 ### Added
 
-- Distribute checksum-pinned precompiled NIFs for glibc 2.35+ GNU/Linux on
-  x86_64/AArch64 and Apple Silicon on macOS 14+, with strict archive and
-  native-dependency validation.
-- Expose native lifecycle, call-budget, deadline-yield, scheduler-timeslice,
-  and maximum native-call duration telemetry through `SmolNet.stack_info/1`.
-
-### Changed
-
-- Drive native output, readiness, maintenance, and shutdown through
-  time-bounded resumable continuations with zero-copy transmit binaries and
-  explicit BEAM scheduler accounting. Orderly shutdown now enters an
-  observable `:shutting_down` native lifecycle while bounded cleanup drains.
-  A feeder can receive `{:error, :busy}` while a deadline continuation retains
-  the stack's single ingress slot and should treat it as backpressure.
+- Independent, supervised IPv4 and IPv6 raw-IP stacks with configurable
+  addresses, routes, MTUs, link behavior, and runtime telemetry.
+- Low-level TCP and UDP sockets plus `:gen_tcp` and `:gen_udp` compatible
+  adapters for clients, listeners, datagrams, active and passive delivery, and
+  controlling-process ownership.
+- Scheduler-aware NIF execution with bounded queues, buffers, readiness,
+  maintenance, shutdown, and packet-processing work.
+- Checksum-pinned precompiled NIFs for Linux x86_64, Linux AArch64, and Apple
+  Silicon macOS, while repository checkouts continue to build from Rust source.
