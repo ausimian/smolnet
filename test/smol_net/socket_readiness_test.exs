@@ -1,6 +1,8 @@
 defmodule SmolNet.SocketReadinessTest do
   use ExUnit.Case, async: false
 
+  @moduletag :debug_nif
+
   alias SmolNet.Native
   alias SmolNet.Socket
   alias SmolNet.Stack

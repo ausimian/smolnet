@@ -16,8 +16,9 @@ The package supports `x86_64-unknown-linux-gnu`,
 Linux assets are built and tested on native Ubuntu 22.04 runners, making glibc
 2.35 the supported floor. Their dependency allowlist is `libc.so.6`,
 `libgcc_s.so.1`, `libm.so.6`, `libdl.so.2`, `libpthread.so.0`, and
-`librt.so.1`. The Apple Silicon asset is built with a macOS 14 deployment
-target on a native `macos-14` runner and may depend only on `libSystem`.
+`librt.so.1`, plus the architecture's glibc dynamic loader. The Apple Silicon
+asset is built with a macOS 14 deployment target on a native `macos-14` runner
+and may depend only on the system `libSystem` and `libiconv` libraries.
 
 ## Release runbook: Publisho, native assets, then Hex
 

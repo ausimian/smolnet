@@ -1,6 +1,8 @@
 defmodule SmolNet.NativeTest do
   use ExUnit.Case, async: false
 
+  @moduletag :debug_nif
+
   alias SmolNet.Native
   alias SmolNet.Stack
   alias SmolNet.Stack.Ref
