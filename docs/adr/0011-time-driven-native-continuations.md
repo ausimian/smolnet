@@ -55,15 +55,29 @@ fault from trapping the owner indefinitely. An explicit shutdown attempt is
 not repeated from `terminate/2`; if the guard is exhausted, the public stop
 path still destroys the bounded resource instead of leaving it live.
 
-After a native slice, `enif_consume_timeslice` charges the calling process for
-the measured fraction of the 1 millisecond target. It does not control
-continuation state: the monotonic deadline decides when work stops, and
-`more` only reports work actually retained. Rustler's API accepts whole
-percentages, so even a sub-10-microsecond call is conservatively charged the
-minimum 1%. The stack owner's self-sent poll messages are ordered behind
-messages already in its mailbox, so each bounded slice gives ordinary stack
-traffic an opportunity to run. Separate stack owners remain independently
-schedulable.
+`enif_consume_timeslice` charges the calling process for the measured fraction
+of the 1 millisecond target. The charge is incremental rather than a single
+report at the end of the call: work loops charge at chunk boundaries and stop
+early when a charge reports the caller's reduction slice as spent. A stack
+owner that has already burned most of its slice on Elixir work before
+re-entering therefore receives a correspondingly shorter native slice instead
+of a full one. Each charge covers only the time since the previous charge;
+charging the elapsed time since the start of the call would re-bill every
+earlier chunk.
+
+Rustler's API accepts whole percentages, so the smallest honest charge covers
+10 microseconds. Work units are grouped into chunks large enough that the
+minimum charge is not a systematic over-report, and at least one chunk always
+runs per call so that a chronically reduction-starved owner still makes
+progress instead of spinning through its own mailbox. The monotonic deadline
+remains a hard ceiling: reductions bound how much the caller is charged, not
+how long the call occupies the scheduler thread.
+
+Continuation state is unchanged. Work stopped by either the deadline or a spent
+slice retains its cursors, and `more` only reports work actually retained. The
+stack owner's self-sent poll messages are ordered behind messages already in
+its mailbox, so each bounded slice gives ordinary stack traffic an opportunity
+to run. Separate stack owners remain independently schedulable.
 
 Unexpected resource destruction remains synchronous. This is intentionally
 different from explicit shutdown: the resource contains at most 64 native
@@ -107,7 +121,9 @@ benchmark.
 
 The native snapshot exposes the configured call target, work deadline,
 encoding headroom, deadline yields, timeslice exhaustion events, and maximum
-observed serialized native-call duration before result encoding.
+observed serialized native-call duration before result encoding. A call may now
+charge the caller several times, so `timeslice_exhaustions` counts the calls in
+which any charge reported the slice as spent rather than the number of charges.
 
 ## Consequences
 
@@ -123,4 +139,17 @@ Calling `enif_consume_timeslice` means message-heavy calls are charged for
 both explicit native scheduler usage and BEAM message delivery. The reduction
 gate therefore allows at most 4,000 reductions, replacing the former 1,200
 ceiling while still rejecting calls that consume more than two ordinary
-2,000-reduction slices.
+2,000-reduction slices. Chunked charging rounds each chunk up to a whole
+percent, which costs at most one percent of a slice per chunk; the maximum-state
+scenarios remain around half the gate.
+
+Slice-aware stopping makes continuations more frequent under load: a caller
+with little of its slice left now yields after a chunk rather than draining a
+whole readiness quota. Total work per unit of time is unchanged, but it is
+spread across more calls, which is the point — other processes on the scheduler
+are no longer starved by an owner that re-enters the NIF with an almost empty
+slice.
+
+The remaining gap is the encoding tail. `enif_consume_timeslice` is called
+before result encoding runs, so up to the 250 microsecond headroom goes
+unreported. That is a separate change.

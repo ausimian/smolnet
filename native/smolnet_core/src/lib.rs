@@ -615,6 +615,22 @@ fn test_set_budget_checkpoints<'a>(
 
 #[cfg(debug_assertions)]
 #[rustler::nif]
+fn test_set_slice_exhaustion<'a>(
+    env: Env<'a>,
+    resource: ResourceArc<StackResource>,
+    charges: usize,
+) -> Term<'a> {
+    let result = catch_operation(|| {
+        resource
+            .with_stack(|stack| stack.test_set_slice_exhaustion(charges))
+            .map_err(|_| atoms::ownership_invariant_violation())
+    });
+
+    encode_envelope_result(env, result)
+}
+
+#[cfg(debug_assertions)]
+#[rustler::nif]
 fn test_maximum_work<'a>(env: Env<'a>, resource: ResourceArc<StackResource>) -> Term<'a> {
     let result = catch_operation(|| {
         resource
