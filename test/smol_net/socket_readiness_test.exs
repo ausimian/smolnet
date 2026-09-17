@@ -1,8 +1,10 @@
 defmodule SmolNet.SocketReadinessTest do
   use ExUnit.Case, async: false
 
+  alias SmolNet.Native
   alias SmolNet.Socket
   alias SmolNet.Stack
+  alias SmolNet.Stack.Ref
   alias SmolNet.Test.Readiness
 
   @max_small_integer 576_460_752_303_423_487
@@ -180,6 +182,29 @@ defmodule SmolNet.SocketReadinessTest do
     assert_abort(socket, read_select, :closed)
     assert_abort(socket, write_select, :closed)
     refute_socket_message(socket)
+  end
+
+  @tag :debug_nif
+  test "stack termination drains retained aborts at maximum waiter capacity" do
+    {:ok, stack} = SmolNet.start_stack()
+
+    sockets_and_selects =
+      Enum.map(1..div(Stack.default_limits().ready_events, 2), fn internal_handle ->
+        socket = Readiness.open(stack, internal_handle)
+        assert {:select, read_select} = Readiness.wait(socket, :read, :recv)
+        assert {:select, write_select} = Readiness.wait(socket, :write, :send)
+        {socket, [read_select, write_select]}
+      end)
+
+    %{stack: stack_pid} = Ref.pids(stack)
+    %{native: native} = :sys.get_state(stack_pid)
+    assert {:ok, %{result: :ok}} = Native.test_set_budget_checkpoints(native, 1)
+
+    assert :ok = GenServer.stop(stack_pid, :normal)
+
+    Enum.each(sockets_and_selects, fn {socket, selects} ->
+      Enum.each(selects, &assert_abort(socket, &1, :closed))
+    end)
   end
 
   test "shutdown rejects every later socket operation" do

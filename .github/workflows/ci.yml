@@ -98,13 +98,55 @@ jobs:
       - run: mix local.hex --force
       - run: mix local.rebar --force
       - run: mix deps.get
-      # Shared-runner wall-clock timings are evidence only until #14 provides
-      # a portable hard gate. Reduction budgets remain enforced everywhere.
       - run: mix precommit
         env:
-          SMOLNET_NIF_WALL_CLOCK_MODE: report
+          # Enforce the full-call p99 while retaining the maximum as evidence;
+          # host preemption makes a shared-runner maximum unsuitable as a gate.
+          SMOLNET_NIF_WALL_CLOCK_MODE: p99
       - run: mix coveralls.cobertura
       - run: mix hex.build
+
+  native-budget:
+    name: native budget / ${{ matrix.architecture }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {os: ubuntu-24.04-arm, architecture: linux-aarch64}
+          - {os: macos-15, architecture: macos-source}
+
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - uses: erlef/setup-beam@54075bcc5e249e4758d363f27d099f55d843f124 # v1
+        with:
+          elixir-version: "1.19.5"
+          otp-version: "28.3"
+
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          toolchain: 1.94.0
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          workspaces: native -> target
+
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: deps
+          key: >-
+            budget-${{ runner.os }}-${{ runner.arch }}-1.19.5-28.3-
+            ${{ hashFiles('mix.lock', 'native/Cargo.lock') }}
+
+      - run: mix local.hex --force
+      - run: mix local.rebar --force
+      - run: mix deps.get
+      - run: mix compile --warnings-as-errors
+      - run: mix run scripts/nif_budget.exs
+        env:
+          SMOLNET_NIF_WALL_CLOCK_MODE: p99
 
   native-safety:
     name: native safety / ASan fuzz

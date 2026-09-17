@@ -113,6 +113,11 @@ defmodule SmolNet.Native do
   @spec test_bounded_work(reference(), map()) :: {:ok, map()} | {:error, atom()}
   def test_bounded_work(_stack, _requested), do: :erlang.nif_error(:nif_not_loaded)
 
+  @spec test_set_budget_checkpoints(reference(), non_neg_integer()) ::
+          {:ok, map()} | {:error, atom()}
+  def test_set_budget_checkpoints(_stack, _checkpoints),
+    do: :erlang.nif_error(:nif_not_loaded)
+
   @spec test_maximum_work(reference()) :: {:ok, map()} | {:error, atom()}
   def test_maximum_work(_stack), do: :erlang.nif_error(:nif_not_loaded)
 

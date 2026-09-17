@@ -11,11 +11,13 @@ defmodule SmolNet.StackSupervisorTest do
     previous_native = Application.get_env(:smolnet, :native_module)
     previous_process = Application.get_env(:smolnet, :native_test_process)
     previous_result = Application.get_env(:smolnet, :native_test_result)
+    previous_shutdown_result = Application.get_env(:smolnet, :native_shutdown_result)
 
     on_exit(fn ->
       restore_env(:native_module, previous_native)
       restore_env(:native_test_process, previous_process)
       restore_env(:native_test_result, previous_result)
+      restore_env(:native_shutdown_result, previous_shutdown_result)
       stop_all_stacks()
     end)
   end
@@ -88,6 +90,43 @@ defmodule SmolNet.StackSupervisorTest do
 
     assert_receive {:adapter_terminated, ^adapter, :shutdown, true}
     assert_receive {:DOWN, ^stack_monitor, :process, _, :shutdown}
+  end
+
+  test "shutdown errors still terminate the complete bundle" do
+    configure_native_double({:ok, empty_envelope(make_ref())})
+    {:ok, ref} = SmolNet.start_stack()
+    pids = Ref.pids(ref)
+    monitors = monitor_all(pids)
+    shutdown_calls = :atomics.new(1, [])
+
+    Application.put_env(
+      :smolnet,
+      :native_shutdown_result,
+      {:counted, shutdown_calls, {:error, :native_panic}}
+    )
+
+    assert :ok = SmolNet.stop_stack(ref)
+    assert_all_down(monitors)
+    assert :atomics.get(shutdown_calls, 1) == 1
+  end
+
+  test "termination retries one transient shutdown lock collision" do
+    configure_native_double({:ok, empty_envelope(make_ref())})
+    {:ok, ref} = SmolNet.start_stack()
+    pids = Ref.pids(ref)
+    monitors = monitor_all(pids)
+    shutdown_calls = :atomics.new(1, [])
+
+    Application.put_env(
+      :smolnet,
+      :native_shutdown_result,
+      {:fail_once, shutdown_calls, {:error, :ownership_invariant_violation},
+       {:ok, empty_envelope(:ok)}}
+    )
+
+    assert :ok = SmolNet.stop_stack(ref)
+    assert_all_down(monitors)
+    assert :atomics.get(shutdown_calls, 1) == 2
   end
 
   test "forced stack loss removes every adapter" do

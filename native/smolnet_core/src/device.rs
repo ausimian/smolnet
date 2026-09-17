@@ -1,13 +1,63 @@
 use std::collections::VecDeque;
 
+#[cfg(any(test, feature = "fuzzing"))]
+use rustler::NewBinary;
+#[cfg(all(not(test), not(feature = "fuzzing")))]
+use rustler::OwnedBinary;
+use rustler::{Env, Term};
 use smoltcp::phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken};
 use smoltcp::time::Instant;
 
-#[derive(Debug)]
+pub struct OutputPacket {
+    #[cfg(all(not(test), not(feature = "fuzzing")))]
+    inner: OwnedBinary,
+    #[cfg(any(test, feature = "fuzzing"))]
+    inner: Vec<u8>,
+}
+
+impl OutputPacket {
+    pub fn zeroed(size: usize) -> Self {
+        #[cfg(all(not(test), not(feature = "fuzzing")))]
+        let inner = {
+            let mut binary = OwnedBinary::new(size).expect("bounded transmit packet allocation");
+            binary.as_mut_slice().fill(0);
+            binary
+        };
+        #[cfg(any(test, feature = "fuzzing"))]
+        let inner = vec![0; size];
+
+        Self { inner }
+    }
+
+    pub fn len(&self) -> usize {
+        self.inner.len()
+    }
+
+    #[cfg(test)]
+    pub fn as_slice(&self) -> &[u8] {
+        self.inner.as_ref()
+    }
+
+    pub fn as_mut_slice(&mut self) -> &mut [u8] {
+        self.inner.as_mut()
+    }
+
+    pub fn into_term<'a>(self, env: Env<'a>) -> Term<'a> {
+        #[cfg(all(not(test), not(feature = "fuzzing")))]
+        {
+            self.inner.release(env).into()
+        }
+        #[cfg(any(test, feature = "fuzzing"))]
+        {
+            NewBinary::from_iter(env, self.inner.into_iter()).into()
+        }
+    }
+}
+
 pub struct BeamDevice {
     mtu: usize,
     receive: VecDeque<Vec<u8>>,
-    transmit: VecDeque<Vec<u8>>,
+    transmit: VecDeque<OutputPacket>,
     transmit_limit: usize,
 }
 
@@ -34,7 +84,12 @@ impl BeamDevice {
         Ok(())
     }
 
-    pub fn take_transmit(&mut self, packet_limit: usize, byte_limit: usize) -> Vec<Vec<u8>> {
+    pub fn take_transmit(
+        &mut self,
+        packet_limit: usize,
+        byte_limit: usize,
+        budget: &mut crate::budget::CallBudget,
+    ) -> Vec<OutputPacket> {
         let mut packets = Vec::new();
         let mut bytes = 0usize;
 
@@ -48,6 +103,10 @@ impl BeamDevice {
             };
 
             if next_bytes > byte_limit {
+                break;
+            }
+
+            if !budget.checkpoint() {
                 break;
             }
 
@@ -70,6 +129,14 @@ impl BeamDevice {
         (self.receive.len(), self.transmit.len())
     }
 
+    pub fn discard_one(&mut self) -> bool {
+        if self.receive.pop_front().is_some() {
+            true
+        } else {
+            self.transmit.pop_front().is_some()
+        }
+    }
+
     #[cfg(debug_assertions)]
     pub fn test_fill_transmit(
         &mut self,
@@ -81,7 +148,7 @@ impl BeamDevice {
         }
 
         self.transmit
-            .extend((0..packet_count).map(|_| vec![0; packet_size]));
+            .extend((0..packet_count).map(|_| OutputPacket::zeroed(packet_size)));
         Ok(())
     }
 }
@@ -97,15 +164,15 @@ impl RxToken for BeamRxToken {
     }
 }
 
-pub struct BeamTxToken<'a>(&'a mut VecDeque<Vec<u8>>);
+pub struct BeamTxToken<'a>(&'a mut VecDeque<OutputPacket>);
 
 impl TxToken for BeamTxToken<'_> {
     fn consume<R, F>(self, length: usize, operation: F) -> R
     where
         F: FnOnce(&mut [u8]) -> R,
     {
-        let mut packet = vec![0; length];
-        let result = operation(&mut packet);
+        let mut packet = OutputPacket::zeroed(length);
+        let result = operation(packet.as_mut_slice());
         self.0.push_back(packet);
         result
     }
@@ -142,6 +209,7 @@ mod tests {
     use smoltcp::phy::{Device, Medium, TxToken};
 
     use super::BeamDevice;
+    use crate::budget::CallBudget;
 
     #[test]
     fn reports_raw_ip_capabilities() {
@@ -165,10 +233,13 @@ mod tests {
         tx.consume(40, |packet| packet[0] = 0x60);
 
         assert!(device.transmit(smoltcp::time::Instant::ZERO).is_none());
-        assert_eq!(device.take_transmit(1, 39), Vec::<Vec<u8>>::new());
+        let mut budget = CallBudget::start(None);
+        assert!(device.take_transmit(1, 39, &mut budget).is_empty());
 
         let mut expected = vec![0; 40];
         expected[0] = 0x60;
-        assert_eq!(device.take_transmit(1, 40), vec![expected]);
+        let packets = device.take_transmit(1, 40, &mut budget);
+        assert_eq!(packets.len(), 1);
+        assert_eq!(packets[0].as_slice(), expected);
     }
 }

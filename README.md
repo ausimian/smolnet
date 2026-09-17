@@ -467,17 +467,40 @@ verified release assets rather than committed to the Git repository. Until
 that workflow lands, consumers need a Rust toolchain, platform C linker, and
 Erlang development files. Alpine and other musl systems remain unsupported.
 
-Configurable per-call maxima are 65,575 copied bytes, 32 output packets, 128
-readiness events, and 128 maintenance units. These fixed quotas work with the
-native envelope's `more` continuation flag so remaining work is polled again.
+Every native stack call has a 1 ms normal-scheduler target. Native work stops
+at a monotonic 750 microsecond deadline, reserving 250 microseconds for result
+encoding and handoff to the BEAM. Output packets are allocated as Rustler
+`OwnedBinary` values and released into the result without a second payload
+copy. Output, readiness and overflow delivery, listener and closing
+maintenance, and shutdown retain their cursors or queues when the deadline is
+reached; `more: true` asks the stack owner to run the next bounded slice.
+Native calls also report their measured scheduler share through
+`enif_consume_timeslice`, so repeated continuations yield fairly to other
+stack processes and ordinary mailbox traffic.
+
+Ingress remains a single-feeder interface with one admitted packet at a time.
+When a deadline continuation still owns that slot, another feeder call can
+return `{:error, :busy}` sooner than it did under quota-only batching. Feeders
+should treat `:busy` as backpressure and retry after yielding or waiting for
+their next input opportunity.
+
+The time budget is backed by deterministic per-call maxima of 65,575 copied
+bytes, 32 output packets, 128 readiness events, and 128 maintenance units.
+These bounds prevent clock or platform anomalies from creating unbounded work.
 A separate hard ceiling allows at most 64 native TCP/UDP backing sockets per
 stack, including listener pools and wildcard-UDP expansion across configured
-addresses. Local `mix precommit` measures empty and maximum output, ingress,
-maintenance, readiness, shutdown, and resource-destruction paths against a
-hard 1 ms normal-scheduler wall-time gate. GitHub-hosted CI reports the same
-wall-clock evidence without gating on VM speed, while continuing to enforce
-the deterministic caller-reduction ceiling. Issue #14 tracks restoring a
-portable hard wall-clock gate.
+addresses. `SmolNet.stack_info/1` exposes the call target, work budget,
+encoding headroom, deadline-yield count, timeslice-exhaustion count, and
+maximum observed serialized native-call duration before result encoding.
+
+Local `mix precommit` enforces a 1 ms maximum for complete Elixir-visible NIF
+calls, including result encoding. The GitHub-hosted x86_64 Linux quality job
+plus the AArch64 Linux and macOS native-budget jobs enforce the full-call p99
+while retaining the absolute maximum as evidence, avoiding false failures from
+host preemption. Each maximum-state scenario uses 100 independently prepared
+samples in p99 mode.
+Unexpected resource destruction remains synchronously bounded by the fixed
+socket, waiter, and packet capacities and is included in the benchmark.
 
 ## Troubleshooting
 

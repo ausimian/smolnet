@@ -23,7 +23,207 @@ defmodule SmolNet.NativeTest do
     assert first_snapshot.result.socket_count == 0
     assert first_snapshot.result.native_socket_count == 0
     assert first_snapshot.result.ready_count == 0
+    assert first_snapshot.result.call_target_nanoseconds == 1_000_000
+    assert first_snapshot.result.work_budget_nanoseconds == 750_000
+    assert first_snapshot.result.encoding_headroom_nanoseconds == 250_000
     assert first_snapshot.result.id != second_snapshot.result.id
+  end
+
+  test "snapshots do not perturb the native call metrics they report" do
+    resource = native_stack()
+    assert {:ok, _envelope} = Native.stack_poll(resource, 0)
+    assert {:ok, %{result: first}} = Native.stack_snapshot(resource)
+    assert {:ok, %{result: second}} = Native.stack_snapshot(resource)
+
+    assert second.counters.native_calls == first.counters.native_calls
+    assert second.counters.deadline_yields == first.counters.deadline_yields
+
+    assert second.counters.max_native_work_nanoseconds ==
+             first.counters.max_native_work_nanoseconds
+  end
+
+  @tag :debug_nif
+  test "deadline yields retain zero-copy output for the next continuation" do
+    resource = native_stack()
+    assert {:ok, %{result: :ok}} = Native.test_prepare_maximum_drop(resource)
+    assert {:ok, %{result: :ok}} = Native.test_set_budget_checkpoints(resource, 0)
+
+    assert {:ok, %{output: [], more: true}} = Native.stack_poll(resource, 0)
+    assert {:ok, %{result: yielded}} = Native.stack_snapshot(resource)
+    assert yielded.transmit_packets == yielded.limits.output_packets
+    assert yielded.counters.deadline_yields >= 1
+
+    assert {:ok, %{output: output, more: false}} = poll_until_complete(resource)
+    assert length(output) == yielded.limits.output_packets
+    assert Enum.all?(output, &(byte_size(&1) == yielded.mtu))
+
+    assert {:ok, %{result: completed}} = Native.stack_snapshot(resource)
+    assert completed.transmit_packets == 0
+    assert completed.counters.max_output_packets == completed.limits.output_packets
+  end
+
+  @tag :debug_nif
+  test "an expired checkpoint without retained work does not request a continuation" do
+    resource = native_stack()
+    assert {:ok, %{result: :ok}} = Native.test_set_budget_checkpoints(resource, 0)
+    assert {:ok, %{more: false}} = Native.test_socket_ready(resource, [])
+
+    assert {:ok, %{result: snapshot}} = Native.stack_snapshot(resource)
+    assert snapshot.counters.deadline_yields >= 1
+  end
+
+  @tag :debug_nif
+  test "shutdown aborts queued readiness instead of delivering a select" do
+    resource = native_stack()
+    {:ok, %{result: identity}} = Native.test_socket_open(resource, 1)
+    reference = make_ref()
+
+    assert {:ok, %{result: {:select, :recv, ^reference}}} =
+             Native.test_socket_wait(resource, identity, %{
+               direction: :read,
+               operation: :recv,
+               pid: self(),
+               reference: reference,
+               arm_point: :none,
+               wake_count: 1,
+               completed: false
+             })
+
+    assert {:ok, %{result: :ok}} = Native.test_set_budget_checkpoints(resource, 0)
+
+    assert {:ok, %{more: true}} =
+             Native.test_socket_ready(resource, [%{identity: identity, direction: :read}])
+
+    assert {:ok, _shutdown} = Native.stack_shutdown(resource)
+    assert {:ok, %{more: false}} = poll_until_complete(resource)
+    %{id: id, generation: generation} = identity
+    assert_receive {:"$smol_socket", {^id, ^generation}, :abort, ^reference, :closed}
+    refute_receive {:"$smol_socket", {^id, ^generation}, :select, ^reference}
+  end
+
+  @tag :debug_nif
+  test "listener scans and closing cleanup resume from retained cursors" do
+    address = [0xFD | List.duplicate(0, 14)] ++ [1]
+
+    resource =
+      native_stack(%{mtu: 1_500, addresses: [%{address: address, prefix_length: 64}], routes: []})
+
+    {:ok, %{result: listener}} = Native.tcp_open(resource, :inet6)
+
+    assert {:ok, %{result: :ok}} =
+             Native.tcp_bind(resource, listener, %{address: address, port: 40_000, scope_id: 0})
+
+    assert {:ok, %{result: :ok}} = Native.test_set_budget_checkpoints(resource, 0)
+    assert {:ok, %{result: :ok, more: true}} = Native.tcp_listen(resource, listener, 4, 0)
+    assert {:ok, %{more: false}} = poll_at_until_complete(resource, 0)
+
+    closing = native_stack()
+    assert {:ok, %{result: :ok}} = Native.test_prepare_closing(closing, 64)
+    assert {:ok, %{result: :ok}} = Native.test_set_budget_checkpoints(closing, 1)
+    assert {:ok, %{more: true}} = Native.stack_poll(closing, 30_000)
+    assert {:ok, %{result: retained}} = Native.stack_snapshot(closing)
+    assert retained.closing_tcp_socket_count == 64
+
+    assert {:ok, %{more: false}} = poll_at_until_complete(closing, 30_000)
+    assert {:ok, %{result: completed}} = Native.stack_snapshot(closing)
+    assert completed.closing_tcp_socket_count == 0
+    assert completed.native_socket_count == 0
+    assert completed.counters.deadline_yields >= 1
+  end
+
+  @tag :debug_nif
+  test "readiness and shutdown make bounded progress across forced continuations" do
+    resource = native_stack()
+
+    identities_and_references =
+      Enum.map(1..Stack.default_limits().ready_events, fn internal_handle ->
+        {:ok, %{result: identity}} = Native.test_socket_open(resource, internal_handle)
+        reference = make_ref()
+
+        assert {:ok, %{result: {:select, :recv, ^reference}}} =
+                 Native.test_socket_wait(resource, identity, %{
+                   direction: :read,
+                   operation: :recv,
+                   pid: self(),
+                   reference: reference,
+                   arm_point: :none,
+                   wake_count: 1,
+                   completed: false
+                 })
+
+        {identity, reference}
+      end)
+
+    keys =
+      Enum.map(identities_and_references, fn {identity, _reference} ->
+        %{identity: identity, direction: :read}
+      end)
+
+    assert {:ok, %{result: :ok}} = Native.test_set_budget_checkpoints(resource, 0)
+    assert {:ok, %{more: true}} = Native.test_socket_ready(resource, keys)
+    refute_receive {:"$smol_socket", _identity, :select, _reference}, 0
+
+    assert {:ok, %{more: false}} = poll_until_complete(resource)
+
+    Enum.each(identities_and_references, fn {identity, reference} ->
+      %{id: id, generation: generation} = identity
+      assert_receive {:"$smol_socket", {^id, ^generation}, :select, ^reference}
+    end)
+
+    shutdown_references =
+      Enum.map(identities_and_references, fn {identity, _reference} ->
+        reference = make_ref()
+
+        assert {:ok, %{result: {:select, :send, ^reference}}} =
+                 Native.test_socket_wait(resource, identity, %{
+                   direction: :write,
+                   operation: :send,
+                   pid: self(),
+                   reference: reference,
+                   arm_point: :none,
+                   wake_count: 0,
+                   completed: false
+                 })
+
+        {identity, reference}
+      end)
+
+    expected_shutdown_messages =
+      Enum.map(shutdown_references, fn {%{id: id, generation: generation}, reference} ->
+        {:"$smol_socket", {id, generation}, :abort, reference, :closed}
+      end)
+
+    assert {:ok, %{result: :ok}} = Native.test_set_budget_checkpoints(resource, 1)
+    assert {:ok, %{more: true}} = Native.stack_shutdown(resource)
+    refute_receive {:"$smol_socket", _identity, :abort, _reference, :closed}, 0
+
+    assert {:ok, %{result: :ok}} = Native.test_set_budget_checkpoints(resource, 1)
+    assert {:ok, %{more: true}} = Native.stack_poll(resource, 0)
+
+    assert_receive priority_abort =
+                     {:"$smol_socket", _identity, :abort, _reference, :closed}
+
+    assert priority_abort in expected_shutdown_messages
+
+    assert {:ok, %{result: retained_shutdown}} = Native.stack_snapshot(resource)
+    assert retained_shutdown.lifecycle == :shutting_down
+    assert retained_shutdown.socket_count == Stack.default_limits().ready_events - 1
+
+    assert {:ok, %{more: false}} = poll_until_complete(resource)
+
+    Enum.each(List.delete(expected_shutdown_messages, priority_abort), fn message ->
+      assert_receive ^message
+    end)
+
+    assert {:ok, %{result: shutdown}} = Native.stack_snapshot(resource)
+    assert shutdown.lifecycle == :shutdown
+    assert shutdown.socket_count == 0
+    assert shutdown.native_socket_count == 0
+    assert shutdown.waiter_count == 0
+    assert shutdown.counters.deadline_yields >= 2
+
+    packet = <<6::4, 0::28, 0::16, 59, 64, 0::256>>
+    assert {:error, :closed} = Native.stack_ingress(resource, packet, 0)
   end
 
   @tag :debug_nif
@@ -318,6 +518,46 @@ defmodule SmolNet.NativeTest do
     %{stack: stack} = Ref.pids(ref)
     {:ok, snapshot} = Stack.native_snapshot(stack)
     snapshot
+  end
+
+  defp native_stack(config \\ %{mtu: 1_500, addresses: [], routes: []}) do
+    {:ok, %{result: resource}} =
+      Native.stack_new(Stack.default_limits(), config, 0)
+
+    resource
+  end
+
+  defp poll_until_complete(resource, calls \\ 0, output \\ [])
+
+  defp poll_until_complete(_resource, calls, _output) when calls >= 512 do
+    flunk("native continuation did not make bounded progress")
+  end
+
+  defp poll_until_complete(resource, calls, output) do
+    assert {:ok, envelope} = Native.stack_poll(resource, calls)
+    output = output ++ envelope.output
+
+    if envelope.more do
+      poll_until_complete(resource, calls + 1, output)
+    else
+      {:ok, %{envelope | output: output}}
+    end
+  end
+
+  defp poll_at_until_complete(resource, now, calls \\ 0)
+
+  defp poll_at_until_complete(_resource, _now, calls) when calls >= 512 do
+    flunk("native maintenance continuation did not make bounded progress")
+  end
+
+  defp poll_at_until_complete(resource, now, calls) do
+    assert {:ok, envelope} = Native.stack_poll(resource, now)
+
+    if envelope.more do
+      poll_at_until_complete(resource, now, calls + 1)
+    else
+      {:ok, envelope}
+    end
   end
 
   defp ipv6_addresses(count) do

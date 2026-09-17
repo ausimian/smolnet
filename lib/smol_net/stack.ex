@@ -18,6 +18,11 @@ defmodule SmolNet.Stack do
     maintenance_work: 128
   }
 
+  # Valid bounded state converges well below this guard. The guard counts NIF
+  # invocations rather than work units because a runtime deadline can expire
+  # before a cleanup unit; its purpose is to bound a non-convergent fault.
+  @shutdown_continuation_limit 1_024
+
   @type limits :: %{
           bytes_copied: pos_integer(),
           output_packets: pos_integer(),
@@ -264,7 +269,7 @@ defmodule SmolNet.Stack do
   @doc false
   @spec shutdown_waiters(pid()) :: :ok | {:error, atom()}
   def shutdown_waiters(stack) do
-    GenServer.call(stack, :shutdown_waiters)
+    GenServer.call(stack, :shutdown_waiters, :infinity)
   catch
     :exit, _reason -> {:error, :closed}
   end
@@ -322,6 +327,8 @@ defmodule SmolNet.Stack do
       rejected_ingress: 0,
       dropped_egress: 0,
       native_continuation: false,
+      shutdown_requested: false,
+      shutdown_drain_attempted: false,
       pending_ingress: nil,
       socket_owner_monitors: %{},
       socket_owner_monitors_by_identity: %{}
@@ -433,6 +440,9 @@ defmodule SmolNet.Stack do
         %{ingress_token: ingress_token} = state
       ) do
     case validate_packet(packet, state.native_config.mtu) do
+      :ok when state.shutdown_requested ->
+        reject_ingress(state, :closed)
+
       :ok when state.link_status == :up ->
         accept_ingress(state, from, packet)
 
@@ -461,8 +471,16 @@ defmodule SmolNet.Stack do
   end
 
   def handle_call(:shutdown_waiters, _from, state) do
-    state.native_module.stack_shutdown(state.native)
-    |> reply_native(state)
+    state = state |> Map.put(:shutdown_requested, true) |> reject_pending_ingress(:closed)
+    reply = drain_native_shutdown(state)
+
+    state =
+      state
+      |> Map.put(:native_continuation, false)
+      |> Map.put(:shutdown_drain_attempted, shutdown_drain_terminal?(reply))
+      |> replace_timer(nil)
+
+    {:reply, reply, state}
   end
 
   def handle_call(
@@ -773,12 +791,14 @@ defmodule SmolNet.Stack do
 
   @impl true
   def terminate(_reason, state) do
+    state = reject_pending_ingress(state, :closed)
+
     if state.timer do
       _cancel_result = state.clock.cancel_timer(state.timer.ref)
     end
 
-    if state.native_module && state.native do
-      _shutdown_result = state.native_module.stack_shutdown(state.native)
+    if state.native_module && state.native && !state.shutdown_drain_attempted do
+      _shutdown_result = drain_native_shutdown(state)
     end
 
     :ok
@@ -989,6 +1009,13 @@ defmodule SmolNet.Stack do
 
   defp accept_ingress(state, _from, _packet), do: reject_ingress(state, :busy)
 
+  defp reject_pending_ingress(%{pending_ingress: nil} = state, _reason), do: state
+
+  defp reject_pending_ingress(%{pending_ingress: {from, _packet}} = state, reason) do
+    GenServer.reply(from, {:error, reason})
+    %{state | pending_ingress: nil}
+  end
+
   defp continue_pending_ingress(%{native_continuation: true} = state) do
     {:noreply, state}
   end
@@ -1005,6 +1032,33 @@ defmodule SmolNet.Stack do
 
   defp timer_deadline(nil), do: nil
   defp timer_deadline(timer), do: timer.deadline
+
+  defp drain_native_shutdown(state) do
+    case state.native_module.stack_shutdown(state.native) do
+      {:ok, envelope} ->
+        continue_native_shutdown(state, envelope, @shutdown_continuation_limit)
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp continue_native_shutdown(_state, %{more: false}, _remaining), do: :ok
+
+  defp continue_native_shutdown(_state, %{more: true}, 0),
+    do: {:error, :shutdown_incomplete}
+
+  defp continue_native_shutdown(state, %{more: true}, remaining) do
+    case state.native_module.stack_poll(state.native, state.clock.now()) do
+      {:ok, envelope} -> continue_native_shutdown(state, envelope, remaining - 1)
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  # A try-lock collision is transient, so terminate/2 gets one more attempt.
+  # Panics and a non-convergent bounded drain must not repeat expensive work.
+  defp shutdown_drain_terminal?({:error, :ownership_invariant_violation}), do: false
+  defp shutdown_drain_terminal?(_result), do: true
 
   defp reply_native(
          result,

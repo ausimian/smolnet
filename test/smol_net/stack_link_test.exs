@@ -220,6 +220,36 @@ defmodule SmolNet.StackLinkTest do
     assert_receive {:DOWN, ^feeder_monitor, :process, ^feeder, :normal}
   end
 
+  test "orderly shutdown rejects ingress parked behind a continuation" do
+    configure_native_double(:wait)
+    packet = empty_ipv6_packet()
+    {:ok, stack} = SmolNet.start_stack(egress: {self(), :shutdown})
+    %{stack: stack_pid} = Ref.pids(stack)
+
+    assert :ok = SmolNet.ingress(stack, packet)
+    assert_receive {:native_stack_ingress, ^stack_pid, ^packet}
+
+    pending_ingress =
+      Task.async(fn ->
+        GenServer.call(
+          stack_pid,
+          {:ingress, stack.ingress_token, packet},
+          :infinity
+        )
+      end)
+
+    shutdown = Task.async(fn -> SmolNet.Stack.shutdown_waiters(stack_pid) end)
+    assert_eventually(fn -> message_queue_length(stack_pid) == 2 end)
+
+    send(stack_pid, {:native_ingress_reply, empty_effects(more: true)})
+
+    assert Task.await(pending_ingress) == {:error, :closed}
+    assert Task.await(shutdown) == :ok
+    assert Process.alive?(stack_pid)
+    assert SmolNet.ingress(stack, packet) == {:error, :closed}
+    refute_receive {:native_stack_ingress, ^stack_pid, ^packet}, 50
+  end
+
   test "only capability-authenticated ingress calls reach native processing" do
     {:ok, stack} = SmolNet.start_stack(egress: {self(), :authenticated})
     %{stack: stack_pid} = Ref.pids(stack)
@@ -320,6 +350,44 @@ defmodule SmolNet.StackLinkTest do
     assert Task.await(second_ingress) == :ok
     assert_receive {:native_stack_ingress, ^stack_pid, ^packet}
     send(stack_pid, {:native_ingress_reply, empty_effects()})
+  end
+
+  test "repeated native continuations do not starve stack messages or another stack" do
+    {:ok, counter} = Agent.start(fn -> 10_000 end)
+
+    on_exit(fn ->
+      Application.put_env(:smolnet, :native_poll_result, empty_effects())
+      stop_all_stacks()
+
+      if Process.alive?(counter) do
+        Agent.stop(counter)
+      end
+    end)
+
+    configure_native_double(empty_effects(more: true))
+    Application.put_env(:smolnet, :native_poll_result, {:countdown, counter, :silent})
+
+    {:ok, continuing_stack} = SmolNet.start_stack(egress: {self(), :continuing})
+    {:ok, independent_stack} = SmolNet.start_stack(egress: {self(), :independent})
+    packet = empty_ipv6_packet()
+
+    assert :ok = SmolNet.ingress(continuing_stack, packet)
+    assert_receive {:native_stack_ingress, _stack_pid, ^packet}
+
+    continuing_info = Task.async(fn -> SmolNet.stack_info(continuing_stack) end)
+    independent_info = Task.async(fn -> SmolNet.stack_info(independent_stack) end)
+
+    assert {:ok, %{native: %{result: %{test_double: true}}}} =
+             Task.await(continuing_info, 1_000)
+
+    assert {:ok, %{native: %{result: %{test_double: true}}}} =
+             Task.await(independent_info, 1_000)
+
+    assert Agent.get(counter, & &1) > 0
+
+    Application.put_env(:smolnet, :native_poll_result, empty_effects())
+    assert {:ok, _info} = SmolNet.stack_info(continuing_stack)
+    Agent.stop(counter)
   end
 
   test "two stacks on independent links progress when one link is held" do

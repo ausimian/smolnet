@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::ops::Bound::{Excluded, Included, Unbounded};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Mutex, TryLockError};
@@ -17,8 +17,9 @@ use smoltcp::wire::{
     Ipv4Cidr, Ipv4Packet, Ipv6Address, Ipv6Cidr, Ipv6ExtHeader, Ipv6Packet, TcpPacket,
 };
 
+use crate::budget::{CALL_TARGET, CallBudget, ENCODING_HEADROOM, WORK_BUDGET};
 use crate::decode_bounded_list;
-use crate::device::BeamDevice;
+use crate::device::{BeamDevice, OutputPacket};
 use crate::limits::{Limits, Work};
 #[cfg(debug_assertions)]
 use crate::socket_table::InstallResult;
@@ -70,6 +71,22 @@ impl StackResource {
     }
 
     pub fn with_stack<T>(&self, operation: impl FnOnce(&mut NativeStack) -> T) -> Result<T, ()> {
+        match self.inner.try_lock() {
+            Ok(mut guard) => {
+                let stack = guard.as_mut().ok_or(())?;
+                stack.begin_call();
+                let result = operation(stack);
+                stack.observe_call();
+                Ok(result)
+            }
+            Err(TryLockError::WouldBlock | TryLockError::Poisoned(_)) => Err(()),
+        }
+    }
+
+    pub fn with_stack_unobserved<T>(
+        &self,
+        operation: impl FnOnce(&mut NativeStack) -> T,
+    ) -> Result<T, ()> {
         match self.inner.try_lock() {
             Ok(mut guard) => guard.as_mut().map(operation).ok_or(()),
             Err(TryLockError::WouldBlock | TryLockError::Poisoned(_)) => Err(()),
@@ -129,11 +146,15 @@ pub struct NativeStack {
     ready: ReadyQueue,
     ready_sweep: bool,
     ready_sweep_cursor: Option<ReadyKey>,
+    ready_sweep_pending: VecDeque<ReadyKey>,
     counters: Counters,
     lifecycle: Lifecycle,
     limits: Limits,
     mtu: usize,
     route_prefixes: Vec<IpCidr>,
+    call_budget: CallBudget,
+    next_forced_budget_checkpoints: Option<usize>,
+    pending_notifications: VecDeque<PendingNotification>,
 }
 
 impl NativeStack {
@@ -192,12 +213,36 @@ impl NativeStack {
             ready: ReadyQueue::new((limits.ready_events / 2).max(1)),
             ready_sweep: false,
             ready_sweep_cursor: None,
+            ready_sweep_pending: VecDeque::new(),
             counters: Counters::default(),
             lifecycle: Lifecycle::Running,
             limits,
             mtu: stack_config.mtu,
             route_prefixes,
+            call_budget: CallBudget::start(None),
+            next_forced_budget_checkpoints: None,
+            pending_notifications: VecDeque::new(),
         })
+    }
+
+    fn begin_call(&mut self) {
+        self.call_budget = CallBudget::start(self.next_forced_budget_checkpoints.take());
+    }
+
+    fn observe_call(&mut self) {
+        self.counters.native_calls += 1;
+        self.counters.max_native_work_nanoseconds = self
+            .counters
+            .max_native_work_nanoseconds
+            .max(self.call_budget.elapsed_nanoseconds());
+
+        if self.call_budget.yielded() {
+            self.counters.deadline_yields += 1;
+        }
+    }
+
+    fn within_budget(&mut self) -> bool {
+        self.call_budget.checkpoint()
     }
 
     pub fn snapshot(&self) -> Envelope<Snapshot> {
@@ -257,14 +302,19 @@ impl NativeStack {
                 sent_waiter_count: read_sent_waiters + write_sent_waiters,
                 read_sent_waiter_count: read_sent_waiters,
                 write_sent_waiter_count: write_sent_waiters,
-                ready_count: self.ready.len(),
-                ready_overflow_pending: self.ready_sweep || self.ready.has_pending(),
+                ready_count: self.ready.len() + self.ready_sweep_pending.len(),
+                ready_overflow_pending: self.ready_sweep
+                    || !self.ready_sweep_pending.is_empty()
+                    || self.ready.has_pending(),
                 readiness: self.ready.counters(),
                 receive_packets,
                 transmit_packets,
                 mtu: self.mtu,
                 ip_address_count: self.interface.ip_addrs().len(),
                 lifecycle: self.lifecycle.as_atom(),
+                call_target_nanoseconds: CALL_TARGET.as_nanos() as u64,
+                work_budget_nanoseconds: WORK_BUDGET.as_nanos() as u64,
+                encoding_headroom_nanoseconds: ENCODING_HEADROOM.as_nanos() as u64,
                 counters: self.counters,
             },
             output: Vec::new(),
@@ -287,6 +337,12 @@ impl NativeStack {
     }
 
     #[cfg(debug_assertions)]
+    pub fn test_set_budget_checkpoints(&mut self, checkpoints: usize) -> Envelope<Atom> {
+        self.next_forced_budget_checkpoints = Some(checkpoints);
+        Envelope::empty(crate::atoms::ok())
+    }
+
+    #[cfg(debug_assertions)]
     pub fn test_maximum_work(&mut self) -> Envelope<Work> {
         let completed = Work {
             bytes_copied: self.limits.bytes_copied,
@@ -299,7 +355,7 @@ impl NativeStack {
         let larger_packets = completed.bytes_copied % packet_count;
 
         let output = (0..packet_count)
-            .map(|index| vec![0_u8; base_size + usize::from(index < larger_packets)])
+            .map(|index| OutputPacket::zeroed(base_size + usize::from(index < larger_packets)))
             .collect();
 
         self.counters.observe(completed);
@@ -345,7 +401,7 @@ impl NativeStack {
         let larger_packets = completed.bytes_copied % packet_count;
         let mut effects = self.poll(now);
         effects.output = (0..packet_count)
-            .map(|index| vec![0_u8; base_size + usize::from(index < larger_packets)])
+            .map(|index| OutputPacket::zeroed(base_size + usize::from(index < larger_packets)))
             .collect();
         self.counters.observe(Work {
             bytes_copied: completed.bytes_copied,
@@ -1461,6 +1517,10 @@ impl NativeStack {
     }
 
     pub fn ingress(&mut self, packet: &[u8], now: Instant) -> Result<Effects, StackError> {
+        if !matches!(self.lifecycle, Lifecycle::Running) {
+            return Err(StackError::Closed);
+        }
+
         self.validate_packet(packet)?;
         self.retarget_wildcard_listener(packet);
         let reset = self.inbound_reset(packet);
@@ -1479,6 +1539,17 @@ impl NativeStack {
             .expect("poll without ingress cannot fail")
     }
 
+    pub fn poll_call(&mut self, env: Env<'_>, now: Instant) -> Envelope<Atom> {
+        match self.lifecycle {
+            Lifecycle::Running => {
+                let effects = self.poll(now);
+                self.finish_call(env, crate::atoms::ok(), effects, Vec::new())
+            }
+            Lifecycle::ShuttingDown => self.continue_shutdown(env),
+            Lifecycle::Shutdown => Envelope::empty(crate::atoms::ok()),
+        }
+    }
+
     pub fn finish_call<T>(
         &mut self,
         env: Env<'_>,
@@ -1487,36 +1558,70 @@ impl NativeStack {
         aborts: Vec<PendingNotification>,
     ) -> Envelope<T> {
         let mut readiness_work = 0usize;
+        self.pending_notifications.extend(aborts);
 
-        for notification in aborts {
-            debug_assert!(readiness_work < self.limits.ready_events);
+        while readiness_work < self.limits.ready_events
+            && !self.pending_notifications.is_empty()
+            && self.within_budget()
+        {
+            let notification = self
+                .pending_notifications
+                .pop_front()
+                .expect("pending notification exists");
             self.send_abort(env, &notification.waiter, notification.identity);
             readiness_work += 1;
         }
 
-        if self.ready.take_overflow() {
+        if self.ready.take_overflow() && matches!(self.lifecycle, Lifecycle::Running) {
             self.ready_sweep = true;
             self.ready_sweep_cursor = None;
         }
 
-        let remaining = self.limits.ready_events.saturating_sub(readiness_work);
-        let queued = self.ready.drain(remaining);
+        let queued = {
+            let ready = &self.ready;
+            let call_budget = &mut self.call_budget;
+            ready.drain_while(self.limits.ready_events - readiness_work, || {
+                call_budget.checkpoint()
+            })
+        };
 
         for key in queued {
-            self.deliver_ready(env, key);
+            self.deliver_or_discard_ready(env, key);
             readiness_work += 1;
         }
 
-        let remaining = self.limits.ready_events.saturating_sub(readiness_work);
+        while readiness_work < self.limits.ready_events
+            && !self.ready_sweep_pending.is_empty()
+            && self.within_budget()
+        {
+            let key = self
+                .ready_sweep_pending
+                .pop_front()
+                .expect("pending sweep key exists");
+            self.deliver_or_discard_ready(env, key);
+            readiness_work += 1;
+        }
 
-        if self.ready_sweep && remaining > 0 {
-            let scan = self
-                .socket_table
-                .scan_ready(self.ready_sweep_cursor, remaining, remaining);
+        if self.ready_sweep
+            && self.ready_sweep_pending.is_empty()
+            && readiness_work < self.limits.ready_events
+        {
+            let remaining = self.limits.ready_events - readiness_work;
+            let scan = {
+                let socket_table = &self.socket_table;
+                let call_budget = &mut self.call_budget;
+                socket_table.scan_ready(self.ready_sweep_cursor, remaining, remaining, || {
+                    call_budget.checkpoint()
+                })
+            };
             let scan_cost = scan.entries_scanned.max(scan.keys.len());
 
             for key in scan.keys {
-                self.deliver_ready(env, key);
+                if self.within_budget() {
+                    self.deliver_or_discard_ready(env, key);
+                } else {
+                    self.ready_sweep_pending.push_back(key);
+                }
             }
 
             readiness_work += scan_cost;
@@ -1524,12 +1629,19 @@ impl NativeStack {
             self.ready_sweep_cursor = self.ready_sweep.then_some(scan.cursor).flatten();
         }
 
-        effects.more = effects.more || self.ready.has_pending() || self.ready_sweep;
+        effects.more = effects.more
+            || !self.pending_notifications.is_empty()
+            || self.ready.has_pending()
+            || !self.ready_sweep_pending.is_empty()
+            || self.ready_sweep;
         self.counters.observe(Work {
             ready_events: readiness_work,
             maintenance_work: effects.maintenance_work,
             ..Work::default()
         });
+        if rustler::schedule::consume_timeslice(env, self.call_budget.timeslice_percent()) {
+            self.counters.timeslice_exhaustions += 1;
+        }
 
         Envelope {
             result,
@@ -1544,49 +1656,132 @@ impl NativeStack {
             return Envelope::empty(crate::atoms::ok());
         }
 
-        // Linearize shutdown before draining the bounded table. Any socket
-        // operation serialized after this point is rejected as closed.
-        self.lifecycle = Lifecycle::Shutdown;
-
-        for record in std::mem::take(&mut self.tcp_records).into_values() {
-            self.sockets.remove(record.handle);
-        }
-        for listener in std::mem::take(&mut self.tcp_listeners).into_values() {
-            for handle in listener.pool {
-                self.sockets.remove(handle);
-            }
-        }
-        for record in std::mem::take(&mut self.udp_records).into_values() {
-            for handle in record.handles {
-                self.sockets.remove(handle);
-            }
-        }
-        self.tcp_connections.clear();
-        self.closing_tcp.clear();
-        self.closing_deadlines.clear();
-        self.closing_sweep_cursor = None;
-        self.closing_cleanup_pending = false;
-        self.closing_cleanup_resweep = false;
-        self.listener_scan_cursor = None;
-        self.listener_scan_pending = false;
-        self.listener_scan_resweep = false;
-
-        let waiters = self.socket_table.close_all();
-        debug_assert!(waiters.len() <= self.limits.ready_events);
-
-        for (identity, _direction, waiter) in &waiters {
-            self.send_abort(env, waiter, *identity);
-        }
-
-        self.ready.clear();
+        // Linearize shutdown before draining the bounded state. Any socket
+        // operation serialized after this point is rejected as closed while
+        // repeated polls resume cleanup from the retained native structures.
+        self.lifecycle = Lifecycle::ShuttingDown;
         self.ready_sweep = false;
         self.ready_sweep_cursor = None;
+        self.ready_sweep_pending.clear();
+        self.continue_shutdown(env)
+    }
+
+    fn continue_shutdown(&mut self, env: Env<'_>) -> Envelope<Atom> {
+        // Once structural cleanup has produced aborts, spend the next slice
+        // delivering them before removing more state. This keeps waiter
+        // notification latency bounded without exceeding the readiness cap.
+        let effects = if self.pending_notifications.is_empty() {
+            self.shutdown_work()
+        } else {
+            Effects::empty()
+        };
+        let mut envelope = self.finish_call(env, crate::atoms::ok(), effects, Vec::new());
+
+        if self.shutdown_pending() {
+            envelope.more = true;
+            envelope.poll_at = None;
+        } else {
+            self.lifecycle = Lifecycle::Shutdown;
+            self.closing_sweep_cursor = None;
+            self.closing_cleanup_pending = false;
+            self.closing_cleanup_resweep = false;
+            self.listener_scan_cursor = None;
+            self.listener_scan_pending = false;
+            self.listener_scan_resweep = false;
+            self.ready_sweep = false;
+            self.ready_sweep_cursor = None;
+            self.ready_sweep_pending.clear();
+            envelope.more = false;
+        }
+
+        envelope
+    }
+
+    fn shutdown_work(&mut self) -> Effects {
+        let mut maintenance_work = 0;
+
+        while maintenance_work < self.limits.maintenance_work && self.within_budget() {
+            if let Some((identity, waiters)) = self.socket_table.close_next() {
+                self.pending_notifications.extend(waiters.into_iter().map(
+                    |(direction, waiter)| PendingNotification {
+                        identity,
+                        direction,
+                        waiter,
+                    },
+                ));
+            } else if let Some((&id, _)) = self.tcp_records.first_key_value() {
+                let record = self
+                    .tcp_records
+                    .remove(&id)
+                    .expect("selected TCP record exists");
+                self.sockets.remove(record.handle);
+                self.closing_tcp.remove(&id);
+                if let Some(deadline) = record.close_deadline {
+                    self.closing_deadlines.remove(&(deadline, id));
+                }
+                if let (Some(local), Some(remote)) = (record.local, record.remote) {
+                    self.tcp_connections
+                        .remove(&ConnectionKey::new(local, remote));
+                }
+            } else if let Some((&id, _)) = self.tcp_listeners.first_key_value() {
+                let listener = self
+                    .tcp_listeners
+                    .remove(&id)
+                    .expect("selected TCP listener exists");
+                for handle in listener.pool {
+                    self.sockets.remove(handle);
+                }
+            } else if let Some((&id, _)) = self.udp_records.first_key_value() {
+                let record = self
+                    .udp_records
+                    .remove(&id)
+                    .expect("selected UDP record exists");
+                for handle in record.handles {
+                    self.sockets.remove(handle);
+                }
+            } else if self.tcp_connections.pop_first().is_some()
+                || self.closing_tcp.pop_first().is_some()
+                || self.closing_deadlines.pop_first().is_some()
+                || self.device.discard_one()
+            {
+                // One retained index or packet was discarded.
+            } else {
+                break;
+            }
+
+            maintenance_work += 1;
+        }
+
         self.counters.observe(Work {
-            ready_events: waiters.len(),
+            maintenance_work,
             ..Work::default()
         });
 
-        Envelope::empty(crate::atoms::ok())
+        Effects {
+            output: Vec::new(),
+            poll_at: None,
+            more: self.shutdown_structures_pending(),
+            maintenance_work,
+        }
+    }
+
+    fn shutdown_structures_pending(&self) -> bool {
+        self.socket_table.len() > 0
+            || !self.tcp_records.is_empty()
+            || !self.tcp_listeners.is_empty()
+            || !self.udp_records.is_empty()
+            || !self.tcp_connections.is_empty()
+            || !self.closing_tcp.is_empty()
+            || !self.closing_deadlines.is_empty()
+            || self.device.queued_packets() != (0, 0)
+    }
+
+    fn shutdown_pending(&self) -> bool {
+        self.shutdown_structures_pending()
+            || !self.pending_notifications.is_empty()
+            || self.ready.has_pending()
+            || !self.ready_sweep_pending.is_empty()
+            || self.ready_sweep
     }
 
     #[cfg(debug_assertions)]
@@ -2152,14 +2347,22 @@ impl NativeStack {
 
         let mut more = keys.len() > limit;
         keys.truncate(limit);
-        let work = keys.len();
+        let mut work = 0;
+        let mut last_processed = None;
 
         for key in &keys {
+            if !self.within_budget() {
+                more = true;
+                break;
+            }
+
             self.refresh_listener_member(*key);
+            work += 1;
+            last_processed = Some(*key);
         }
 
         if more {
-            self.listener_scan_cursor = keys.last().copied();
+            self.listener_scan_cursor = last_processed.or(cursor);
         } else if self.listener_scan_resweep {
             self.listener_scan_cursor = None;
             self.listener_scan_resweep = false;
@@ -2322,9 +2525,17 @@ impl NativeStack {
             .collect::<Vec<_>>();
         let mut more = ids.len() > limit;
         ids.truncate(limit);
-        let work = ids.len();
+        let mut work = 0;
+        let mut last_processed = None;
 
         for id in &ids {
+            if !self.within_budget() {
+                more = true;
+                break;
+            }
+
+            work += 1;
+            last_processed = Some(*id);
             let Some(record) = self.tcp_records.get(id).copied() else {
                 self.closing_tcp.remove(id);
                 continue;
@@ -2371,7 +2582,7 @@ impl NativeStack {
         }
 
         if more {
-            self.closing_sweep_cursor = ids.last().copied();
+            self.closing_sweep_cursor = last_processed.or(self.closing_sweep_cursor);
         } else if self.closing_cleanup_resweep {
             self.closing_sweep_cursor = None;
             self.closing_cleanup_resweep = false;
@@ -2654,7 +2865,7 @@ impl NativeStack {
     fn ensure_running(&self) -> Result<(), SocketError> {
         match self.lifecycle {
             Lifecycle::Running => Ok(()),
-            Lifecycle::Shutdown => Err(SocketError::Closed),
+            Lifecycle::ShuttingDown | Lifecycle::Shutdown => Err(SocketError::Closed),
         }
     }
 
@@ -2680,6 +2891,14 @@ impl NativeStack {
             ReadyResult::NoWaiter | ReadyResult::Coalesced | ReadyResult::Stale => {
                 self.counters.readiness_dropped += 1;
             }
+        }
+    }
+
+    fn deliver_or_discard_ready(&mut self, env: Env<'_>, key: ReadyKey) {
+        if matches!(self.lifecycle, Lifecycle::Running) {
+            self.deliver_ready(env, key);
+        } else {
+            self.counters.readiness_dropped += 1;
         }
     }
 
@@ -2712,12 +2931,14 @@ impl NativeStack {
         self.device.begin_call(self.limits.output_packets);
         let input_bytes = copied_bytes.unwrap_or(0);
         let output_byte_limit = self.limits.bytes_copied.saturating_sub(input_bytes);
-        let mut output = self
-            .device
-            .take_transmit(self.limits.output_packets, output_byte_limit);
-        let mut output_bytes: usize = output.iter().map(Vec::len).sum();
+        let mut output = self.device.take_transmit(
+            self.limits.output_packets,
+            output_byte_limit,
+            &mut self.call_budget,
+        );
+        let mut output_bytes: usize = output.iter().map(|packet| packet.len()).sum();
 
-        if self.device.has_receive() {
+        if self.device.has_receive() && self.within_budget() {
             let _ = self
                 .interface
                 .poll_ingress_single(now, &mut self.device, &mut self.sockets);
@@ -2725,7 +2946,13 @@ impl NativeStack {
             self.request_listener_scan();
         }
 
-        self.interface.poll_maintenance(now);
+        let mut deadline_work_deferred = false;
+
+        if self.within_budget() {
+            self.interface.poll_maintenance(now);
+        } else {
+            deadline_work_deferred = true;
+        }
 
         if self
             .next_close_deadline()
@@ -2773,6 +3000,11 @@ impl NativeStack {
         while maintenance_work < self.limits.maintenance_work
             && self.device.queued_packets().1 < self.limits.output_packets
         {
+            if !self.within_budget() {
+                deadline_work_deferred = true;
+                break;
+            }
+
             maintenance_work += 1;
             egress_attempted = true;
 
@@ -2798,10 +3030,13 @@ impl NativeStack {
 
         let remaining_packets = self.limits.output_packets.saturating_sub(output.len());
         let remaining_bytes = output_byte_limit.saturating_sub(output_bytes);
-        let additional_output = self
-            .device
-            .take_transmit(remaining_packets, remaining_bytes);
-        output_bytes += additional_output.iter().map(Vec::len).sum::<usize>();
+        let additional_output =
+            self.device
+                .take_transmit(remaining_packets, remaining_bytes, &mut self.call_budget);
+        output_bytes += additional_output
+            .iter()
+            .map(|packet| packet.len())
+            .sum::<usize>();
         output.extend(additional_output);
         if !cleanup_ran && self.closing_cleanup_pending {
             let remaining_maintenance = self
@@ -2834,7 +3069,10 @@ impl NativeStack {
             || cleanup_more
             || self.closing_cleanup_pending
             || listener_more
-            || self.listener_scan_pending;
+            || self.listener_scan_pending
+            || deadline_work_deferred;
+        // A received packet retained past the deadline keeps the continuation
+        // alive through has_receive(), even if no later work loop ran.
         let poll_at = if more {
             Some(now.total_millis())
         } else {
@@ -2919,13 +3157,16 @@ pub(crate) fn fuzz_raw_engine(data: &[u8]) {
         return;
     };
     let packet = data.get(..data.len().min(4_096)).unwrap_or_default();
+    stack.begin_call();
     let _arbitrary_result = stack.ingress(packet, Instant::ZERO);
 
     let payload = data.get(..data.len().min(2_048)).unwrap_or_default();
     let valid_packet = fuzz_ipv6_packet(payload);
+    stack.begin_call();
     let _valid_result = stack.ingress(&valid_packet, Instant::from_millis(1));
 
     for tick in 2..=2 + data.first().map_or(0, |byte| i64::from(byte % 4)) {
+        stack.begin_call();
         let _effects = stack.poll(Instant::from_millis(tick));
     }
 }
@@ -2985,6 +3226,7 @@ pub(crate) fn fuzz_socket_lifecycle(data: &[u8]) {
 
     for (step, operation) in data.iter().copied().take(512).enumerate() {
         let now = Instant::from_millis(i64::try_from(step).unwrap_or(i64::MAX));
+        stack.begin_call();
 
         match operation % 11 {
             0 if identities.len() < 32 => {
@@ -3388,25 +3630,25 @@ fn fuzz_shutdown(stack: &mut NativeStack) {
         return;
     }
 
-    stack.lifecycle = Lifecycle::Shutdown;
-    for record in std::mem::take(&mut stack.tcp_records).into_values() {
-        stack.sockets.remove(record.handle);
-    }
-    for listener in std::mem::take(&mut stack.tcp_listeners).into_values() {
-        for handle in listener.pool {
-            stack.sockets.remove(handle);
+    stack.lifecycle = Lifecycle::ShuttingDown;
+    stack.ready_sweep = false;
+    stack.ready_sweep_cursor = None;
+    stack.ready_sweep_pending.clear();
+
+    for _call in 0..1_024 {
+        stack.begin_call();
+        let _effects = stack.shutdown_work();
+
+        if !stack.shutdown_structures_pending() {
+            break;
         }
     }
-    for record in std::mem::take(&mut stack.udp_records).into_values() {
-        for handle in record.handles {
-            stack.sockets.remove(handle);
-        }
-    }
-    stack.tcp_connections.clear();
-    stack.closing_tcp.clear();
-    stack.closing_deadlines.clear();
-    let _waiters = stack.socket_table.close_all();
+
+    assert!(!stack.shutdown_structures_pending());
+    stack.pending_notifications.clear();
     stack.ready.clear();
+    stack.ready_sweep_pending.clear();
+    stack.lifecycle = Lifecycle::Shutdown;
 }
 
 #[derive(Clone, Debug)]
@@ -3591,6 +3833,7 @@ fn tcp_listener_target(packet: &[u8]) -> Option<(IpAddress, u16)> {
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum StackError {
+    Closed,
     InvalidLimits,
     InvalidStackConfig,
     InvalidPacket,
@@ -3599,7 +3842,7 @@ pub enum StackError {
 }
 
 pub struct Effects {
-    pub output: Vec<Vec<u8>>,
+    pub output: Vec<OutputPacket>,
     pub poll_at: Option<i64>,
     pub more: bool,
     maintenance_work: usize,
@@ -3670,6 +3913,7 @@ pub struct PendingNotification {
 #[derive(Clone, Copy)]
 enum Lifecycle {
     Running,
+    ShuttingDown,
     Shutdown,
 }
 
@@ -3677,6 +3921,7 @@ impl Lifecycle {
     fn as_atom(self) -> Atom {
         match self {
             Self::Running => crate::atoms::running(),
+            Self::ShuttingDown => crate::atoms::shutting_down(),
             Self::Shutdown => crate::atoms::shutdown(),
         }
     }
@@ -3698,6 +3943,10 @@ pub struct Counters {
     listener_promotions: usize,
     listener_refills: usize,
     listener_overflow_drops: usize,
+    native_calls: usize,
+    deadline_yields: usize,
+    timeslice_exhaustions: usize,
+    max_native_work_nanoseconds: u64,
 }
 
 impl Counters {
@@ -3709,10 +3958,9 @@ impl Counters {
     }
 }
 
-#[derive(NifMap)]
 pub struct Envelope<T> {
     pub result: T,
-    pub output: Vec<Vec<u8>>,
+    pub output: Vec<OutputPacket>,
     pub poll_at: Option<i64>,
     pub more: bool,
 }
@@ -3773,6 +4021,9 @@ pub struct Snapshot {
     mtu: usize,
     ip_address_count: usize,
     lifecycle: Atom,
+    call_target_nanoseconds: u64,
+    work_budget_nanoseconds: u64,
+    encoding_headroom_nanoseconds: u64,
     counters: Counters,
 }
 
