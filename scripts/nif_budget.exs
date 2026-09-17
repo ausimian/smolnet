@@ -12,16 +12,19 @@ defmodule SmolNet.NifBudget do
   @maximum_addresses 8
   @maximum_wildcard_udp_sockets div(@native_socket_capacity, @maximum_addresses)
   @max_wall_nanoseconds 1_000_000
-  # Message-heavy NIFs are charged a larger caller cost by the BEAM even when
-  # their measured wall time is sub-millisecond. Keep the ceiling below the
-  # default 2,000-reduction process time slice.
-  @max_reductions 1_200
+  # Message-heavy NIFs are charged for message delivery as well as the measured
+  # native share reported through enif_consume_timeslice/2. Crossing one
+  # 2,000-reduction slice is expected to yield the caller; this upper bound
+  # guards against accidentally charging more than two complete slices.
+  @max_reductions 4_000
   @wall_clock_mode (case System.get_env("SMOLNET_NIF_WALL_CLOCK_MODE") do
                       nil -> :enforce
                       "enforce" -> :enforce
+                      "p99" -> :p99
                       "report" -> :report
                       value -> raise "invalid SMOLNET_NIF_WALL_CLOCK_MODE: #{inspect(value)}"
                     end)
+  @scenario_iterations if(@wall_clock_mode == :p99, do: 100, else: 1)
 
   def run do
     IO.puts("wall-clock budget mode: #{@wall_clock_mode}")
@@ -45,101 +48,163 @@ defmodule SmolNet.NifBudget do
       {:ok, _envelope} = Native.stack_ingress(ingress, packet, index)
     end)
 
-    maintenance = new_stack(@maximum_limits, empty_config())
-    {:ok, _envelope} = Native.test_prepare_closing(maintenance, @native_socket_capacity)
-
-    once("maximum closing-socket maintenance", fn ->
-      {:ok, _envelope} = Native.stack_poll(maintenance, 30_000)
-    end)
-
-    ready_resource = new_stack(@maximum_limits, empty_config())
-    {ready_keys, _ready_references} = arm_waiters(ready_resource)
-
-    once("maximum readiness delivery", fn ->
-      {:ok, _envelope} = Native.test_socket_ready(ready_resource, ready_keys)
-    end)
-
-    once("maximum readiness overflow sweep", fn ->
-      {:ok, _envelope} = Native.stack_poll(ready_resource, 0)
-    end)
-
-    drain_messages(@maximum_limits.ready_events)
-
-    combined = new_stack(@maximum_limits, empty_config())
-    {:ok, _envelope} = Native.test_prepare_closing(combined, @native_socket_capacity)
-
-    {combined_keys, _combined_references} =
-      arm_waiters(combined, @native_socket_capacity, [:read, :write])
-
-    once("combined maximum work", fn ->
-      {:ok, _envelope} = Native.test_combined_maximum_work(combined, combined_keys, 30_000)
-    end)
-
-    drain_messages(@maximum_limits.ready_events)
-
-    shutdown_resource = new_stack(@maximum_limits, empty_config())
-    {_shutdown_keys, _shutdown_references} = arm_waiters(shutdown_resource)
-
-    once("maximum waiter shutdown", fn ->
-      {:ok, _envelope} = Native.stack_shutdown(shutdown_resource)
-    end)
-
-    drain_messages(@maximum_limits.ready_events)
-
-    wildcard_bind = new_stack(@maximum_limits, maximum_udp_config(@maximum_addresses))
-    {:ok, %{result: wildcard_identity}} = Native.udp_open(wildcard_bind, :inet6)
-
-    once("maximum wildcard-UDP bind", fn ->
-      {:ok, %{result: :ok}} =
-        Native.udp_bind(wildcard_bind, wildcard_identity, %{
-          address: List.duplicate(0, 16),
-          port: 39_999,
-          scope_id: 0
-        })
-    end)
-
-    listener_expand = new_stack(@maximum_limits, maximum_udp_config(@maximum_addresses))
-    {:ok, %{result: listener_identity}} = Native.tcp_open(listener_expand, :inet6)
-
-    {:ok, %{result: :ok}} =
-      Native.tcp_bind(listener_expand, listener_identity, %{
-        address: maximum_ipv6_address(1),
-        port: 39_998,
-        scope_id: 0
-      })
-
-    once("maximum TCP listener expansion", fn ->
-      {:ok, %{result: :ok}} = Native.tcp_listen(listener_expand, listener_identity, 128, 0)
-    end)
-
-    {wildcard_shutdown, wildcard_identities} = maximum_wildcard_udp_state()
-    _wildcard_references = populate_maximum_waiter_state(wildcard_shutdown, wildcard_identities)
-
-    once("maximum wildcard-UDP shutdown", fn ->
-      {:ok, _envelope} = Native.stack_shutdown(wildcard_shutdown)
-    end)
-
-    drain_messages(@maximum_limits.ready_events)
-
-    {allocation_shutdown, allocation_identities} = maximum_single_address_udp_state()
-
-    _allocation_references =
-      populate_maximum_waiter_state(allocation_shutdown, allocation_identities)
-
-    once("maximum native-allocation shutdown", fn ->
-      {:ok, _envelope} = Native.stack_shutdown(allocation_shutdown)
-    end)
-
-    drain_messages(@maximum_limits.ready_events)
-
-    once(
-      "maximum wildcard-UDP resource destructor",
-      prepare_resource_drop(&maximum_wildcard_udp_state/0)
+    scenario(
+      "maximum closing-socket maintenance",
+      fn ->
+        resource = new_stack(@maximum_limits, empty_config())
+        {:ok, _envelope} = Native.test_prepare_closing(resource, @native_socket_capacity)
+        resource
+      end,
+      fn resource -> Native.stack_poll(resource, 30_000) end,
+      fn resource, {:ok, envelope} -> continue_native_work(resource, envelope, 30_000) end
     )
 
-    once(
+    scenario(
+      "maximum readiness delivery",
+      fn ->
+        resource = new_stack(@maximum_limits, empty_config())
+        {keys, _references} = arm_waiters(resource)
+        {resource, keys}
+      end,
+      fn {resource, keys} ->
+        {:ok, %{more: true}} = result = Native.test_socket_ready(resource, keys)
+        result
+      end,
+      fn {resource, _keys}, {:ok, envelope} ->
+        continue_native_work(resource, envelope, 0)
+        drain_messages(@maximum_limits.ready_events)
+      end
+    )
+
+    scenario(
+      "maximum readiness overflow sweep",
+      fn ->
+        resource = new_stack(@maximum_limits, empty_config())
+        {keys, _references} = arm_waiters(resource)
+        {:ok, %{more: true}} = Native.test_socket_ready(resource, keys)
+        resource
+      end,
+      fn resource -> Native.stack_poll(resource, 0) end,
+      fn resource, {:ok, envelope} ->
+        continue_native_work(resource, envelope, 0)
+        drain_messages(@maximum_limits.ready_events)
+      end
+    )
+
+    scenario(
+      "combined maximum work",
+      fn ->
+        resource = new_stack(@maximum_limits, empty_config())
+        {:ok, _envelope} = Native.test_prepare_closing(resource, @native_socket_capacity)
+        {keys, _references} = arm_waiters(resource, @native_socket_capacity, [:read, :write])
+        {resource, keys}
+      end,
+      fn {resource, keys} -> Native.test_combined_maximum_work(resource, keys, 30_000) end,
+      fn {resource, _keys}, {:ok, envelope} ->
+        continue_native_work(resource, envelope, 30_000)
+        drain_messages(@maximum_limits.ready_events)
+      end
+    )
+
+    scenario(
+      "maximum waiter shutdown",
+      fn ->
+        resource = new_stack(@maximum_limits, empty_config())
+        {_keys, _references} = arm_waiters(resource)
+        resource
+      end,
+      &Native.stack_shutdown/1,
+      fn resource, {:ok, envelope} ->
+        continue_native_work(resource, envelope, 0)
+        drain_messages(@maximum_limits.ready_events)
+      end
+    )
+
+    scenario(
+      "maximum wildcard-UDP bind",
+      fn ->
+        resource = new_stack(@maximum_limits, maximum_udp_config(@maximum_addresses))
+        {:ok, %{result: identity}} = Native.udp_open(resource, :inet6)
+        {resource, identity}
+      end,
+      fn {resource, identity} ->
+        {:ok, %{result: :ok}} =
+          result =
+            Native.udp_bind(resource, identity, %{
+              address: List.duplicate(0, 16),
+              port: 39_999,
+              scope_id: 0
+            })
+
+        result
+      end,
+      fn {resource, _identity}, {:ok, envelope} ->
+        continue_native_work(resource, envelope, 0)
+      end
+    )
+
+    scenario(
+      "maximum TCP listener expansion",
+      fn ->
+        resource = new_stack(@maximum_limits, maximum_udp_config(@maximum_addresses))
+        {:ok, %{result: identity}} = Native.tcp_open(resource, :inet6)
+
+        {:ok, %{result: :ok}} =
+          Native.tcp_bind(resource, identity, %{
+            address: maximum_ipv6_address(1),
+            port: 39_998,
+            scope_id: 0
+          })
+
+        {resource, identity}
+      end,
+      fn {resource, identity} ->
+        {:ok, %{result: :ok}} = result = Native.tcp_listen(resource, identity, 128, 0)
+        result
+      end,
+      fn {resource, _identity}, {:ok, envelope} ->
+        continue_native_work(resource, envelope, 0)
+      end
+    )
+
+    scenario(
+      "maximum wildcard-UDP shutdown",
+      fn ->
+        {resource, identities} = maximum_wildcard_udp_state()
+        _references = populate_maximum_waiter_state(resource, identities)
+        resource
+      end,
+      &Native.stack_shutdown/1,
+      fn resource, {:ok, envelope} ->
+        continue_native_work(resource, envelope, 0)
+        drain_messages(@maximum_limits.ready_events)
+      end
+    )
+
+    scenario(
+      "maximum native-allocation shutdown",
+      fn ->
+        {resource, identities} = maximum_single_address_udp_state()
+        _references = populate_maximum_waiter_state(resource, identities)
+        resource
+      end,
+      &Native.stack_shutdown/1,
+      fn resource, {:ok, envelope} ->
+        continue_native_work(resource, envelope, 0)
+        drain_messages(@maximum_limits.ready_events)
+      end
+    )
+
+    scenario(
+      "maximum wildcard-UDP resource destructor",
+      fn -> prepare_resource_drop(&maximum_wildcard_udp_state/0) end,
+      fn drop -> drop.() end
+    )
+
+    scenario(
       "maximum native-allocation resource destructor",
-      prepare_resource_drop(&maximum_single_address_udp_state/0)
+      fn -> prepare_resource_drop(&maximum_single_address_udp_state/0) end,
+      fn drop -> drop.() end
     )
   end
 
@@ -148,7 +213,7 @@ defmodule SmolNet.NifBudget do
     {samples, reductions} = samples(iterations, operation)
     sorted = Enum.sort(samples)
     maximum = List.last(sorted)
-    p99 = Enum.at(sorted, div(iterations * 99, 100))
+    p99 = Enum.at(sorted, div(iterations * 99 + 99, 100) - 1)
     mean = div(Enum.sum(samples), iterations)
 
     IO.puts("#{label} budget evidence")
@@ -158,18 +223,39 @@ defmodule SmolNet.NifBudget do
     IO.puts("  maximum wall time: #{maximum} ns (budget #{@max_wall_nanoseconds} ns)")
     IO.puts("  caller reductions/call: #{Float.round(reductions, 2)} (budget #{@max_reductions})")
 
-    enforce!(label, maximum, reductions)
+    enforce!(label, maximum, reductions, p99)
   end
 
-  defp once(label, operation) do
-    {samples, reductions} = samples(1, fn _index -> operation.() end)
-    maximum = hd(samples)
+  defp scenario(label, prepare, operation, cleanup \\ fn _state, _result -> :ok end) do
+    measurements =
+      Enum.map(1..@scenario_iterations, fn _index ->
+        state = prepare.()
+        :erlang.garbage_collect()
+        {:reductions, reductions_before} = Process.info(self(), :reductions)
+        started_at = System.monotonic_time(:nanosecond)
+        result = operation.(state)
+        elapsed = System.monotonic_time(:nanosecond) - started_at
+        {:reductions, reductions_after} = Process.info(self(), :reductions)
+        cleanup.(state, result)
+        assert_no_socket_messages!()
+        {elapsed, reductions_after - reductions_before}
+      end)
+
+    {samples, reductions} = Enum.unzip(measurements)
+    sorted = Enum.sort(samples)
+    maximum = List.last(sorted)
+    p99 = Enum.at(sorted, div(@scenario_iterations * 99 + 99, 100) - 1)
+    mean = div(Enum.sum(samples), @scenario_iterations)
+    reductions = Enum.sum(reductions) / @scenario_iterations
 
     IO.puts("#{label} budget evidence")
+    IO.puts("  calls: #{@scenario_iterations}")
+    IO.puts("  mean wall time: #{mean} ns")
+    IO.puts("  p99 wall time: #{p99} ns")
     IO.puts("  maximum wall time: #{maximum} ns (budget #{@max_wall_nanoseconds} ns)")
     IO.puts("  caller reductions/call: #{Float.round(reductions, 2)} (budget #{@max_reductions})")
 
-    enforce!(label, maximum, reductions)
+    enforce!(label, maximum, reductions, p99)
   end
 
   defp samples(iterations, operation) do
@@ -186,19 +272,29 @@ defmodule SmolNet.NifBudget do
     {samples, (reductions_after - reductions_before) / iterations}
   end
 
-  defp enforce!(label, maximum, reductions) do
+  defp enforce!(label, maximum, reductions, p99) do
     if reductions > @max_reductions do
       raise "#{label} exceeded the normal-scheduler reduction budget"
     end
 
     if maximum > @max_wall_nanoseconds do
-      case @wall_clock_mode do
-        :enforce ->
-          raise "#{label} exceeded the normal-scheduler wall-clock budget"
+      enforce_wall_clock!(label, p99)
+    end
+  end
 
-        :report ->
-          IO.puts("  wall-clock overrun recorded without failing in report-only mode")
-      end
+  defp enforce_wall_clock!(label, p99) do
+    case @wall_clock_mode do
+      :enforce ->
+        raise "#{label} exceeded the normal-scheduler wall-clock budget"
+
+      :p99 when is_integer(p99) and p99 > @max_wall_nanoseconds ->
+        raise "#{label} exceeded the normal-scheduler p99 wall-clock budget"
+
+      :p99 ->
+        IO.puts("  maximum overrun recorded with a passing p99")
+
+      :report ->
+        IO.puts("  wall-clock overrun recorded without failing in report-only mode")
     end
   end
 
@@ -263,6 +359,17 @@ defmodule SmolNet.NifBudget do
     end)
   end
 
+  defp assert_no_socket_messages! do
+    receive do
+      message
+      when is_tuple(message) and tuple_size(message) > 0 and
+             elem(message, 0) == :"$smol_socket" ->
+        raise "unexpected surplus socket message after benchmark cleanup: #{inspect(message)}"
+    after
+      0 -> :ok
+    end
+  end
+
   defp maximum_wildcard_udp_state do
     resource = new_stack(@maximum_limits, maximum_udp_config(@maximum_addresses))
 
@@ -309,7 +416,8 @@ defmodule SmolNet.NifBudget do
 
     identities = native_identities ++ synthetic_identities
     {ready_keys, sent_references} = arm_identity_waiters(resource, identities, :read)
-    {:ok, _envelope} = Native.test_socket_ready(resource, Enum.reverse(ready_keys))
+    {:ok, envelope} = Native.test_socket_ready(resource, Enum.reverse(ready_keys))
+    continue_native_work(resource, envelope, 0)
     drain_messages(@maximum_limits.ready_events)
     {_active_keys, active_references} = arm_identity_waiters(resource, identities, :write)
     {:ok, %{result: snapshot}} = Native.stack_snapshot(resource)
@@ -397,6 +505,26 @@ defmodule SmolNet.NifBudget do
       Native.resource_counts().dropped > baseline -> :ok
       attempts == 0 -> raise "maximum resource destructor did not complete"
       true -> wait_for_drop(baseline, attempts - 1)
+    end
+  end
+
+  defp continue_native_work(_resource, %{more: false}, _now), do: :ok
+
+  defp continue_native_work(resource, %{more: true}, now) do
+    continue_native_polls(resource, now, 0)
+  end
+
+  defp continue_native_polls(_resource, _now, 512) do
+    raise "native continuation did not make bounded progress"
+  end
+
+  defp continue_native_polls(resource, now, calls) do
+    {:ok, envelope} = Native.stack_poll(resource, now)
+
+    if envelope.more do
+      continue_native_polls(resource, now, calls + 1)
+    else
+      :ok
     end
   end
 end

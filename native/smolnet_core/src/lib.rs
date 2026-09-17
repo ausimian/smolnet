@@ -1,3 +1,4 @@
+mod budget;
 mod device;
 mod limits;
 mod socket_table;
@@ -14,8 +15,8 @@ use limits::Limits;
 #[cfg(debug_assertions)]
 use limits::Work;
 use rustler::{
-    Atom, Binary, Decoder, Encoder, Env, Error, ListIterator, LocalPid, NewBinary, NifMap,
-    NifResult, Reference, ResourceArc, Term,
+    Atom, Binary, Decoder, Encoder, Env, Error, ListIterator, LocalPid, NifMap, NifResult,
+    Reference, ResourceArc, Term,
 };
 use socket_table::SocketError;
 use stack::{Envelope, ResourceCounts, StackConfig, StackError, StackResource};
@@ -69,6 +70,7 @@ mod atoms {
         routes,
         scope_id,
         running,
+        shutting_down,
         shutdown,
         ready,
         select,
@@ -93,13 +95,15 @@ fn stack_new<'a>(
     config_term: Term<'a>,
     now_millis: i64,
 ) -> Term<'a> {
-    guarded(env, || {
+    let result = catch_operation(|| {
         let limits = Limits::decode(limits_term).map_err(|_| atoms::invalid_limits())?;
         let config = StackConfig::decode(config_term).map_err(|_| atoms::invalid_stack_config())?;
         let now = time::instant_from_millis(now_millis).map_err(|_| atoms::time_overflow())?;
         let resource = StackResource::new(limits, config, now).map_err(stack_error_atom)?;
-        Ok((atoms::ok(), stack::Envelope::created(resource)))
-    })
+        Ok(stack::Envelope::created(resource))
+    });
+
+    encode_envelope_result(env, result)
 }
 
 #[rustler::nif]
@@ -129,10 +133,7 @@ fn stack_poll<'a>(env: Env<'a>, resource: ResourceArc<StackResource>, now_millis
     let result = catch_operation(|| {
         let now = time::instant_from_millis(now_millis).map_err(|_| atoms::time_overflow())?;
         resource
-            .with_stack(|stack| {
-                let effects = stack.poll(now);
-                stack.finish_call(env, atoms::ok(), effects, Vec::new())
-            })
+            .with_stack(|stack| stack.poll_call(env, now))
             .map_err(|_| atoms::ownership_invariant_violation())
     });
 
@@ -549,11 +550,13 @@ fn udp_close<'a>(
 
 #[rustler::nif]
 fn stack_snapshot<'a>(env: Env<'a>, resource: ResourceArc<StackResource>) -> Term<'a> {
-    guarded(env, || {
+    let result = catch_operation(|| {
         resource
-            .with_stack(|stack| (atoms::ok(), stack.snapshot()))
+            .with_stack_unobserved(|stack| stack.snapshot())
             .map_err(|_| atoms::ownership_invariant_violation())
-    })
+    });
+
+    encode_envelope_result(env, result)
 }
 
 #[rustler::nif]
@@ -585,11 +588,29 @@ fn test_bounded_work<'a>(
     resource: ResourceArc<StackResource>,
     requested: Work,
 ) -> Term<'a> {
-    guarded(env, || {
+    let result = catch_operation(|| {
         resource
-            .with_stack(|stack| (atoms::ok(), stack.apply_bounded_work(requested)))
+            .with_stack(|stack| stack.apply_bounded_work(requested))
             .map_err(|_| atoms::ownership_invariant_violation())
-    })
+    });
+
+    encode_envelope_result(env, result)
+}
+
+#[cfg(debug_assertions)]
+#[rustler::nif]
+fn test_set_budget_checkpoints<'a>(
+    env: Env<'a>,
+    resource: ResourceArc<StackResource>,
+    checkpoints: usize,
+) -> Term<'a> {
+    let result = catch_operation(|| {
+        resource
+            .with_stack(|stack| stack.test_set_budget_checkpoints(checkpoints))
+            .map_err(|_| atoms::ownership_invariant_violation())
+    });
+
+    encode_envelope_result(env, result)
 }
 
 #[cfg(debug_assertions)]
@@ -755,18 +776,6 @@ fn test_socket_close<'a>(
     encode_envelope_result(env, result)
 }
 
-fn guarded<'a, T, F>(env: Env<'a>, operation: F) -> Term<'a>
-where
-    T: Encoder,
-    F: FnOnce() -> Result<T, Atom>,
-{
-    match catch_operation(operation) {
-        Ok(Ok(value)) => value.encode(env),
-        Ok(Err(reason)) => (atoms::error(), reason).encode(env),
-        Err(_) => (atoms::error(), atoms::native_panic()).encode(env),
-    }
-}
-
 fn catch_operation<T, E, F>(operation: F) -> Result<Result<T, E>, ()>
 where
     F: FnOnce() -> Result<T, E>,
@@ -794,7 +803,7 @@ where
             let output = envelope
                 .output
                 .into_iter()
-                .map(|packet| NewBinary::from_iter(env, packet.into_iter()).into())
+                .map(|packet| packet.into_term(env))
                 .collect();
 
             (
@@ -883,6 +892,7 @@ where
 
 fn stack_error_atom(error: StackError) -> Atom {
     match error {
+        StackError::Closed => atoms::closed(),
         StackError::InvalidLimits => atoms::invalid_limits(),
         StackError::InvalidStackConfig => atoms::invalid_stack_config(),
         StackError::InvalidPacket => atoms::invalid_packet(),

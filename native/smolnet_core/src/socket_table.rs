@@ -386,24 +386,13 @@ impl SocketTable {
         Ok(waiters)
     }
 
-    pub fn close_all(&mut self) -> Vec<(SocketIdentity, Direction, Waiter)> {
-        let entries = std::mem::take(&mut self.entries);
-        let mut waiters = Vec::with_capacity(self.waiter_count);
-
-        for (id, (generation, mut entry)) in entries {
-            let identity = SocketIdentity { id, generation };
-
-            if let Some(waiter) = entry.read_waiter.take() {
-                waiters.push((identity, Direction::Read, waiter));
-            }
-
-            if let Some(waiter) = entry.write_waiter.take() {
-                waiters.push((identity, Direction::Write, waiter));
-            }
-        }
-
-        self.waiter_count = 0;
-        waiters
+    pub fn close_next(&mut self) -> Option<(SocketIdentity, Vec<(Direction, Waiter)>)> {
+        let (&id, &(generation, _)) = self.entries.first_key_value()?;
+        let identity = SocketIdentity { id, generation };
+        let waiters = self
+            .close(identity)
+            .expect("identity selected from the socket table remains valid");
+        Some((identity, waiters))
     }
 
     pub fn scan_ready(
@@ -411,6 +400,7 @@ impl SocketTable {
         cursor: Option<ReadyKey>,
         entry_limit: usize,
         key_limit: usize,
+        mut within_budget: impl FnMut() -> bool,
     ) -> ReadyScan {
         if entry_limit == 0 || key_limit == 0 {
             return ReadyScan {
@@ -442,6 +432,11 @@ impl SocketTable {
                 continue;
             }
 
+            if !within_budget() {
+                complete = false;
+                break;
+            }
+
             entries_scanned += 1;
 
             if !skip_read && entry.read_ready.load(Ordering::Acquire) {
@@ -453,6 +448,11 @@ impl SocketTable {
                 next_cursor = Some(key);
 
                 if keys.len() == key_limit {
+                    complete = false;
+                    break;
+                }
+
+                if !within_budget() {
                     complete = false;
                     break;
                 }

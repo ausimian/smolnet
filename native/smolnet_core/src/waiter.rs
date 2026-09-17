@@ -144,6 +144,7 @@ impl ReadyQueue {
         }))
     }
 
+    #[cfg(feature = "fuzzing")]
     pub fn drain(&self, limit: usize) -> Vec<ReadyKey> {
         let Some(mut entries) = self.try_entries() else {
             self.state.overflow.store(true, Ordering::Release);
@@ -154,6 +155,40 @@ impl ReadyQueue {
 
         for key in &keys {
             entries.remove(key);
+        }
+
+        keys
+    }
+
+    pub fn drain_while(
+        &self,
+        limit: usize,
+        mut within_budget: impl FnMut() -> bool,
+    ) -> Vec<ReadyKey> {
+        if limit == 0 {
+            return Vec::new();
+        }
+
+        if !within_budget() {
+            return Vec::new();
+        }
+
+        let Some(mut entries) = self.try_entries() else {
+            self.state.overflow.store(true, Ordering::Release);
+            return Vec::new();
+        };
+
+        let mut keys = Vec::with_capacity(limit.min(entries.len()));
+
+        loop {
+            let Some(key) = entries.pop_first() else {
+                break;
+            };
+            keys.push(key);
+
+            if keys.len() == limit || !within_budget() {
+                break;
+            }
         }
 
         keys
@@ -172,6 +207,7 @@ impl ReadyQueue {
             || self.try_entries().is_none_or(|entries| !entries.is_empty())
     }
 
+    #[cfg(feature = "fuzzing")]
     pub fn clear(&self) {
         if let Some(mut entries) = self.try_entries() {
             entries.clear();
@@ -305,5 +341,25 @@ mod tests {
         assert!(flag.load(Ordering::Acquire));
         assert!(queue.take_overflow());
         assert_eq!(queue.counters().overflows, 1);
+    }
+
+    #[test]
+    fn zero_limit_does_not_probe_the_queue_lock() {
+        let queue = ReadyQueue::new(1);
+        let _guard = queue.state.entries.lock().unwrap();
+
+        assert!(queue.drain_while(0, || true).is_empty());
+        assert!(!queue.take_overflow());
+        assert_eq!(queue.counters().overflows, 0);
+    }
+
+    #[test]
+    fn expired_budget_does_not_probe_the_queue_lock() {
+        let queue = ReadyQueue::new(1);
+        let _guard = queue.state.entries.lock().unwrap();
+
+        assert!(queue.drain_while(1, || false).is_empty());
+        assert!(!queue.take_overflow());
+        assert_eq!(queue.counters().overflows, 0);
     }
 }
