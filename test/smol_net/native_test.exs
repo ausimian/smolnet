@@ -229,6 +229,44 @@ defmodule SmolNet.NativeTest do
   end
 
   @tag :debug_nif
+  test "a caller whose reduction slice is spent receives a shorter native slice" do
+    ready_events = Stack.default_limits().ready_events
+
+    unconstrained = native_stack()
+    keys = arm_read_waiters(unconstrained, ready_events)
+    # Arming the waiters spends this process's slice; yield for a fresh one so
+    # the reference call is not itself throttled.
+    :erlang.yield()
+    assert {:ok, _envelope} = Native.test_socket_ready(unconstrained, keys)
+    delivered_unconstrained = drain_select_messages()
+
+    starved = native_stack()
+    keys = arm_read_waiters(starved, ready_events)
+    :erlang.yield()
+
+    # The first incremental charge reports the caller's slice as spent, so the
+    # call stops after the chunk that charge covers instead of continuing to
+    # drain readiness.
+    assert {:ok, %{result: :ok}} = Native.test_set_slice_exhaustion(starved, 0)
+    assert {:ok, %{more: true}} = Native.test_socket_ready(starved, keys)
+
+    delivered_starved = drain_select_messages()
+    assert delivered_starved > 0
+    assert delivered_starved < delivered_unconstrained
+
+    assert {:ok, %{result: snapshot}} = Native.stack_snapshot(starved)
+    assert snapshot.counters.timeslice_exhaustions >= 1
+    assert snapshot.counters.deadline_yields >= 1
+    assert snapshot.counters.max_native_work_nanoseconds > 0
+    assert snapshot.counters.max_native_work_nanoseconds < snapshot.call_target_nanoseconds
+
+    # Readiness retained by the shortened slice still completes across ordinary
+    # continuations rather than being dropped.
+    assert {:ok, %{more: false}} = poll_until_complete(starved)
+    assert delivered_starved + drain_select_messages() == ready_events
+  end
+
+  @tag :debug_nif
   test "returns immediately when the defensive mutex is already held" do
     {:ok, ref} = SmolNet.start_stack()
     %{stack: stack} = Ref.pids(ref)
@@ -527,6 +565,34 @@ defmodule SmolNet.NativeTest do
       Native.stack_new(Stack.default_limits(), config, 0)
 
     resource
+  end
+
+  defp arm_read_waiters(resource, count) do
+    Enum.map(1..count, fn internal_handle ->
+      {:ok, %{result: identity}} = Native.test_socket_open(resource, internal_handle)
+      reference = make_ref()
+
+      assert {:ok, %{result: {:select, :recv, ^reference}}} =
+               Native.test_socket_wait(resource, identity, %{
+                 direction: :read,
+                 operation: :recv,
+                 pid: self(),
+                 reference: reference,
+                 arm_point: :none,
+                 wake_count: 1,
+                 completed: false
+               })
+
+      %{identity: identity, direction: :read}
+    end)
+  end
+
+  defp drain_select_messages(count \\ 0) do
+    receive do
+      {:"$smol_socket", _identity, :select, _reference} -> drain_select_messages(count + 1)
+    after
+      0 -> count
+    end
   end
 
   defp poll_until_complete(resource, calls \\ 0, output \\ [])

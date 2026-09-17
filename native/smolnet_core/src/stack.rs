@@ -17,7 +17,7 @@ use smoltcp::wire::{
     Ipv4Cidr, Ipv4Packet, Ipv6Address, Ipv6Cidr, Ipv6ExtHeader, Ipv6Packet, TcpPacket,
 };
 
-use crate::budget::{CALL_TARGET, CallBudget, ENCODING_HEADROOM, WORK_BUDGET};
+use crate::budget::{CALL_TARGET, CHARGE_CHUNK, CallBudget, ENCODING_HEADROOM, WORK_BUDGET};
 use crate::decode_bounded_list;
 use crate::device::{BeamDevice, OutputPacket};
 use crate::limits::{Limits, Work};
@@ -154,6 +154,7 @@ pub struct NativeStack {
     route_prefixes: Vec<IpCidr>,
     call_budget: CallBudget,
     next_forced_budget_checkpoints: Option<usize>,
+    next_forced_slice_exhaustion: Option<usize>,
     pending_notifications: VecDeque<PendingNotification>,
 }
 
@@ -221,12 +222,17 @@ impl NativeStack {
             route_prefixes,
             call_budget: CallBudget::start(None),
             next_forced_budget_checkpoints: None,
+            next_forced_slice_exhaustion: None,
             pending_notifications: VecDeque::new(),
         })
     }
 
     fn begin_call(&mut self) {
         self.call_budget = CallBudget::start(self.next_forced_budget_checkpoints.take());
+
+        if let Some(charges) = self.next_forced_slice_exhaustion.take() {
+            self.call_budget.force_slice_exhaustion_after(charges);
+        }
     }
 
     fn observe_call(&mut self) {
@@ -239,6 +245,27 @@ impl NativeStack {
         if self.call_budget.yielded() {
             self.counters.deadline_yields += 1;
         }
+
+        // A call may now charge the caller several times. The counter keeps its
+        // established meaning: the number of calls in which any charge reported
+        // the caller's reduction slice as exhausted.
+        if self.call_budget.slice_exhausted() {
+            self.counters.timeslice_exhaustions += 1;
+        }
+    }
+
+    /// Charges the caller once a whole chunk of work units has accumulated.
+    ///
+    /// `force` flushes whatever is outstanding, including the time spent in
+    /// work that is not unit-counted, and is used for the final charge of a
+    /// call.
+    fn charge_chunk(&mut self, env: Env<'_>, pending: &mut usize, force: bool) {
+        if !force && *pending < CHARGE_CHUNK {
+            return;
+        }
+
+        *pending = 0;
+        self.call_budget.charge(env);
     }
 
     fn within_budget(&mut self) -> bool {
@@ -339,6 +366,12 @@ impl NativeStack {
     #[cfg(debug_assertions)]
     pub fn test_set_budget_checkpoints(&mut self, checkpoints: usize) -> Envelope<Atom> {
         self.next_forced_budget_checkpoints = Some(checkpoints);
+        Envelope::empty(crate::atoms::ok())
+    }
+
+    #[cfg(debug_assertions)]
+    pub fn test_set_slice_exhaustion(&mut self, charges: usize) -> Envelope<Atom> {
+        self.next_forced_slice_exhaustion = Some(charges);
         Envelope::empty(crate::atoms::ok())
     }
 
@@ -1558,6 +1591,10 @@ impl NativeStack {
         aborts: Vec<PendingNotification>,
     ) -> Envelope<T> {
         let mut readiness_work = 0usize;
+        // Work units completed since the last charge. The caller is charged at
+        // chunk boundaries so that its remaining reduction slice, not just the
+        // deadline, decides how much more of this call runs.
+        let mut uncharged = 0usize;
         self.pending_notifications.extend(aborts);
 
         while readiness_work < self.limits.ready_events
@@ -1570,6 +1607,8 @@ impl NativeStack {
                 .expect("pending notification exists");
             self.send_abort(env, &notification.waiter, notification.identity);
             readiness_work += 1;
+            uncharged += 1;
+            self.charge_chunk(env, &mut uncharged, false);
         }
 
         if self.ready.take_overflow() && matches!(self.lifecycle, Lifecycle::Running) {
@@ -1586,8 +1625,18 @@ impl NativeStack {
         };
 
         for key in queued {
-            self.deliver_or_discard_ready(env, key);
-            readiness_work += 1;
+            // Keys drained from the ready queue are retained rather than
+            // dropped when the budget runs out: `ready_sweep_pending` is the
+            // same cursor the sweep below uses, and `more` already accounts
+            // for it.
+            if self.within_budget() {
+                self.deliver_or_discard_ready(env, key);
+                readiness_work += 1;
+                uncharged += 1;
+                self.charge_chunk(env, &mut uncharged, false);
+            } else {
+                self.ready_sweep_pending.push_back(key);
+            }
         }
 
         while readiness_work < self.limits.ready_events
@@ -1600,6 +1649,8 @@ impl NativeStack {
                 .expect("pending sweep key exists");
             self.deliver_or_discard_ready(env, key);
             readiness_work += 1;
+            uncharged += 1;
+            self.charge_chunk(env, &mut uncharged, false);
         }
 
         if self.ready_sweep
@@ -1619,6 +1670,8 @@ impl NativeStack {
             for key in scan.keys {
                 if self.within_budget() {
                     self.deliver_or_discard_ready(env, key);
+                    uncharged += 1;
+                    self.charge_chunk(env, &mut uncharged, false);
                 } else {
                     self.ready_sweep_pending.push_back(key);
                 }
@@ -1639,9 +1692,9 @@ impl NativeStack {
             maintenance_work: effects.maintenance_work,
             ..Work::default()
         });
-        if rustler::schedule::consume_timeslice(env, self.call_budget.timeslice_percent()) {
-            self.counters.timeslice_exhaustions += 1;
-        }
+        // Flush the tail: whatever has not yet been charged, including the
+        // work this call did before reaching the readiness loops.
+        self.charge_chunk(env, &mut uncharged, true);
 
         Envelope {
             result,
@@ -1671,7 +1724,7 @@ impl NativeStack {
         // delivering them before removing more state. This keeps waiter
         // notification latency bounded without exceeding the readiness cap.
         let effects = if self.pending_notifications.is_empty() {
-            self.shutdown_work()
+            self.shutdown_work(Some(env))
         } else {
             Effects::empty()
         };
@@ -1697,8 +1750,11 @@ impl NativeStack {
         envelope
     }
 
-    fn shutdown_work(&mut self) -> Effects {
+    /// `env` is absent only for the fuzzing harness, which drives the stack
+    /// without a BEAM environment to charge.
+    fn shutdown_work(&mut self, env: Option<Env<'_>>) -> Effects {
         let mut maintenance_work = 0;
+        let mut uncharged = 0usize;
 
         while maintenance_work < self.limits.maintenance_work && self.within_budget() {
             if let Some((identity, waiters)) = self.socket_table.close_next() {
@@ -1750,6 +1806,11 @@ impl NativeStack {
             }
 
             maintenance_work += 1;
+
+            if let Some(env) = env {
+                uncharged += 1;
+                self.charge_chunk(env, &mut uncharged, false);
+            }
         }
 
         self.counters.observe(Work {
@@ -3637,7 +3698,7 @@ fn fuzz_shutdown(stack: &mut NativeStack) {
 
     for _call in 0..1_024 {
         stack.begin_call();
-        let _effects = stack.shutdown_work();
+        let _effects = stack.shutdown_work(None);
 
         if !stack.shutdown_structures_pending() {
             break;
