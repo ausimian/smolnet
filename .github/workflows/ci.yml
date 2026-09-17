@@ -104,7 +104,15 @@ jobs:
           # host preemption makes a shared-runner maximum unsuitable as a gate.
           SMOLNET_NIF_WALL_CLOCK_MODE: p99
       - run: mix coveralls.cobertura
-      - run: mix hex.build
+      # Release-time checksums do not exist until tagged NIF assets have been
+      # published. Supply a disposable manifest so this job still verifies the
+      # package file list; release-nif.yml exercises the real consumer path.
+      - name: Validate Hex package layout
+        run: |
+          manifest=checksum-Elixir.SmolNet.Native.exs
+          trap 'rm -f "$manifest"' EXIT
+          printf '%%{}\n' > "$manifest"
+          mix hex.build
 
   native-budget:
     name: native budget / ${{ matrix.architecture }}

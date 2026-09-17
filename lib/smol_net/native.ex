@@ -1,7 +1,17 @@
 defmodule SmolNet.Native do
   @moduledoc false
 
-  use Rustler, otp_app: :smolnet, crate: :smolnet_nif
+  version = Mix.Project.config()[:version]
+  source_build? = File.dir?(Path.expand("../../native/smolnet_nif", __DIR__))
+
+  use RustlerPrecompiled,
+    otp_app: :smolnet,
+    crate: "smolnet_nif",
+    base_url: "https://github.com/ausimian/smolnet/releases/download/#{version}",
+    version: version,
+    force_build: source_build?,
+    targets: ~w(x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu aarch64-apple-darwin),
+    nif_versions: ["2.15"]
 
   @spec health() :: :ok
   def health, do: :erlang.nif_error(:nif_not_loaded)

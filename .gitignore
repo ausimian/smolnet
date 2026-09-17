@@ -13,6 +13,7 @@
 /native/fuzz/corpus/
 /native/fuzz/artifacts/
 /priv/native/
+/checksum-Elixir.SmolNet.Native.exs
 
 # Dialyzer PLTs are toolchain-specific and rebuilt from the lockfile.
 /priv/plts/
