@@ -8,6 +8,13 @@ and this project adheres to
 
 <!-- %% CHANGELOG_ENTRIES %% -->
 
+## 0.1.2 - 2026-09-17
+
+### Fixed
+
+- Corrected release validation for production precompiled NIFs and their
+  platform system-library dependencies.
+
 ## 0.1.1 - 2026-09-17
 
 # Initial release
