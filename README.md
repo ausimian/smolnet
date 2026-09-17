@@ -4,10 +4,33 @@ SmolNet is an Elixir library that embeds the Rust
 [`smoltcp`](https://github.com/smoltcp-rs/smoltcp) TCP/IP stack behind a
 deliberately small Rustler NIF.
 
-The project is under initial development. Phase 10 provides independent raw-IP
-dual-family stacks and complete bounded IPv4 and IPv6 TCP and UDP operation.
-TCP is available through `:gen_tcp`; UDP is available through `:gen_udp`, with
-passive and active delivery and normal controlling-process ownership.
+Version 0.1.0 is the first release candidate. It provides independent raw-IP
+dual-family stacks and bounded IPv4 and IPv6 TCP and UDP operation. TCP is
+available through `:gen_tcp`; UDP is available through `:gen_udp`, with passive
+and active delivery and normal controlling-process ownership.
+
+## Quick start and raw-link contract
+
+From a source checkout, this self-contained smoke test starts a stack, inspects
+it, and shuts down its temporary supervision bundle:
+
+```console
+mix run examples/quickstart.exs
+```
+
+```elixir
+address = {0xFD00, 0, 0, 0, 0, 0, 0, 1}
+
+{:ok, stack} =
+  SmolNet.start_stack(
+    egress: {self(), :quickstart},
+    addresses: [{address, 64}]
+  )
+
+{:ok, info} = SmolNet.stack_info(stack)
+:running = info.native.result.lifecycle
+:ok = SmolNet.stop_stack(stack)
+```
 
 `SmolNet.start_stack/1` creates an independent native stack and returns an
 opaque reference. A transport-neutral link process supplies complete IPv4 or IPv6
@@ -381,6 +404,46 @@ Ancillary data, multicast, broadcast, OS file descriptors, raw socket options,
 and every other TCP or UDP inet option are outside the first-release contract
 and fail explicitly.
 
+## Architecture and supervision
+
+Each call to `SmolNet.start_stack/1` creates a temporary supervision bundle
+containing one stack owner process and one dynamic supervisor for its inet
+adapters. The stack process exclusively owns the native resource and serializes
+all access. Native calls use a nonblocking `try_lock`, perform bounded work, and
+return immediately; readiness waits, application deadlines, framing, and active
+mode remain in Elixir processes. A stack or adapter failure cannot corrupt
+another bundle, and owner/link failure follows the documented lifecycle policy.
+
+The Rust workspace separates the reusable `smolnet_core` engine from the thin
+`smolnet_nif` Rustler entry point. The engine contains packet, socket, waiter,
+timer, and bounds logic. Elixir owns supervision, raw-link delivery, timer
+replacement, synchronous retry loops, and OTP inet compatibility. Native output
+is delivered after every driving operation, and each returned `poll_at` replaces
+the prior BEAM timer.
+
+## Error contract
+
+Public low-level calls return `:ok`, `{:ok, value}`, `{:select, continuation}`,
+or `{:error, reason}`. Validation failures are stable atoms such as
+`:unsupported_family`, `:invalid_options`, `:invalid_address`, and
+`:message_too_large`; lifecycle failures use `:closed`, `:invalid_socket`, or
+`:invalid_socket_state`; network failures include `:network_unreachable`,
+`:connection_timeout`, `:connection_refused`, and `:connection_reset`.
+Concurrent operations in the same readiness direction return `:busy`. Inet
+adapters translate these into the documented OTP-style atoms such as `:einval`,
+`:eafnosupport`, `:emsgsize`, and `:enetdown`. Treat a select notification only
+as permission to retry.
+
+## Migrating to 0.1.0
+
+This is the first public release candidate, so there is no earlier supported
+release API to migrate from. Users of development snapshots should update to
+the explicit IPv4/IPv6 endpoint maps and inet backend modules shown above,
+remove assumptions that socket IDs can be reused, and handle nowait operations
+through their returned select continuations. The release candidate continues
+to compile its NIF from source; precompiled distribution is deferred until the
+release-assets workflow is introduced.
+
 ## Development
 
 The supported development baseline is Elixir 1.19.5, Erlang/OTP 28.3, and Rust
@@ -395,21 +458,45 @@ mix precommit
 
 ## Native builds
 
-SmolNet currently builds its NIF from source. Building requires a Rust toolchain
-new enough for Rustler and smoltcp; Rust 1.91 is the declared minimum and Rust
-1.94.0 is the pinned development version.
+SmolNet currently builds its NIF from source. Building requires Rust 1.91 or
+newer; Rust 1.94.0 is the pinned development version. The package retains the
+complete `smolnet_core` and `smolnet_nif` workspace required by Rustler.
 
-The first release targets GNU-libc Linux and macOS. When a supported GNU
-architecture has no prebuilt NIF, the Hex package retains `native/Cargo.toml`,
-`native/Cargo.lock`, and the complete `smolnet_nif` crate so Rustler can compile
-the library during dependency compilation. Alpine and other musl systems are
-not yet supported.
+Precompiled GNU/Linux x86_64 and AArch64 libraries will be distributed as
+verified release assets rather than committed to the Git repository. Until
+that workflow lands, consumers need a Rust toolchain, platform C linker, and
+Erlang development files. Alpine and other musl systems remain unsupported.
+
+Configurable per-call maxima are 65,575 copied bytes, 32 output packets, 128
+readiness events, and 128 maintenance units. These fixed quotas work with the
+native envelope's `more` continuation flag so remaining work is polled again.
+A separate hard ceiling allows at most 64 native TCP/UDP backing sockets per
+stack, including listener pools and wildcard-UDP expansion across configured
+addresses. Local `mix precommit` measures empty and maximum output, ingress,
+maintenance, readiness, shutdown, and resource-destruction paths against a
+hard 1 ms normal-scheduler wall-time gate. GitHub-hosted CI reports the same
+wall-clock evidence without gating on VM speed, while continuing to enforce
+the deterministic caller-reduction ceiling. Issue #14 tracks restoring a
+portable hard wall-clock gate.
+
+## Troubleshooting
+
+- If a source build fails, confirm Rust 1.91 or newer is active and that the
+  platform C linker and Erlang development files are installed.
+- If ingress returns a validation error, supply exactly one complete IPv4 or
+  IPv6 packet within the configured MTU. Ethernet frames and fragmented IPv4
+  packets are not accepted.
+- If an operation times out despite no inbound traffic, ensure the stack owner
+  remains alive. SmolNet schedules retransmission timers itself, but the raw
+  transport must forward emitted packets and return peer traffic.
+- Use `SmolNet.stack_info/1` to inspect lifecycle, bounds, socket counts, and
+  listener/queue metrics before reporting a failure.
 
 ## Status
 
-SmolNet has not published its first release. `CHANGELOG.md` records initial
-development; `RELEASE.md` will be introduced only after the first release has
-been published.
+Version 0.1.0 is prepared as a release candidate but has not been tagged,
+published to Hex, or released. `RELEASE.md` will be introduced only after the
+first release has actually been published.
 
 ## License
 

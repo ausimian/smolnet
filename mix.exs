@@ -1,7 +1,7 @@
 defmodule SmolNet.MixProject do
   use Mix.Project
 
-  @version "0.1.0-dev"
+  @version "0.1.0"
   @source_url "https://github.com/ausimian/smolnet"
 
   def project do
@@ -54,8 +54,12 @@ defmodule SmolNet.MixProject do
         "dialyzer",
         "docs --warnings-as-errors",
         "cmd cargo fmt --manifest-path native/Cargo.toml --all -- --check",
+        "cmd cargo fmt --manifest-path native/fuzz/Cargo.toml --all -- --check",
         "cmd cargo clippy --manifest-path native/Cargo.toml --workspace --all-targets -- -D warnings",
         "cmd cargo test --manifest-path native/Cargo.toml --workspace",
+        "cmd cargo check --manifest-path native/fuzz/Cargo.toml --all-targets --locked",
+        "run scripts/nif_budget.exs",
+        "run examples/quickstart.exs",
         "test --warnings-as-errors"
       ]
     ]
@@ -92,8 +96,11 @@ defmodule SmolNet.MixProject do
         "lib",
         "native/Cargo.toml",
         "native/Cargo.lock",
+        "native/smolnet_core/Cargo.toml",
+        "native/smolnet_core/src",
         "native/smolnet_nif/Cargo.toml",
         "native/smolnet_nif/src",
+        "examples/quickstart.exs",
         ".formatter.exs",
         "mix.exs",
         "README.md",

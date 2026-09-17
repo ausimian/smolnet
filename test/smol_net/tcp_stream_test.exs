@@ -43,6 +43,21 @@ defmodule SmolNet.TcpStreamTest do
     assert_eventually(fn -> IPv6TcpPeer.stats(peer).received == payload end, 2_000)
   end
 
+  test "graceful closing records retain bounded logical socket capacity" do
+    {stack, peer, socket} = connected_socket(limits: %{ready_events: 1})
+    :ok = IPv6TcpPeer.hold_acks(peer, true)
+
+    assert :ok = SmolNet.close(socket)
+    assert {:error, :system_limit} = SmolNet.open(:inet6, :stream, :tcp, stack: stack)
+
+    {:ok, info} = SmolNet.stack_info(stack)
+    assert info.native.result.socket_count == 0
+    assert info.native.result.closing_tcp_socket_count == 1
+
+    assert info.native.result.socket_count + info.native.result.closing_tcp_socket_count <=
+             info.native.result.limits.ready_events
+  end
+
   test "exact receives accumulate only in the caller across bounded native reads" do
     {_stack, peer, socket} = connected_socket(limits: %{bytes_copied: 1_280}, mtu: 1_280)
     payload = :binary.copy("abc", 1_000)

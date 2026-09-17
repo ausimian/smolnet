@@ -1,0 +1,36 @@
+[package]
+name = "smolnet-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "=0.4.10"
+smolnet_core = {path = "../smolnet_core", features = ["fuzzing"]}
+
+[[bin]]
+name = "raw_packets"
+path = "fuzz_targets/raw_packets.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "endpoint_options"
+path = "fuzz_targets/endpoint_options.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "socket_operations"
+path = "fuzz_targets/socket_operations.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]
+members = ["."]

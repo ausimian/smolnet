@@ -16,7 +16,7 @@ defmodule SmolNetTest do
   test "validates stack options before starting a bundle" do
     assert SmolNet.start_stack(limits: %{bytes_copied: 0}) == {:error, :invalid_limits}
 
-    assert SmolNet.start_stack(limits: %{bytes_copied: 16 * 1024 * 1024 + 1}) ==
+    assert SmolNet.start_stack(limits: %{bytes_copied: 65_576}) ==
              {:error, :invalid_limits}
 
     assert SmolNet.start_stack(limits: :invalid) == {:error, :invalid_limits}

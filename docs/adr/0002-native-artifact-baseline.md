@@ -2,32 +2,37 @@
 
 ## Status
 
-Accepted for the project skeleton.
+Accepted for the first release candidate.
 
 ## Context
 
-The initial NIF exports only `health/0`, but links Rustler and the deliberately
-restricted smoltcp feature set. Its size is a useful baseline for later phases.
+Phase 0 established a 302 KiB Apple silicon skeleton baseline. The completed
+native stack now implements bounded dual-family TCP and UDP, so the release
+candidate needs a new production measurement.
 
 ## Measurements
 
-Measured on Apple silicon macOS with Rust 1.94.0, fat LTO, one codegen unit,
-symbol stripping, and unwind panic behavior:
+The complete x86_64 GNU/Linux NIF was evaluated with Rust 1.94.0, fat LTO, one
+codegen unit, symbol stripping, and unwind panic behavior:
 
-| Optimization | Mach-O bytes | gzip bytes |
+| Optimization | ELF bytes | gzip bytes |
 |---|---:|---:|
-| `z` | 302,240 | 137,855 |
-| `s` | 302,160 | 136,269 |
-| `3` | 335,168 | 146,800 |
+| `z` | 707,872 | 337,655 |
+| `s` | 718,328 | 345,059 |
+| `3` | 836,680 | 402,203 |
 
-The stripped `s` artifact exports two global symbols and dynamically links only
-Apple's `libSystem` and `libiconv` platform libraries. Linux dynamic-linkage and
-glibc-baseline measurements remain CI work because they cannot be inferred from
-a macOS artifact.
+After removing debug-only NIF entry points and applying the final resource
+bounds, representative stripped release builds measured 710,672 bytes for
+x86_64 GNU/Linux, 617,432 bytes for AArch64 GNU/Linux, and 568,896 bytes for
+Apple silicon macOS. Their gzip sizes were 339,265, 322,912, and 286,643 bytes
+respectively. These are measurements, not files distributed from the source
+repository; the release-assets workflow will re-establish the Linux values on
+matching native runners.
 
 ## Decision
 
-Use `opt-level = "s"` for release builds. It is marginally smaller uncompressed
-than `z` and materially smaller when compressed, while `3` is larger. Keep fat
-LTO, one codegen unit, symbol stripping, and panic unwinding. Re-run the matrix
-when native behavior or dependencies materially change.
+Use `opt-level = "z"` for release builds. It is smaller than `s` and `3` for the
+completed stack. Keep fat LTO, one codegen unit, symbol stripping, and panic
+unwinding. Do not commit generated shared libraries; distribute future
+precompiled builds as verified release assets. Re-run the matrix when native
+behavior or dependencies materially change.

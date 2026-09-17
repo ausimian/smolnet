@@ -4,7 +4,8 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Mutex, TryLockError};
 
 use rustler::{
-    Atom, Encoder, Env, LocalPid, NewBinary, NifMap, Reference, Resource, ResourceArc, Term,
+    Atom, Decoder, Encoder, Env, LocalPid, NewBinary, NifMap, NifResult, Reference, Resource,
+    ResourceArc, Term,
 };
 use smoltcp::iface::{Config, Interface, PollResult, Route, SocketHandle, SocketSet};
 use smoltcp::socket::tcp::{self, ConnectError, ListenError};
@@ -16,28 +17,33 @@ use smoltcp::wire::{
     Ipv4Cidr, Ipv4Packet, Ipv6Address, Ipv6Cidr, Ipv6ExtHeader, Ipv6Packet, TcpPacket,
 };
 
+use crate::decode_bounded_list;
 use crate::device::BeamDevice;
 use crate::limits::{Limits, Work};
+#[cfg(debug_assertions)]
+use crate::socket_table::InstallResult;
 use crate::socket_table::{
-    CancelResult, InstallResult, ReadyResult, SocketError, SocketKind, SocketTable,
-    WaiterRegistration,
+    CancelResult, ReadyResult, SocketError, SocketKind, SocketTable, WaiterRegistration,
 };
 use crate::tcp::{
     self as tcp_support, AddressFamily, ConnectFailure, ConnectPhase, EncodedEndpoint,
     ListenerRecord, ShutdownHow, TcpEndpoint, TcpRecord, ValidatedEndpoint,
 };
 use crate::udp::{self as udp_support, UdpRecord};
+#[cfg(debug_assertions)]
+use crate::waiter::ArmPoint;
 use crate::waiter::{
-    ArmPoint, Direction, Operation, ReadinessCounters, ReadyKey, ReadyQueue, SocketIdentity, Waiter,
+    Direction, Operation, ReadinessCounters, ReadyKey, ReadyQueue, SocketIdentity, Waiter,
 };
 
 static NEXT_STACK_ID: AtomicU64 = AtomicU64::new(1);
 static CREATED: AtomicUsize = AtomicUsize::new(0);
 static DROPPED: AtomicUsize = AtomicUsize::new(0);
 static ACTIVE: AtomicUsize = AtomicUsize::new(0);
+pub const NATIVE_SOCKET_CAPACITY: usize = 64;
 
 pub struct StackResource {
-    inner: Mutex<NativeStack>,
+    inner: Mutex<Option<NativeStack>>,
 }
 
 #[rustler::resource_impl]
@@ -55,7 +61,7 @@ impl StackResource {
 
         let stack = NativeStack::new(limits, config, now)?;
         let resource = ResourceArc::new(Self {
-            inner: Mutex::new(stack),
+            inner: Mutex::new(Some(stack)),
         });
 
         CREATED.fetch_add(1, Ordering::Relaxed);
@@ -65,11 +71,12 @@ impl StackResource {
 
     pub fn with_stack<T>(&self, operation: impl FnOnce(&mut NativeStack) -> T) -> Result<T, ()> {
         match self.inner.try_lock() {
-            Ok(mut guard) => Ok(operation(&mut guard)),
+            Ok(mut guard) => guard.as_mut().map(operation).ok_or(()),
             Err(TryLockError::WouldBlock | TryLockError::Poisoned(_)) => Err(()),
         }
     }
 
+    #[cfg(debug_assertions)]
     pub fn test_contention(&self) -> Result<(), ()> {
         let _guard = self.inner.try_lock().map_err(|_| ())?;
         self.with_stack(|_| ())
@@ -86,6 +93,12 @@ impl StackResource {
 
 impl Drop for StackResource {
     fn drop(&mut self) {
+        let inner = self
+            .inner
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        drop(inner);
         ACTIVE.fetch_sub(1, Ordering::Relaxed);
         DROPPED.fetch_add(1, Ordering::Relaxed);
     }
@@ -190,6 +203,7 @@ impl NativeStack {
     pub fn snapshot(&self) -> Envelope<Snapshot> {
         let (receive_packets, transmit_packets) = self.device.queued_packets();
         let (read_waiters, write_waiters) = self.socket_table.waiter_counts();
+        let (read_sent_waiters, write_sent_waiters) = self.socket_table.sent_waiter_counts();
         let listener_pool_socket_count = self
             .tcp_listeners
             .values()
@@ -217,6 +231,7 @@ impl NativeStack {
                 limits: self.limits,
                 socket_count: self.socket_table.len(),
                 native_socket_count: self.sockets.iter().count(),
+                native_socket_capacity: NATIVE_SOCKET_CAPACITY,
                 tcp_socket_count: self.tcp_records.len(),
                 tcp_listener_count: self.tcp_listeners.len(),
                 udp_socket_count: self.udp_records.len(),
@@ -239,6 +254,9 @@ impl NativeStack {
                 waiter_count: self.socket_table.waiter_count(),
                 read_waiter_count: read_waiters,
                 write_waiter_count: write_waiters,
+                sent_waiter_count: read_sent_waiters + write_sent_waiters,
+                read_sent_waiter_count: read_sent_waiters,
+                write_sent_waiter_count: write_sent_waiters,
                 ready_count: self.ready.len(),
                 ready_overflow_pending: self.ready_sweep || self.ready.has_pending(),
                 readiness: self.ready.counters(),
@@ -255,6 +273,7 @@ impl NativeStack {
         }
     }
 
+    #[cfg(debug_assertions)]
     pub fn apply_bounded_work(&mut self, requested: Work) -> Envelope<Work> {
         let (completed, more) = self.limits.constrain(requested);
         self.counters.observe(completed);
@@ -267,16 +286,128 @@ impl NativeStack {
         }
     }
 
+    #[cfg(debug_assertions)]
+    pub fn test_maximum_work(&mut self) -> Envelope<Work> {
+        let completed = Work {
+            bytes_copied: self.limits.bytes_copied,
+            output_packets: self.limits.output_packets,
+            ready_events: self.limits.ready_events,
+            maintenance_work: self.limits.maintenance_work,
+        };
+        let packet_count = completed.output_packets;
+        let base_size = completed.bytes_copied / packet_count;
+        let larger_packets = completed.bytes_copied % packet_count;
+
+        let output = (0..packet_count)
+            .map(|index| vec![0_u8; base_size + usize::from(index < larger_packets)])
+            .collect();
+
+        self.counters.observe(completed);
+
+        Envelope {
+            result: completed,
+            output,
+            poll_at: None,
+            more: false,
+        }
+    }
+
+    #[cfg(debug_assertions)]
+    pub fn test_combined_maximum_work(
+        &mut self,
+        env: Env<'_>,
+        keys: Vec<ReadyKey>,
+        now: Instant,
+    ) -> Result<Envelope<Work>, SocketError> {
+        if keys.len() > self.limits.ready_events {
+            return Err(SocketError::SystemLimit);
+        }
+
+        let mut wakers = Vec::with_capacity(keys.len());
+        for key in keys {
+            let flag =
+                self.socket_table
+                    .ready_flag(key.identity, SocketKind::Synthetic, key.direction)?;
+            wakers.push(self.ready.waker(key, flag));
+        }
+        for waker in wakers {
+            waker.wake();
+        }
+
+        let completed = Work {
+            bytes_copied: self.limits.bytes_copied,
+            output_packets: self.limits.output_packets,
+            ready_events: self.limits.ready_events,
+            maintenance_work: self.limits.maintenance_work,
+        };
+        let packet_count = completed.output_packets;
+        let base_size = completed.bytes_copied / packet_count;
+        let larger_packets = completed.bytes_copied % packet_count;
+        let mut effects = self.poll(now);
+        effects.output = (0..packet_count)
+            .map(|index| vec![0_u8; base_size + usize::from(index < larger_packets)])
+            .collect();
+        self.counters.observe(Work {
+            bytes_copied: completed.bytes_copied,
+            output_packets: completed.output_packets,
+            ..Work::default()
+        });
+
+        Ok(self.finish_call(env, completed, effects, Vec::new()))
+    }
+
+    #[cfg(debug_assertions)]
+    pub fn test_prepare_closing(&mut self, count: usize) -> Result<Envelope<Atom>, SocketError> {
+        if count > self.limits.maintenance_work || count > self.limits.ready_events {
+            return Err(SocketError::SystemLimit);
+        }
+
+        let now = Instant::ZERO;
+        let deadline = now + Duration::from_millis(tcp_support::CLOSE_TIMEOUT_MILLIS);
+
+        for _index in 0..count {
+            self.ensure_logical_socket_capacity()?;
+            self.ensure_native_socket_capacity(1, 0)?;
+            let handle = self.sockets.add(tcp_support::socket());
+            let identity = match self.socket_table.insert(SocketKind::Tcp, 0) {
+                Ok(identity) => identity,
+                Err(error) => {
+                    self.sockets.remove(handle);
+                    return Err(error);
+                }
+            };
+            let mut record = TcpRecord::new(identity, handle, AddressFamily::Inet6);
+            record.phase = ConnectPhase::Connected;
+            record.close_deadline = Some(deadline);
+            self.tcp_records.insert(identity.id, record);
+            let _waiters = self.socket_table.close(identity)?;
+            self.sockets.get_mut::<tcp::Socket<'static>>(handle).close();
+            self.closing_tcp.insert(identity.id);
+            self.closing_deadlines.insert((deadline, identity.id));
+        }
+
+        self.closing_sweep_cursor = None;
+        self.request_closing_cleanup();
+        self.maintenance_cleanup_turn = false;
+        Ok(Envelope::empty(crate::atoms::ok()))
+    }
+
+    #[cfg(debug_assertions)]
+    pub fn test_prepare_maximum_drop(&mut self) -> Result<Envelope<Atom>, SocketError> {
+        self.device
+            .test_fill_transmit(self.limits.output_packets, self.mtu)
+            .map_err(|()| SocketError::InvalidState)?;
+        Ok(Envelope::empty(crate::atoms::ok()))
+    }
+
     pub fn tcp_open(
         &mut self,
         env: Env<'_>,
         family: AddressFamily,
     ) -> Result<Envelope<SocketIdentity>, SocketError> {
         self.ensure_running()?;
-
-        if self.tcp_records.len() >= self.limits.ready_events {
-            return Err(SocketError::SystemLimit);
-        }
+        self.ensure_logical_socket_capacity()?;
+        self.ensure_native_socket_capacity(1, 0)?;
 
         let handle = self.sockets.add(tcp_support::socket());
         let identity = match self.socket_table.insert(SocketKind::Tcp, 0) {
@@ -377,6 +508,7 @@ impl NativeStack {
         };
         let listen_endpoint = self.concrete_listener_endpoint(endpoint)?;
         let pool_target = backlog.min(tcp_support::LISTENER_POOL_MAX);
+        self.ensure_native_socket_capacity(pool_target.saturating_sub(1), 0)?;
         let mut handles = vec![record.handle];
 
         for _ in 1..pool_target {
@@ -904,6 +1036,8 @@ impl NativeStack {
         family: AddressFamily,
     ) -> Result<Envelope<SocketIdentity>, SocketError> {
         self.ensure_running()?;
+        self.ensure_logical_socket_capacity()?;
+        self.ensure_native_socket_capacity(1, 0)?;
 
         let handle = self.sockets.add(udp_support::socket());
         let identity = match self.socket_table.insert(SocketKind::Udp, 0) {
@@ -967,37 +1101,47 @@ impl NativeStack {
             return Err(SocketError::AddressNotAvailable);
         }
 
-        let mut handles = Vec::with_capacity(addresses.len());
+        debug_assert_eq!(record.handles.len(), 1);
+        let primary_handle = record.primary_handle();
+        let mut addresses = addresses.into_iter();
+        let primary_address = addresses.next().expect("non-empty addresses checked");
+        let additional_addresses = addresses.collect::<Vec<_>>();
+        self.ensure_native_socket_capacity(additional_addresses.len(), 0)?;
+        let mut additional_sockets = Vec::with_capacity(additional_addresses.len());
 
-        for address in addresses {
-            let handle = self.sockets.add(udp_support::socket());
-            let bind_result =
-                self.sockets
-                    .get_mut::<udp::Socket<'static>>(handle)
-                    .bind(IpListenEndpoint {
-                        addr: Some(address),
-                        port: endpoint.port,
-                    });
+        for address in additional_addresses {
+            let mut socket = udp_support::socket();
+            let bind_result = socket.bind(IpListenEndpoint {
+                addr: Some(address),
+                port: endpoint.port,
+            });
 
             match bind_result {
-                Ok(()) => handles.push(handle),
-                Err(error) => {
-                    self.sockets.remove(handle);
-                    for handle in handles {
-                        self.sockets.remove(handle);
-                    }
-
-                    return Err(match error {
-                        UdpBindError::InvalidState => SocketError::InvalidState,
-                        UdpBindError::Unaddressable => SocketError::InvalidAddress,
-                    });
-                }
+                Ok(()) => additional_sockets.push(socket),
+                Err(UdpBindError::InvalidState) => return Err(SocketError::InvalidState),
+                Err(UdpBindError::Unaddressable) => return Err(SocketError::InvalidAddress),
             }
         }
 
-        for handle in record.handles {
-            self.sockets.remove(handle);
-        }
+        self.sockets
+            .get_mut::<udp::Socket<'static>>(primary_handle)
+            .bind(IpListenEndpoint {
+                addr: Some(primary_address),
+                port: endpoint.port,
+            })
+            .map_err(|error| match error {
+                UdpBindError::InvalidState => SocketError::InvalidState,
+                UdpBindError::Unaddressable => SocketError::InvalidAddress,
+            })?;
+
+        let mut handles = vec![primary_handle];
+        handles.extend(
+            additional_sockets
+                .into_iter()
+                .map(|socket| self.sockets.add(socket)),
+        );
+
+        debug_assert!(self.sockets.iter().count() <= NATIVE_SOCKET_CAPACITY);
 
         let record = self.udp_record_mut(identity)?;
         record.handles = handles;
@@ -1452,6 +1596,7 @@ impl NativeStack {
         internal_handle: u64,
     ) -> Result<Envelope<SocketIdentity>, SocketError> {
         self.ensure_running()?;
+        self.ensure_logical_socket_capacity()?;
         let identity = self
             .socket_table
             .insert(SocketKind::Synthetic, internal_handle)?;
@@ -1478,9 +1623,10 @@ impl NativeStack {
             return Err(SocketError::InvalidOperation);
         }
 
+        let expected_kind = self.socket_table.validate_any(identity)?.kind;
         let flag = self
             .socket_table
-            .ready_flag(identity, SocketKind::Synthetic, direction)?;
+            .ready_flag(identity, expected_kind, direction)?;
         let key = ReadyKey {
             identity,
             direction,
@@ -1502,7 +1648,7 @@ impl NativeStack {
                 env,
                 WaiterRegistration {
                     identity,
-                    expected_kind: SocketKind::Synthetic,
+                    expected_kind,
                     direction,
                     pid,
                     operation,
@@ -1535,9 +1681,10 @@ impl NativeStack {
         let mut wakers = Vec::with_capacity(keys.len());
 
         for key in keys {
-            let flag =
-                self.socket_table
-                    .ready_flag(key.identity, SocketKind::Synthetic, key.direction)?;
+            let expected_kind = self.socket_table.validate_any(key.identity)?.kind;
+            let flag = self
+                .socket_table
+                .ready_flag(key.identity, expected_kind, key.direction)?;
             wakers.push(self.ready.waker(key, flag));
         }
 
@@ -2044,7 +2191,11 @@ impl NativeStack {
         {
             let can_queue = listener.accepted.len() < listener.backlog;
             let child = can_queue
-                .then(|| self.socket_table.insert(SocketKind::Tcp, 0))
+                .then(|| {
+                    self.ensure_logical_socket_capacity()?;
+                    self.ensure_native_socket_capacity(1, 0)?;
+                    self.socket_table.insert(SocketKind::Tcp, 0)
+                })
                 .transpose();
 
             match child {
@@ -2088,6 +2239,7 @@ impl NativeStack {
     }
 
     fn add_listener_member(&mut self, listener: &mut ListenerRecord) {
+        debug_assert!(self.ensure_native_socket_capacity(1, 0).is_ok());
         let handle = self.sockets.add(tcp_support::socket());
         let socket = self.sockets.get_mut::<tcp::Socket<'static>>(handle);
         socket.set_timeout(Some(Duration::from_millis(
@@ -2114,6 +2266,38 @@ impl NativeStack {
                     flag,
                 )
                 .wake();
+        }
+    }
+
+    fn ensure_logical_socket_capacity(&self) -> Result<(), SocketError> {
+        let logical_socket_count = self
+            .socket_table
+            .len()
+            .checked_add(self.closing_tcp.len())
+            .ok_or(SocketError::SystemLimit)?;
+
+        if logical_socket_count >= self.limits.ready_events {
+            Err(SocketError::SystemLimit)
+        } else {
+            Ok(())
+        }
+    }
+
+    fn ensure_native_socket_capacity(
+        &self,
+        added: usize,
+        removed: usize,
+    ) -> Result<(), SocketError> {
+        let native_socket_count = self.sockets.iter().count();
+        let resulting_socket_count = native_socket_count
+            .checked_sub(removed)
+            .and_then(|count| count.checked_add(added))
+            .ok_or(SocketError::SystemLimit)?;
+
+        if resulting_socket_count > NATIVE_SOCKET_CAPACITY {
+            Err(SocketError::SystemLimit)
+        } else {
+            Ok(())
         }
     }
 
@@ -2684,40 +2868,562 @@ impl NativeStack {
             return Err(StackError::InvalidPacket);
         }
 
-        let valid = match packet[0] >> 4 {
-            4 => Ipv4Packet::new_checked(packet).is_ok_and(|ipv4| {
-                usize::from(ipv4.total_len()) == packet.len()
-                    && ipv4.verify_checksum()
-                    && !ipv4.more_frags()
-                    && ipv4.frag_offset() == 0
-            }),
-            6 => Ipv6Packet::new_checked(packet).is_ok_and(|ipv6| {
-                40usize
-                    .checked_add(usize::from(ipv6.payload_len()))
-                    .is_some_and(|declared| declared == packet.len())
-            }),
-            _ => false,
-        };
-
-        if !valid {
+        if let Err(error) = validate_raw_packet(packet, self.mtu, self.limits.bytes_copied) {
             self.counters.rejected_packets += 1;
-            return Err(StackError::InvalidPacket);
-        }
-
-        if packet.len() > self.mtu || packet.len() > self.limits.bytes_copied {
-            self.counters.rejected_packets += 1;
-            return Err(StackError::PacketTooLarge);
+            return Err(error);
         }
 
         Ok(())
     }
 }
 
-#[derive(Clone, Debug, NifMap)]
+pub(crate) fn validate_raw_packet(
+    packet: &[u8],
+    mtu: usize,
+    bytes_copied: usize,
+) -> Result<(), StackError> {
+    if packet.is_empty() {
+        return Err(StackError::InvalidPacket);
+    }
+
+    let valid = match packet[0] >> 4 {
+        4 => Ipv4Packet::new_checked(packet).is_ok_and(|ipv4| {
+            usize::from(ipv4.total_len()) == packet.len()
+                && ipv4.verify_checksum()
+                && !ipv4.more_frags()
+                && ipv4.frag_offset() == 0
+        }),
+        6 => Ipv6Packet::new_checked(packet).is_ok_and(|ipv6| {
+            40usize
+                .checked_add(usize::from(ipv6.payload_len()))
+                .is_some_and(|declared| declared == packet.len())
+        }),
+        _ => false,
+    };
+
+    if !valid {
+        return Err(StackError::InvalidPacket);
+    }
+
+    if packet.len() > mtu || packet.len() > bytes_copied {
+        return Err(StackError::PacketTooLarge);
+    }
+
+    Ok(())
+}
+
+#[cfg(feature = "fuzzing")]
+pub(crate) fn fuzz_raw_engine(data: &[u8]) {
+    let limits = fuzz_limits();
+    let Some(mut stack) = NativeStack::new(limits, fuzz_stack_config(), Instant::ZERO).ok() else {
+        return;
+    };
+    let packet = data.get(..data.len().min(4_096)).unwrap_or_default();
+    let _arbitrary_result = stack.ingress(packet, Instant::ZERO);
+
+    let payload = data.get(..data.len().min(2_048)).unwrap_or_default();
+    let valid_packet = fuzz_ipv6_packet(payload);
+    let _valid_result = stack.ingress(&valid_packet, Instant::from_millis(1));
+
+    for tick in 2..=2 + data.first().map_or(0, |byte| i64::from(byte % 4)) {
+        let _effects = stack.poll(Instant::from_millis(tick));
+    }
+}
+
+#[cfg(feature = "fuzzing")]
+pub(crate) fn fuzz_config_and_endpoints(data: &[u8]) {
+    let limits = fuzz_limits();
+    let mtu = data
+        .first()
+        .map_or(1_280, |byte| 1_200 + usize::from(*byte) * 256);
+    let address_length = data.get(1).map_or(0, |byte| usize::from(byte % 18));
+    let address = data
+        .get(2..)
+        .unwrap_or_default()
+        .iter()
+        .copied()
+        .take(address_length)
+        .collect::<Vec<_>>();
+    let prefix_length = data.get(20).copied().unwrap_or_default();
+    let route_gateway = data
+        .get(21..)
+        .unwrap_or_default()
+        .iter()
+        .copied()
+        .take(address_length)
+        .collect::<Vec<_>>();
+    let config = StackConfig {
+        mtu,
+        addresses: vec![AddressConfig {
+            address: address.clone(),
+            prefix_length,
+        }],
+        routes: vec![RouteConfig {
+            destination: address.clone(),
+            prefix_length,
+            gateway: route_gateway,
+        }],
+    };
+    let _stack_result = NativeStack::new(limits, config, Instant::ZERO);
+
+    let endpoint = TcpEndpoint {
+        address,
+        port: fuzz_signed_value(data.get(39..47).unwrap_or_default()),
+        scope_id: fuzz_signed_value(data.get(47..55).unwrap_or_default()),
+    };
+    let _bind_result = endpoint.bind_endpoint();
+    let _remote_result = endpoint.remote_endpoint();
+}
+
+#[cfg(feature = "fuzzing")]
+pub(crate) fn fuzz_socket_lifecycle(data: &[u8]) {
+    let Some(mut stack) = NativeStack::new(fuzz_limits(), fuzz_stack_config(), Instant::ZERO).ok()
+    else {
+        return;
+    };
+    let mut identities = Vec::with_capacity(32);
+
+    for (step, operation) in data.iter().copied().take(512).enumerate() {
+        let now = Instant::from_millis(i64::try_from(step).unwrap_or(i64::MAX));
+
+        match operation % 11 {
+            0 if identities.len() < 32 => {
+                if let Ok(identity) = fuzz_open_socket(&mut stack, SocketKind::Tcp, operation) {
+                    identities.push((identity, SocketKind::Tcp));
+                }
+            }
+            1 if identities.len() < 32 => {
+                if let Ok(identity) = fuzz_open_socket(&mut stack, SocketKind::Udp, operation) {
+                    identities.push((identity, SocketKind::Udp));
+                }
+            }
+            2 if !identities.is_empty() => {
+                let (identity, kind) = identities[usize::from(operation) % identities.len()];
+                let _result = fuzz_bind_socket(&mut stack, identity, kind, operation);
+            }
+            3 if !identities.is_empty() => {
+                let (identity, kind) = identities[usize::from(operation) % identities.len()];
+                let _result = fuzz_advance_socket(&mut stack, identity, kind, operation, now);
+            }
+            4 if !identities.is_empty() => {
+                let index = usize::from(operation) % identities.len();
+                let (identity, kind) = identities.swap_remove(index);
+                let _result = fuzz_close_socket(&mut stack, identity, kind, operation, now);
+            }
+            5 if !identities.is_empty() => {
+                let (identity, kind) = identities[usize::from(operation) % identities.len()];
+                fuzz_readiness(&mut stack, identity, kind, operation);
+            }
+            6 => {
+                let _effects = stack.poll(now);
+            }
+            7 => {
+                let packet = fuzz_ipv6_packet(data.get(step..).unwrap_or_default());
+                let _result = stack.ingress(&packet, now);
+            }
+            8 => {
+                let packet = data
+                    .get(step..)
+                    .unwrap_or_default()
+                    .get(..data.len().saturating_sub(step).min(256))
+                    .unwrap_or_default();
+                let _result = stack.ingress(packet, now);
+            }
+            9 if !identities.is_empty() => {
+                let (mut identity, kind) = identities[usize::from(operation) % identities.len()];
+                identity.generation = identity.generation.wrapping_add(1);
+                let _result = stack.socket_table.validate(identity, kind);
+            }
+            10 => {
+                fuzz_shutdown(&mut stack);
+                break;
+            }
+            _other => {}
+        }
+    }
+
+    fuzz_shutdown(&mut stack);
+}
+
+#[cfg(feature = "fuzzing")]
+fn fuzz_limits() -> Limits {
+    Limits {
+        bytes_copied: 65_575,
+        output_packets: 32,
+        ready_events: 64,
+        maintenance_work: 64,
+    }
+}
+
+#[cfg(feature = "fuzzing")]
+fn fuzz_stack_config() -> StackConfig {
+    StackConfig {
+        mtu: 4_096,
+        addresses: vec![
+            AddressConfig {
+                address: vec![192, 0, 2, 1],
+                prefix_length: 24,
+            },
+            AddressConfig {
+                address: vec![0xfd, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+                prefix_length: 64,
+            },
+        ],
+        routes: vec![
+            RouteConfig {
+                destination: vec![0, 0, 0, 0],
+                prefix_length: 0,
+                gateway: vec![192, 0, 2, 2],
+            },
+            RouteConfig {
+                destination: vec![0; 16],
+                prefix_length: 0,
+                gateway: vec![0xfd, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2],
+            },
+        ],
+    }
+}
+
+#[cfg(feature = "fuzzing")]
+fn fuzz_ipv6_packet(payload: &[u8]) -> Vec<u8> {
+    let payload = payload.get(..payload.len().min(2_048)).unwrap_or_default();
+    let payload_length = u16::try_from(payload.len()).expect("bounded fuzz payload");
+    let mut packet = Vec::with_capacity(40 + payload.len());
+    packet.extend_from_slice(&[0x60, 0, 0, 0]);
+    packet.extend_from_slice(&payload_length.to_be_bytes());
+    packet.extend_from_slice(&[59, 64]);
+    packet.extend_from_slice(&[0xfd, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2]);
+    packet.extend_from_slice(&[0xfd, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
+    packet.extend_from_slice(payload);
+    packet
+}
+
+#[cfg(feature = "fuzzing")]
+fn fuzz_signed_value(bytes: &[u8]) -> i64 {
+    let mut value = [0_u8; 8];
+    let length = bytes.len().min(value.len());
+    value[..length].copy_from_slice(&bytes[..length]);
+    i64::from_le_bytes(value)
+}
+
+#[cfg(feature = "fuzzing")]
+fn fuzz_family(operation: u8) -> AddressFamily {
+    if operation & 0x80 == 0 {
+        AddressFamily::Inet
+    } else {
+        AddressFamily::Inet6
+    }
+}
+
+#[cfg(feature = "fuzzing")]
+fn fuzz_endpoint(family: AddressFamily, operation: u8, remote: bool) -> TcpEndpoint {
+    let address = match (family, remote) {
+        (AddressFamily::Inet, false) => vec![192, 0, 2, 1],
+        (AddressFamily::Inet, true) => vec![192, 0, 2, 2],
+        (AddressFamily::Inet6, false) => {
+            vec![0xfd, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]
+        }
+        (AddressFamily::Inet6, true) => {
+            vec![0xfd, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2]
+        }
+    };
+
+    TcpEndpoint {
+        address,
+        port: if remote {
+            1 + i64::from(operation) * 251
+        } else {
+            0
+        },
+        scope_id: 0,
+    }
+}
+
+#[cfg(feature = "fuzzing")]
+fn fuzz_open_socket(
+    stack: &mut NativeStack,
+    kind: SocketKind,
+    operation: u8,
+) -> Result<SocketIdentity, SocketError> {
+    stack.ensure_running()?;
+    stack.ensure_logical_socket_capacity()?;
+    stack.ensure_native_socket_capacity(1, 0)?;
+    let family = fuzz_family(operation);
+
+    match kind {
+        SocketKind::Tcp => {
+            let handle = stack.sockets.add(tcp_support::socket());
+            let identity = match stack.socket_table.insert(kind, 0) {
+                Ok(identity) => identity,
+                Err(error) => {
+                    stack.sockets.remove(handle);
+                    return Err(error);
+                }
+            };
+            stack
+                .tcp_records
+                .insert(identity.id, TcpRecord::new(identity, handle, family));
+            Ok(identity)
+        }
+        SocketKind::Udp => {
+            let handle = stack.sockets.add(udp_support::socket());
+            let identity = match stack.socket_table.insert(kind, 0) {
+                Ok(identity) => identity,
+                Err(error) => {
+                    stack.sockets.remove(handle);
+                    return Err(error);
+                }
+            };
+            stack
+                .udp_records
+                .insert(identity.id, UdpRecord::new(identity, handle, family));
+            Ok(identity)
+        }
+        SocketKind::Synthetic => Err(SocketError::WrongKind),
+    }
+}
+
+#[cfg(feature = "fuzzing")]
+fn fuzz_bind_socket(
+    stack: &mut NativeStack,
+    identity: SocketIdentity,
+    kind: SocketKind,
+    operation: u8,
+) -> Result<(), SocketError> {
+    let family = match kind {
+        SocketKind::Tcp => stack.tcp_record(identity)?.family,
+        SocketKind::Udp => stack.udp_record(identity)?.family,
+        SocketKind::Synthetic => return Err(SocketError::WrongKind),
+    };
+    let mut endpoint = fuzz_endpoint(family, operation, false).bind_endpoint()?;
+
+    match kind {
+        SocketKind::Tcp => {
+            stack.socket_table.validate(identity, SocketKind::Tcp)?;
+            let record = *stack.tcp_record(identity)?;
+            if record.phase != ConnectPhase::Open {
+                return Err(SocketError::InvalidState);
+            }
+            endpoint.port = stack.allocate_ephemeral_port(record.family)?;
+            let record = stack.tcp_record_mut(identity)?;
+            record.phase = ConnectPhase::Bound;
+            record.local = Some(endpoint.ip_endpoint());
+            record.local_scope_id = endpoint.scope_id;
+        }
+        SocketKind::Udp => {
+            stack.socket_table.validate(identity, SocketKind::Udp)?;
+            let record = stack.udp_record(identity)?.clone();
+            if record.local.is_some() {
+                return Err(SocketError::InvalidState);
+            }
+            endpoint.port = stack.allocate_udp_ephemeral_port(record.family)?;
+            stack
+                .sockets
+                .get_mut::<udp::Socket<'static>>(record.primary_handle())
+                .bind(endpoint.ip_endpoint())
+                .map_err(|error| match error {
+                    UdpBindError::InvalidState => SocketError::InvalidState,
+                    UdpBindError::Unaddressable => SocketError::InvalidAddress,
+                })?;
+            let record = stack.udp_record_mut(identity)?;
+            record.local = Some(endpoint);
+        }
+        SocketKind::Synthetic => return Err(SocketError::WrongKind),
+    }
+
+    Ok(())
+}
+
+#[cfg(feature = "fuzzing")]
+fn fuzz_advance_socket(
+    stack: &mut NativeStack,
+    identity: SocketIdentity,
+    kind: SocketKind,
+    operation: u8,
+    now: Instant,
+) -> Result<(), SocketError> {
+    match kind {
+        SocketKind::Tcp => {
+            let record = *stack.tcp_record(identity)?;
+            if record.phase != ConnectPhase::Bound {
+                return Err(SocketError::NotBound);
+            }
+            let local = record.local.ok_or(SocketError::NotBound)?;
+            let endpoint = ValidatedEndpoint {
+                address: local.addr,
+                port: local.port,
+                scope_id: record.local_scope_id,
+            };
+            let listen_endpoint = stack.concrete_listener_endpoint(endpoint)?;
+            stack
+                .sockets
+                .get_mut::<tcp::Socket<'static>>(record.handle)
+                .listen(listen_endpoint)
+                .map_err(|error| match error {
+                    ListenError::InvalidState => SocketError::InvalidState,
+                    ListenError::Unaddressable => SocketError::InvalidAddress,
+                })?;
+            stack.remove_tcp_record(record);
+            stack.tcp_listeners.insert(
+                identity.id,
+                ListenerRecord::new(
+                    identity,
+                    endpoint,
+                    listen_endpoint,
+                    local,
+                    1 + usize::from(operation % 4),
+                    [record.handle],
+                ),
+            );
+            stack.request_listener_scan();
+        }
+        SocketKind::Udp => {
+            let record = stack.udp_record(identity)?.clone();
+            if record.local.is_none() {
+                return Err(SocketError::NotBound);
+            }
+            let remote = fuzz_endpoint(record.family, operation, true).remote_endpoint()?;
+            if !stack.reachable(remote.address) {
+                return Err(SocketError::NetworkUnreachable);
+            }
+            stack.udp_record_mut(identity)?.peer = Some(remote);
+        }
+        SocketKind::Synthetic => return Err(SocketError::WrongKind),
+    }
+
+    let _effects = stack.poll(now);
+    Ok(())
+}
+
+#[cfg(feature = "fuzzing")]
+fn fuzz_readiness(
+    stack: &mut NativeStack,
+    identity: SocketIdentity,
+    kind: SocketKind,
+    operation: u8,
+) {
+    let direction = if operation & 0x40 == 0 {
+        Direction::Read
+    } else {
+        Direction::Write
+    };
+    let key = ReadyKey {
+        identity,
+        direction,
+    };
+    let Ok(flag) = stack.socket_table.ready_flag(identity, kind, direction) else {
+        return;
+    };
+    let waker = stack.ready.waker(key, flag);
+    waker.wake_by_ref();
+    waker.wake_by_ref();
+
+    for ready in stack.ready.drain(1 + usize::from(operation % 4)) {
+        let _result = stack.socket_table.take_ready_waiter(ready);
+    }
+}
+
+#[cfg(feature = "fuzzing")]
+fn fuzz_close_socket(
+    stack: &mut NativeStack,
+    identity: SocketIdentity,
+    kind: SocketKind,
+    operation: u8,
+    now: Instant,
+) -> Result<(), SocketError> {
+    stack.socket_table.validate(identity, kind)?;
+    let _waiters = stack.socket_table.close(identity)?;
+
+    match kind {
+        SocketKind::Tcp => {
+            if let Some(listener) = stack.tcp_listeners.remove(&identity.id) {
+                for handle in listener.pool {
+                    stack.sockets.remove(handle);
+                }
+                stack.listener_scan_cursor = None;
+                stack.listener_scan_pending = !stack.tcp_listeners.is_empty();
+            } else {
+                let mut record = *stack.tcp_record(identity)?;
+                if operation & 0x80 != 0 {
+                    record.phase = ConnectPhase::Connected;
+                    stack.tcp_record_mut(identity)?.phase = ConnectPhase::Connected;
+                }
+
+                if record.phase == ConnectPhase::Connected {
+                    stack
+                        .sockets
+                        .get_mut::<tcp::Socket<'static>>(record.handle)
+                        .close();
+                    let deadline = now + Duration::from_millis(tcp_support::CLOSE_TIMEOUT_MILLIS);
+                    stack.tcp_record_mut(identity)?.close_deadline = Some(deadline);
+                    stack.closing_tcp.insert(identity.id);
+                    stack.closing_deadlines.insert((deadline, identity.id));
+                    stack.request_closing_cleanup();
+                } else {
+                    stack
+                        .sockets
+                        .get_mut::<tcp::Socket<'static>>(record.handle)
+                        .abort();
+                    stack.remove_tcp_socket(record);
+                }
+            }
+        }
+        SocketKind::Udp => {
+            let record = stack.udp_record(identity)?.clone();
+            for handle in record.handles {
+                stack.sockets.remove(handle);
+            }
+            stack.udp_records.remove(&identity.id);
+        }
+        SocketKind::Synthetic => return Err(SocketError::WrongKind),
+    }
+
+    let _effects = stack.poll(now);
+    Ok(())
+}
+
+#[cfg(feature = "fuzzing")]
+fn fuzz_shutdown(stack: &mut NativeStack) {
+    if matches!(stack.lifecycle, Lifecycle::Shutdown) {
+        return;
+    }
+
+    stack.lifecycle = Lifecycle::Shutdown;
+    for record in std::mem::take(&mut stack.tcp_records).into_values() {
+        stack.sockets.remove(record.handle);
+    }
+    for listener in std::mem::take(&mut stack.tcp_listeners).into_values() {
+        for handle in listener.pool {
+            stack.sockets.remove(handle);
+        }
+    }
+    for record in std::mem::take(&mut stack.udp_records).into_values() {
+        for handle in record.handles {
+            stack.sockets.remove(handle);
+        }
+    }
+    stack.tcp_connections.clear();
+    stack.closing_tcp.clear();
+    stack.closing_deadlines.clear();
+    let _waiters = stack.socket_table.close_all();
+    stack.ready.clear();
+}
+
+#[derive(Clone, Debug)]
 pub struct StackConfig {
     mtu: usize,
     addresses: Vec<AddressConfig>,
     routes: Vec<RouteConfig>,
+}
+
+impl<'a> Decoder<'a> for StackConfig {
+    fn decode(term: Term<'a>) -> NifResult<Self> {
+        Ok(Self {
+            mtu: term.map_get(crate::atoms::mtu())?.decode()?,
+            addresses: decode_bounded_list(term.map_get(crate::atoms::addresses())?, 8)?,
+            routes: decode_bounded_list(term.map_get(crate::atoms::routes())?, 4)?,
+        })
+    }
 }
 
 impl StackConfig {
@@ -2736,10 +3442,19 @@ impl StackConfig {
     }
 }
 
-#[derive(Clone, Debug, NifMap)]
+#[derive(Clone, Debug)]
 struct AddressConfig {
     address: Vec<u8>,
     prefix_length: u8,
+}
+
+impl<'a> Decoder<'a> for AddressConfig {
+    fn decode(term: Term<'a>) -> NifResult<Self> {
+        Ok(Self {
+            address: decode_bounded_list(term.map_get(crate::atoms::address())?, 16)?,
+            prefix_length: term.map_get(crate::atoms::prefix_length())?.decode()?,
+        })
+    }
 }
 
 impl AddressConfig {
@@ -2758,11 +3473,21 @@ impl AddressConfig {
     }
 }
 
-#[derive(Clone, Debug, NifMap)]
+#[derive(Clone, Debug)]
 struct RouteConfig {
     destination: Vec<u8>,
     prefix_length: u8,
     gateway: Vec<u8>,
+}
+
+impl<'a> Decoder<'a> for RouteConfig {
+    fn decode(term: Term<'a>) -> NifResult<Self> {
+        Ok(Self {
+            destination: decode_bounded_list(term.map_get(crate::atoms::destination())?, 16)?,
+            prefix_length: term.map_get(crate::atoms::prefix_length())?.decode()?,
+            gateway: decode_bounded_list(term.map_get(crate::atoms::gateway())?, 16)?,
+        })
+    }
 }
 
 impl RouteConfig {
@@ -3020,6 +3745,7 @@ pub struct Snapshot {
     limits: Limits,
     socket_count: usize,
     native_socket_count: usize,
+    native_socket_capacity: usize,
     tcp_socket_count: usize,
     tcp_listener_count: usize,
     udp_socket_count: usize,
@@ -3036,6 +3762,9 @@ pub struct Snapshot {
     waiter_count: usize,
     read_waiter_count: usize,
     write_waiter_count: usize,
+    sent_waiter_count: usize,
+    read_sent_waiter_count: usize,
+    write_sent_waiter_count: usize,
     ready_count: usize,
     ready_overflow_pending: bool,
     readiness: ReadinessCounters,
@@ -3054,6 +3783,7 @@ pub struct ResourceCounts {
     active: usize,
 }
 
+#[cfg(debug_assertions)]
 fn wake_repeatedly(waker: &std::task::Waker, count: usize) {
     for _ in 0..count {
         waker.wake_by_ref();
@@ -3087,7 +3817,9 @@ mod tests {
     #[test]
     fn contention_never_waits_for_the_mutex() {
         let resource = StackResource {
-            inner: Mutex::new(NativeStack::new(LIMITS, config(), Instant::ZERO).unwrap()),
+            inner: Mutex::new(Some(
+                NativeStack::new(LIMITS, config(), Instant::ZERO).unwrap(),
+            )),
         };
         assert_eq!(resource.test_contention(), Err(()));
     }

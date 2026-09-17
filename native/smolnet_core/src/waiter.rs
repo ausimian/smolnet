@@ -32,6 +32,7 @@ impl Operation {
 }
 
 #[derive(Clone, Copy, Debug, Eq, NifUnitEnum, PartialEq)]
+#[cfg(debug_assertions)]
 pub enum ArmPoint {
     None,
     BeforeTry,

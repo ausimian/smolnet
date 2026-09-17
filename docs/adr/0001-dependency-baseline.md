@@ -2,7 +2,7 @@
 
 ## Status
 
-Accepted for the project skeleton.
+Accepted for the first release candidate.
 
 ## Decision
 
@@ -11,19 +11,20 @@ Accepted for the project skeleton.
 - Rust 1.94.0 is pinned for development and CI. The crate declares Rust 1.91 as
   its minimum because both Rustler 0.38 and smoltcp 0.14 require it.
 - Rustler 0.38.0 provides the Elixir/NIF boundary.
-- smoltcp 0.14.0 is built with default features disabled. Only `std`,
-  `medium-ip`, `proto-ipv6`, `auto-icmp-echo-reply`, `async`, and
-  `socket-tcp` are enabled. Automatic ICMPv6 echo replies provide the Phase 2
-  packet-path integration probe without exposing an ICMP socket API. The
-  `async` feature supplies one-shot socket waker registration for Phase 3; it
-  does not introduce a runtime, task executor, or native polling thread.
+- smoltcp 0.14.0 is built with default features disabled. The first-release
+  graph enables `std`, `medium-ip`, `proto-ipv4`, `proto-ipv6`,
+  `auto-icmp-echo-reply`, `async`, `iface-max-addr-count-8`, `socket-tcp`, and
+  `socket-udp`. Automatic ICMP echo replies provide the packet-path integration
+  probe without exposing an ICMP socket API. The `async` feature supplies
+  one-shot socket waker registration; it does not introduce a runtime, task
+  executor, or native polling thread.
 - Credo, Dialyxir, ExDoc, ExCoveralls, and Publisho provide local quality,
   documentation, coverage, and eventual release tooling.
 
 | Dependency | Why accepted | Rejected alternative |
 |---|---|---|
 | Rustler 0.38.0 | Current NIF API, OTP 29 support, and the newer module-local compiler configuration path | 0.37.x has an older supported NIF surface and predates the 0.38 configuration guidance |
-| smoltcp 0.14.0 | Current stable stack, Rust 1.91 MSRV aligned with Rustler, and individually selectable protocol features | 0.13.x is already superseded; default features would add IPv4, UDP, Ethernet, host interfaces, and logging before their phases |
+| smoltcp 0.14.0 | Current stable stack, Rust 1.91 MSRV aligned with Rustler, and individually selectable protocol features | 0.13.x is already superseded; default features would add Ethernet, host interfaces, logging, and other unused functionality |
 | Credo 1.7 | Strict, established Elixir static analysis | A custom lint script would duplicate ecosystem checks and require local maintenance |
 | Dialyxir 1.4 | Standard Mix integration for Dialyzer | Running Dialyzer directly would require bespoke PLT and warning handling |
 | ExDoc 0.40 | Standard Elixir documentation generator with warnings-as-errors | Hand-built documentation would not validate references against the compiled API |
@@ -37,10 +38,10 @@ also require the relevant cross-version CI evidence before merge.
 
 ## Consequences
 
-The initial smoltcp feature graph excludes IPv4, UDP, Ethernet, host raw
-socket/TUN helpers, logging, and smoltcp's optional `libc` feature. Rustler
-itself depends on the Rust `libc` crate on Unix, and the first release targets
-GNU libc; musl builds are deferred.
+The first-release smoltcp feature graph includes both IP families and TCP/UDP,
+but excludes Ethernet, host raw-socket/TUN helpers, logging, and smoltcp's
+optional `libc` feature. Rustler itself depends on the Rust `libc` crate on
+Unix, and the first release targets GNU libc; musl builds are deferred.
 
 Dependency versions are locked. Updates require an explicit compatibility,
 binary-size, and feature-graph review.

@@ -113,6 +113,20 @@ defmodule SmolNet.Native do
   @spec test_bounded_work(reference(), map()) :: {:ok, map()} | {:error, atom()}
   def test_bounded_work(_stack, _requested), do: :erlang.nif_error(:nif_not_loaded)
 
+  @spec test_maximum_work(reference()) :: {:ok, map()} | {:error, atom()}
+  def test_maximum_work(_stack), do: :erlang.nif_error(:nif_not_loaded)
+
+  @spec test_combined_maximum_work(reference(), [map()], integer()) ::
+          {:ok, map()} | {:error, atom()}
+  def test_combined_maximum_work(_stack, _keys, _now),
+    do: :erlang.nif_error(:nif_not_loaded)
+
+  @spec test_prepare_closing(reference(), non_neg_integer()) :: {:ok, map()} | {:error, atom()}
+  def test_prepare_closing(_stack, _count), do: :erlang.nif_error(:nif_not_loaded)
+
+  @spec test_prepare_maximum_drop(reference()) :: {:ok, map()} | {:error, atom()}
+  def test_prepare_maximum_drop(_stack), do: :erlang.nif_error(:nif_not_loaded)
+
   @spec test_socket_open(reference(), non_neg_integer()) :: {:ok, map()} | {:error, atom()}
   def test_socket_open(_stack, _internal_handle), do: :erlang.nif_error(:nif_not_loaded)
 
