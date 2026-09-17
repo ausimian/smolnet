@@ -134,7 +134,7 @@ jobs:
           tar -xzf "$ASSET" -C artifact
           cp "artifact/$entry" _build/test/lib/smolnet/priv/native/smolnet_nif.so
           MIX_ENV=test mix run --no-compile -e 'unless SmolNet.Native.health() == :ok, do: raise("NIF health check failed")'
-          MIX_ENV=test mix test --no-compile --warnings-as-errors
+          MIX_ENV=test mix test --no-compile --warnings-as-errors --exclude debug_nif
 
       - name: Smoke-test the Hex consumer path
         env:

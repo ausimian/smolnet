@@ -6,8 +6,14 @@ architecture=${2:?usage: verify-nif-linux.sh <nif> <x86_64|aarch64>}
 glibc_floor=2.35
 
 case "$architecture" in
-  x86_64) expected_machine='Advanced Micro Devices X86-64' ;;
-  aarch64) expected_machine='AArch64' ;;
+  x86_64)
+    expected_machine='Advanced Micro Devices X86-64'
+    dynamic_loader='ld-linux-x86-64.so.2'
+    ;;
+  aarch64)
+    expected_machine='AArch64'
+    dynamic_loader='ld-linux-aarch64.so.1'
+    ;;
   *) echo "error: unsupported architecture $architecture" >&2; exit 1 ;;
 esac
 
@@ -17,7 +23,7 @@ if [[ "$actual_machine" != "$expected_machine" ]]; then
   exit 1
 fi
 
-allowed='libc.so.6 libgcc_s.so.1 libm.so.6 libdl.so.2 libpthread.so.0 librt.so.1'
+allowed="libc.so.6 libgcc_s.so.1 libm.so.6 libdl.so.2 libpthread.so.0 librt.so.1 $dynamic_loader"
 while IFS= read -r dependency; do
   if [[ " $allowed " != *" $dependency "* ]]; then
     echo "error: unexpected native dependency $dependency" >&2

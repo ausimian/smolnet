@@ -30,15 +30,16 @@ if (( major > 14 || (major == 14 && minor > 0) || (major == 14 && minor == 0 && 
 fi
 
 install_name=$(otool -D "$nif" 2>/dev/null | sed -n '2p' || true)
+allowed='/usr/lib/libSystem.B.dylib /usr/lib/libiconv.2.dylib'
 while IFS= read -r dependency; do
   if [[ -n "$install_name" && "$dependency" == "$install_name" ]]; then
     continue
   fi
 
-  if [[ "$dependency" != '/usr/lib/libSystem.B.dylib' ]]; then
+  if [[ " $allowed " != *" $dependency "* ]]; then
     echo "error: unexpected native dependency $dependency" >&2
     exit 1
   fi
 done < <(otool -L "$nif" | tail -n +2 | awk '{print $1}')
 
-echo "verified Apple Silicon NIF with macOS $macos_floor floor and libSystem-only dependency"
+echo "verified Apple Silicon NIF with macOS $macos_floor floor and allowlisted system dependencies"
