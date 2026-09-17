@@ -26,6 +26,7 @@ defmodule SmolNet.NativeTest do
     assert first_snapshot.result.id != second_snapshot.result.id
   end
 
+  @tag :debug_nif
   test "returns immediately when the defensive mutex is already held" do
     {:ok, ref} = SmolNet.start_stack()
     %{stack: stack} = Ref.pids(ref)
@@ -36,6 +37,7 @@ defmodule SmolNet.NativeTest do
              {:ok, {:error, :ownership_invariant_violation}}
   end
 
+  @tag :debug_nif
   test "bounds every ABI work dimension and reports a continuation" do
     limits = %{
       bytes_copied: 1_500,
@@ -204,6 +206,100 @@ defmodule SmolNet.NativeTest do
     assert Native.health() == :ok
   end
 
+  test "native collection decoders reject oversized input before allocating it" do
+    limits = Stack.default_limits()
+    address = List.duplicate(0, 17)
+    too_many_addresses = List.duplicate(%{address: [127, 0, 0, 1], prefix_length: 8}, 9)
+
+    too_many_routes =
+      List.duplicate(
+        %{destination: [0, 0, 0, 0], prefix_length: 0, gateway: [127, 0, 0, 1]},
+        5
+      )
+
+    assert Native.stack_new(limits, %{mtu: 1_280, addresses: too_many_addresses, routes: []}, 0) ==
+             {:error, :invalid_stack_config}
+
+    assert Native.stack_new(limits, %{mtu: 1_280, addresses: [], routes: too_many_routes}, 0) ==
+             {:error, :invalid_stack_config}
+
+    assert Native.stack_new(
+             limits,
+             %{mtu: 1_280, addresses: [%{address: address, prefix_length: 64}], routes: []},
+             0
+           ) == {:error, :invalid_stack_config}
+
+    {:ok, %{result: resource}} =
+      Native.stack_new(limits, %{mtu: 1_280, addresses: [], routes: []}, 0)
+
+    {:ok, %{result: identity}} = Native.tcp_open(resource, :inet6)
+
+    assert Native.tcp_bind(resource, identity, %{address: address, port: 80, scope_id: 0}) ==
+             {:error, :invalid_address}
+
+    assert Native.health() == :ok
+  end
+
+  test "native backing sockets have a hard per-stack capacity" do
+    config = %{mtu: 1_500, addresses: ipv6_addresses(8), routes: []}
+    {:ok, %{result: resource}} = Native.stack_new(Stack.default_limits(), config, 0)
+
+    for index <- 1..8 do
+      {:ok, %{result: identity}} = Native.udp_open(resource, :inet6)
+
+      assert {:ok, %{result: :ok}} =
+               Native.udp_bind(resource, identity, %{
+                 address: List.duplicate(0, 16),
+                 port: 40_000 + index,
+                 scope_id: 0
+               })
+    end
+
+    assert {:ok, %{result: snapshot}} = Native.stack_snapshot(resource)
+    assert snapshot.native_socket_capacity == 64
+    assert snapshot.native_socket_count == snapshot.native_socket_capacity
+    assert Native.udp_open(resource, :inet6) == {:error, :system_limit}
+  end
+
+  test "rejected wildcard expansion preserves the original UDP socket" do
+    addresses = ipv6_addresses(8)
+    config = %{mtu: 1_500, addresses: addresses, routes: []}
+    {:ok, %{result: resource}} = Native.stack_new(Stack.default_limits(), config, 0)
+
+    for index <- 1..7 do
+      {:ok, %{result: identity}} = Native.udp_open(resource, :inet6)
+
+      assert {:ok, %{result: :ok}} =
+               Native.udp_bind(resource, identity, %{
+                 address: List.duplicate(0, 16),
+                 port: 41_000 + index,
+                 scope_id: 0
+               })
+    end
+
+    {:ok, %{result: candidate}} = Native.udp_open(resource, :inet6)
+    {:ok, _spare} = Native.udp_open(resource, :inet6)
+
+    assert Native.udp_bind(resource, candidate, %{
+             address: List.duplicate(0, 16),
+             port: 42_000,
+             scope_id: 0
+           }) == {:error, :system_limit}
+
+    assert {:ok, %{result: snapshot}} = Native.stack_snapshot(resource)
+    assert snapshot.native_socket_count == 58
+
+    assert {:ok, %{result: :ok}} =
+             Native.udp_bind(resource, candidate, %{
+               address: hd(addresses).address,
+               port: 42_000,
+               scope_id: 0
+             })
+
+    assert {:ok, %{result: preserved}} = Native.stack_snapshot(resource)
+    assert preserved.native_socket_count == 58
+  end
+
   test "repeated create and destroy cycles release their native resources" do
     baseline = Native.resource_counts().active
 
@@ -222,6 +318,12 @@ defmodule SmolNet.NativeTest do
     %{stack: stack} = Ref.pids(ref)
     {:ok, snapshot} = Stack.native_snapshot(stack)
     snapshot
+  end
+
+  defp ipv6_addresses(count) do
+    Enum.map(1..count, fn suffix ->
+      %{address: [0xFD | List.duplicate(0, 14)] ++ [suffix], prefix_length: 64}
+    end)
   end
 
   defp stop_all_stacks do

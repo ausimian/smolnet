@@ -964,7 +964,7 @@ ownership has been transferred according to OTP rules.
 
 ## Recommended implementation boundaries
 
-Suggested source layout:
+Implemented source layout:
 
 ```text
 lib/
@@ -972,22 +972,27 @@ lib/
   smol_net/
     stack.ex
     socket.ex
-  smol_net/inet/
-    socket.ex
+  smol_net/inet_backend/
     options.ex
     packet.ex
-  smol_net/otp/
-    gen_tcp_backend.ex
-    gen_udp_backend.ex
+    tcp.ex / tcp4.ex
+    udp.ex / udp4.ex
 
-native/smol_nif/src/
-  lib.rs
+native/smolnet_core/src/
   stack.rs
   device.rs
   socket_table.rs
   waiter.rs
   tcp.rs
   udp.rs
+
+native/smolnet_nif/src/
+  lib.rs                         # thin Rustler entry point
+
+native/fuzz/fuzz_targets/
+  raw_packets.rs
+  endpoint_options.rs
+  socket_operations.rs
 ```
 
 Recommended planning slices:
@@ -1039,25 +1044,29 @@ The implementation plan should include at least:
 - TCP and UDP coexist in one `SocketSet` without readiness cross-talk;
 - active mode is drain-bounded and cannot monopolize its adapter process.
 
-## Decisions still requiring implementation-time validation
+## Finalized first-release decisions
 
-The architecture is settled, but the plan must resolve these concrete details:
-
-- target smoltcp and Rustler versions and their exact waker/term-storage APIs;
-- exact bounded polling calls available in that smoltcp version;
-- exact public result/select tuple compatibility with OTP `:socket`;
-- the custom inet backend callbacks and socket term expected by the pinned OTP
-  version;
-- whether low-level ownership/lifetime monitoring belongs in `SmolNet.Stack`,
-  the inet adapter, or both;
-- maximum bytes/packets emitted or copied per NIF invocation;
-- outbound mailbox backpressure/overflow policy;
-- egress message tag, opaque link identity, monitoring, and link-down policy;
-- native TCP/UDP buffer defaults and configurable limits;
-- close semantics and how long a graceful TCP close remains in the native set;
-- whether first release is outbound-only or includes listener/accept pooling;
-- mapping of smoltcp errors/states to OTP error atoms and close notifications.
-
-None of these should move application timeouts, packet framing, active-mode
-policy, or arbitrary send queues into Rust. They refine the boundary rather than
-change it.
+- Rustler 0.38.0 and smoltcp 0.14.0 are pinned. One-shot wakers store only the
+  waiting PID/reference, and every native drive applies explicit work, byte,
+  output, readiness, and maintenance limits.
+- Public nowait operations return opaque select continuations compatible with
+  the library's socket-like API. OTP integration uses custom IPv4 and IPv6
+  `:gen_tcp` and `:gen_udp` backend modules for the supported OTP matrix.
+- `SmolNet.Stack` owns and monitors the native lifetime. Each inet adapter also
+  monitors its controlling process and stack, so socket cleanup and bundle
+  failure stay isolated.
+- Raw-link egress is `{:smol_stack, link_ref, :egress, packet}`. The configured
+  link process owns transport backpressure; link death follows `:stop`,
+  `:mark_down`, or notification policy.
+- TCP buffers are fixed at 4,096 bytes per direction. UDP rings contain 16
+  packet descriptors and 16 KiB per direction. Public sockets and retained TCP
+  closes share the configured `ready_events` capacity.
+- Established TCP close invalidates the public handle immediately and retains a
+  bounded native FIN state for at most 30 seconds. UDP closes immediately.
+- The first release includes outbound TCP/UDP, listener/accept pooling, and
+  passive and bounded active inet modes for IPv4 and IPv6.
+- Stable low-level errors are translated by inet adapters into documented OTP
+  atoms. Close/error transitions abort both relevant waiter directions.
+- Application timeouts, packet framing, active-mode policy, and unsent or
+  partially received application data remain in Elixir; Rust never owns an
+  arbitrary application queue.

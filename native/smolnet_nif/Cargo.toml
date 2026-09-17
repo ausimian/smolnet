@@ -10,14 +10,4 @@ crate-type = ["cdylib"]
 
 [dependencies]
 rustler = "=0.38.0"
-smoltcp = { version = "=0.14.0", default-features = false, features = [
-  "std",
-  "medium-ip",
-  "proto-ipv4",
-  "proto-ipv6",
-  "auto-icmp-echo-reply",
-  "async",
-  "iface-max-addr-count-8",
-  "socket-tcp",
-  "socket-udp",
-] }
+smolnet_core = {path = "../smolnet_core"}

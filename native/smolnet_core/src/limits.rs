@@ -9,13 +9,19 @@ pub struct Limits {
 }
 
 impl Limits {
+    pub const MAX_BYTES_COPIED: usize = 65_575;
+    pub const MAX_OUTPUT_PACKETS: usize = 32;
+    pub const MAX_READY_EVENTS: usize = 128;
+    pub const MAX_MAINTENANCE_WORK: usize = 128;
+
     pub fn valid(self) -> bool {
-        (1..=16 * 1024 * 1024).contains(&self.bytes_copied)
-            && (1..=1_024).contains(&self.output_packets)
-            && (1..=4_096).contains(&self.ready_events)
-            && (1..=4_096).contains(&self.maintenance_work)
+        (1..=Self::MAX_BYTES_COPIED).contains(&self.bytes_copied)
+            && (1..=Self::MAX_OUTPUT_PACKETS).contains(&self.output_packets)
+            && (1..=Self::MAX_READY_EVENTS).contains(&self.ready_events)
+            && (1..=Self::MAX_MAINTENANCE_WORK).contains(&self.maintenance_work)
     }
 
+    #[cfg(debug_assertions)]
     pub fn constrain(self, requested: Work) -> (Work, bool) {
         let completed = Work {
             bytes_copied: requested.bytes_copied.min(self.bytes_copied),
@@ -94,7 +100,15 @@ mod tests {
 
         assert!(
             !Limits {
-                output_packets: 1_025,
+                output_packets: 33,
+                ..LIMITS
+            }
+            .valid()
+        );
+
+        assert!(
+            !Limits {
+                ready_events: 129,
                 ..LIMITS
             }
             .valid()

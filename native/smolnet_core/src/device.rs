@@ -69,6 +69,21 @@ impl BeamDevice {
     pub fn queued_packets(&self) -> (usize, usize) {
         (self.receive.len(), self.transmit.len())
     }
+
+    #[cfg(debug_assertions)]
+    pub fn test_fill_transmit(
+        &mut self,
+        packet_count: usize,
+        packet_size: usize,
+    ) -> Result<(), ()> {
+        if !self.transmit.is_empty() {
+            return Err(());
+        }
+
+        self.transmit
+            .extend((0..packet_count).map(|_| vec![0; packet_size]));
+        Ok(())
+    }
 }
 
 pub struct BeamRxToken(Vec<u8>);

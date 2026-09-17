@@ -8,12 +8,14 @@ and this project adheres to
 
 <!-- %% CHANGELOG_ENTRIES %% -->
 
-## Unreleased
+## [Unreleased]
+
+## [0.1.0] - 2026-09-17
 
 ### Added
 
-- Establish the Elixir application, Rustler NIF workspace, quality tooling, and
-  cross-platform compatibility workflow.
+- Provide independently supervised embedded raw-IP stacks with explicit
+  lifecycle, configuration, and runtime bounds.
 - Add serialized single-feeder raw IPv6 ingress, transport-neutral egress
   messages, native stack polling, BEAM-owned timer scheduling, link-down
   policies, and stack metrics.
@@ -41,3 +43,6 @@ and this project adheres to
 - Add IPv4 UDP parity across low-level and `gen_udp` APIs, including
   family-specific MTU limits and checksum handling, dual-family protocol
   coexistence, and an explicit TCP/UDP inet option contract.
+- Bound native packet, socket, readiness, maintenance, shutdown, and resource
+  destruction work so malformed traffic and maximum configurations cannot
+  monopolize a BEAM scheduler.

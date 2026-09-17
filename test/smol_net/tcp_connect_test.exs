@@ -250,17 +250,16 @@ defmodule SmolNet.TcpConnectTest do
     assert {:error, :invalid_socket_state} = SmolNet.bind(first, endpoint(@client, 50_001))
   end
 
-  test "ephemeral allocation reports deterministic exhaustion" do
+  test "live socket capacity is enforced before unbounded ephemeral scans" do
     {:ok, stack} =
-      SmolNet.start_stack(addresses: [{@client, 64}], limits: %{ready_events: 1_025})
+      SmolNet.start_stack(addresses: [{@client, 64}], limits: %{ready_events: 4})
 
-    for port <- 49_152..50_175 do
-      {:ok, socket} = SmolNet.open(:inet6, :stream, :tcp, stack: stack)
-      assert :ok = SmolNet.bind(socket, endpoint(@client, port))
+    for _index <- 1..4 do
+      assert {:ok, socket} = SmolNet.open(:inet6, :stream, :tcp, stack: stack)
+      assert :ok = SmolNet.bind(socket, endpoint(@client, 0))
     end
 
-    {:ok, exhausted} = SmolNet.open(:inet6, :stream, :tcp, stack: stack)
-    assert {:error, :ephemeral_ports_exhausted} = SmolNet.bind(exhausted, endpoint(@client, 0))
+    assert {:error, :system_limit} = SmolNet.open(:inet6, :stream, :tcp, stack: stack)
   end
 
   test "address, port, scope, family, route, and timeout validation is explicit" do

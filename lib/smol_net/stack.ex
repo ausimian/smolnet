@@ -15,7 +15,7 @@ defmodule SmolNet.Stack do
     bytes_copied: 64 * 1024,
     output_packets: 32,
     ready_events: 128,
-    maintenance_work: 256
+    maintenance_work: 128
   }
 
   @type limits :: %{

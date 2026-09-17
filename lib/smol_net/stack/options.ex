@@ -5,10 +5,10 @@ defmodule SmolNet.Stack.Options do
 
   @default_mtu 1_500
   @max_limits %{
-    bytes_copied: 16 * 1024 * 1024,
-    output_packets: 1_024,
-    ready_events: 4_096,
-    maintenance_work: 4_096
+    bytes_copied: 65_575,
+    output_packets: 32,
+    ready_events: 128,
+    maintenance_work: 128
   }
   @allowed [:egress, :mtu, :addresses, :routes, :limits, :link_down]
 

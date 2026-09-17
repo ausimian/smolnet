@@ -506,6 +506,17 @@ impl SocketTable {
             })
     }
 
+    pub fn sent_waiter_counts(&self) -> (usize, usize) {
+        self.entries
+            .values()
+            .fold((0, 0), |(read, write), (_, entry)| {
+                (
+                    read + usize::from(entry.read_sent.is_some()),
+                    write + usize::from(entry.write_sent.is_some()),
+                )
+            })
+    }
+
     #[cfg(test)]
     fn entry_mut(&mut self, identity: SocketIdentity) -> &mut SocketEntry {
         &mut self.entries.get_mut(&identity.id).unwrap().1

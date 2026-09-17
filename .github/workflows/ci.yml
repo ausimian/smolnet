@@ -98,6 +98,49 @@ jobs:
       - run: mix local.hex --force
       - run: mix local.rebar --force
       - run: mix deps.get
+      # Shared-runner wall-clock timings are evidence only until #14 provides
+      # a portable hard gate. Reduction budgets remain enforced everywhere.
       - run: mix precommit
+        env:
+          SMOLNET_NIF_WALL_CLOCK_MODE: report
       - run: mix coveralls.cobertura
       - run: mix hex.build
+
+  native-safety:
+    name: native safety / ASan fuzz
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - uses: erlef/setup-beam@54075bcc5e249e4758d363f27d099f55d843f124 # v1
+        with:
+          elixir-version: "1.19.5"
+          otp-version: "28.3"
+
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # nightly
+        with:
+          toolchain: nightly-2026-09-01
+
+      - run: cargo install cargo-fuzz --version 0.13.2 --locked
+      - run: >-
+          cargo +nightly-2026-09-01 test
+          --manifest-path native/Cargo.toml
+          --package smolnet_core
+          --target x86_64-unknown-linux-gnu
+        env:
+          RUSTFLAGS: -Zsanitizer=address
+      - run: cargo +nightly-2026-09-01 fuzz run raw_packets -- -runs=10000
+        working-directory: native/fuzz
+      - run: cargo +nightly-2026-09-01 fuzz run endpoint_options -- -runs=10000
+        working-directory: native/fuzz
+      - run: cargo +nightly-2026-09-01 fuzz run socket_operations -- -runs=10000
+        working-directory: native/fuzz
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: failure()
+        with:
+          name: fuzz-crashes
+          path: native/fuzz/artifacts
+          if-no-files-found: ignore
