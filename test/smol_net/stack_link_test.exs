@@ -42,7 +42,7 @@ defmodule SmolNet.StackLinkTest do
     end)
   end
 
-  test "accepts raw IPv6 and emits exactly one tagged binary packet" do
+  test "accepts raw IPv6 and emits exactly one tagged packet batch" do
     {:ok, stack} =
       SmolNet.start_stack(
         egress: {self(), :direct_link},
@@ -54,7 +54,7 @@ defmodule SmolNet.StackLinkTest do
     packet = echo_request(@address_b, @address_a, "hello")
     assert :ok = SmolNet.ingress(stack, packet)
 
-    assert_receive {:smol_stack, :direct_link, :egress, response}
+    assert_receive {:smol_stack, :direct_link, :egress, [response]}
     assert is_binary(response)
     assert <<6::4, _::bitstring>> = response
     assert ipv6_source(response) == ipv6_binary(@address_a)
@@ -66,6 +66,25 @@ defmodule SmolNet.StackLinkTest do
       {:ok, info} = SmolNet.stack_info(stack)
       info.processed_ingress == 1 and info.native.result.counters.emitted_packets == 1
     end)
+  end
+
+  test "egress emits one ordered list per native output envelope" do
+    first = empty_ipv6_packet(1)
+    second = empty_ipv6_packet(2)
+    configure_native_double(:default, output: [first, second])
+
+    {:ok, _stack} = SmolNet.start_stack(egress: {self(), :batch_link})
+
+    assert_receive {:smol_stack, :batch_link, :egress, [^first, ^second]}
+    refute_receive {:smol_stack, :batch_link, :egress, _other}, 50
+  end
+
+  test "egress does not emit empty output envelopes" do
+    configure_native_double(:default)
+
+    {:ok, _stack} = SmolNet.start_stack(egress: {self(), :empty_batch})
+
+    refute_receive {:smol_stack, :empty_batch, :egress, _packets}, 50
   end
 
   test "rejects malformed and oversized packets before native mutation" do
@@ -106,8 +125,8 @@ defmodule SmolNet.StackLinkTest do
     assert :ok = SmolNet.ingress(stack, packet)
     assert :ok = SmolNet.ingress(stack, packet)
 
-    assert_receive {:smol_stack, :byte_bound, :egress, first_response}
-    assert_receive {:smol_stack, :byte_bound, :egress, second_response}
+    assert_receive {:smol_stack, :byte_bound, :egress, [first_response]}
+    assert_receive {:smol_stack, :byte_bound, :egress, [second_response]}
     assert byte_size(first_response) == 1_280
     assert byte_size(second_response) == 1_280
 
@@ -347,7 +366,7 @@ defmodule SmolNet.StackLinkTest do
 
     :ok = ManualClock.advance(clock, 1)
     assert_receive {:native_stack_poll, ^stack_pid, 10}
-    assert_receive {:smol_stack, :timer, :egress, packet}
+    assert_receive {:smol_stack, :timer, :egress, [packet]}
     assert packet == empty_ipv6_packet()
 
     {:ok, polled} = SmolNet.stack_info(stack)
@@ -505,18 +524,18 @@ defmodule SmolNet.StackLinkTest do
     second = empty_ipv6_packet(2)
 
     :ok = IPv6Link.fault(link, :drop)
-    send(link, {:smol_stack, :source, :egress, first})
+    send(link, {:smol_stack, :source, :egress, [first]})
     assert_receive {:test_link_egress, :source, ^first}
     refute_receive {:native_stack_ingress, _, _}, 50
 
     :ok = IPv6Link.fault(link, :duplicate)
-    send(link, {:smol_stack, :source, :egress, first})
+    send(link, {:smol_stack, :source, :egress, [first]})
     assert_receive {:native_stack_ingress, peer_pid, ^first}
     assert_receive {:native_stack_ingress, ^peer_pid, ^first}
 
     :ok = IPv6Link.fault(link, :hold)
-    send(link, {:smol_stack, :source, :egress, first})
-    send(link, {:smol_stack, :source, :egress, second})
+    send(link, {:smol_stack, :source, :egress, [first]})
+    send(link, {:smol_stack, :source, :egress, [second]})
     refute_receive {:native_stack_ingress, _, _}, 50
 
     :ok = IPv6Link.release(link, :reverse)
@@ -563,6 +582,10 @@ defmodule SmolNet.StackLinkTest do
 
   test "validates stack link and IPv6 configuration options" do
     assert SmolNet.start_stack(egress: :bad) == {:error, :invalid_egress}
+
+    assert SmolNet.start_stack(egress: {self(), :bad, :batch}) ==
+             {:error, :invalid_egress}
+
     assert SmolNet.start_stack(mtu: 1_279) == {:error, :invalid_mtu}
 
     assert SmolNet.start_stack(addresses: [{{1, 2, 3, 4}, 64}]) ==
@@ -596,7 +619,7 @@ defmodule SmolNet.StackLinkTest do
       {:ok,
        %{
          result: make_ref(),
-         output: [],
+         output: Keyword.get(options, :output, []),
          poll_at: Keyword.get(options, :poll_at),
          more: false
        }}

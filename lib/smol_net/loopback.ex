@@ -88,11 +88,13 @@ defmodule SmolNet.Loopback do
   def handle_call(:stack, _from, state), do: {:reply, state.stack, state}
 
   @impl true
-  def handle_info({:smol_stack, @link_ref, :egress, packet}, state) do
-    case SmolNet.ingress(state.stack, packet) do
-      {:error, :closed} -> {:stop, :normal, state}
-      _accepted_or_dropped -> {:noreply, state}
-    end
+  def handle_info({:smol_stack, @link_ref, :egress, packets}, state) do
+    Enum.reduce_while(packets, {:noreply, state}, fn packet, _result ->
+      case SmolNet.ingress(state.stack, packet) do
+        {:error, :closed} -> {:halt, {:stop, :normal, state}}
+        _accepted_or_dropped -> {:cont, {:noreply, state}}
+      end
+    end)
   end
 
   # The stack was stopped from elsewhere, so the link it fed has no purpose.

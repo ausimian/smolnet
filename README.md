@@ -34,7 +34,7 @@ address = {0xFD00, 0, 0, 0, 0, 0, 0, 1}
 
 `SmolNet.start_stack/1` creates an independent native stack and returns an
 opaque reference. A transport-neutral link process supplies complete IPv4 or IPv6
-packets with `SmolNet.ingress/2` and receives each emitted packet as a message:
+packets with `SmolNet.ingress/2` and receives emitted packets in bounded batches:
 
 ```elixir
 address = {0xFD00, 0, 0, 0, 0, 0, 0, 1}
@@ -50,10 +50,15 @@ address = {0xFD00, 0, 0, 0, 0, 0, 0, 1}
 :ok = SmolNet.ingress(stack, complete_ip_packet)
 
 receive do
-  {:smol_stack, :my_link, :egress, complete_ip_packet} ->
-    :send_it_over_the_external_transport
+  {:smol_stack, :my_link, :egress, complete_ip_packets} ->
+    :send_them_over_the_external_transport
 end
 ```
+
+`complete_ip_packets` is a non-empty list of complete raw IP packet binaries.
+Its length and total data are bounded by the stack's `:output_packets` and
+`:bytes_copied` limits. Each native output envelope produces at most one message
+and preserves packet order.
 
 Each stack has one serialized link feeder. Ingress waits only until the stack
 owner validates and accepts the packet; bounded native processing then runs

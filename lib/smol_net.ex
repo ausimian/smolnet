@@ -39,8 +39,9 @@ defmodule SmolNet do
   Starts a raw-IP network stack.
 
   The returned reference is opaque and owns the complete temporary runtime
-  bundle. Configure packet output with `egress: {pid, link_ref}`. Each emitted
-  packet is delivered as `{:smol_stack, link_ref, :egress, packet}`.
+  bundle. Configure packet output with `egress: {pid, link_ref}`. Each bounded
+  native output batch is delivered as
+  `{:smol_stack, link_ref, :egress, [packet, ...]}`.
 
   IPv4 addresses use `{{a, b, c, d}, prefix_length}` and IPv6 addresses use
   `{{s1, s2, s3, s4, s5, s6, s7, s8}, prefix_length}`. Routes use

@@ -127,7 +127,17 @@ defmodule SmolNet.Test.IPv6TcpPeer do
   end
 
   @impl true
-  def handle_info({:smol_stack, :tcp_client, :egress, packet}, state) do
+  def handle_info({:smol_stack, :tcp_client, :egress, packets}, state) do
+    state =
+      Enum.reduce(packets, state, fn packet, state ->
+        {:noreply, state} = handle_egress(packet, state)
+        state
+      end)
+
+    {:noreply, state}
+  end
+
+  defp handle_egress(packet, state) do
     tcp = decode_tcp(packet)
     send(state.test, {:tcp_peer_egress, tcp.flags, packet})
     state = %{state | packets: [tcp | state.packets]}

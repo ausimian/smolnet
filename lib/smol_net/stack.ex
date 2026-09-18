@@ -956,11 +956,10 @@ defmodule SmolNet.Stack do
   defp native_socket_kind(:tcp), do: :stream
   defp native_socket_kind(:udp), do: :datagram
 
-  defp emit_packets(%{link_status: :up} = state, packets) do
-    Enum.each(packets, fn packet ->
-      send(state.egress_pid, {:smol_stack, state.link_ref, :egress, packet})
-    end)
+  defp emit_packets(state, []), do: state
 
+  defp emit_packets(%{link_status: :up} = state, packets) do
+    send(state.egress_pid, {:smol_stack, state.link_ref, :egress, packets})
     state
   end
 
