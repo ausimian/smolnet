@@ -34,25 +34,31 @@ defmodule SmolNet.Test.IPv6Link do
   end
 
   @impl true
-  def handle_info({:smol_stack, link_ref, :egress, packet}, state) do
-    send(state.test, {:test_link_egress, link_ref, packet})
+  def handle_info({:smol_stack, link_ref, :egress, packets}, state) do
     peer = Map.fetch!(state.peers, link_ref)
 
-    case state.fault do
-      :pass ->
-        SmolNet.ingress(peer, packet)
-        {:noreply, state}
+    state =
+      Enum.reduce(packets, state, fn packet, state ->
+        send(state.test, {:test_link_egress, link_ref, packet})
 
-      :drop ->
-        {:noreply, state}
+        case state.fault do
+          :pass ->
+            SmolNet.ingress(peer, packet)
+            state
 
-      :duplicate ->
-        SmolNet.ingress(peer, packet)
-        SmolNet.ingress(peer, packet)
-        {:noreply, state}
+          :drop ->
+            state
 
-      :hold ->
-        {:noreply, %{state | held: [{peer, packet} | state.held]}}
-    end
+          :duplicate ->
+            SmolNet.ingress(peer, packet)
+            SmolNet.ingress(peer, packet)
+            state
+
+          :hold ->
+            %{state | held: [{peer, packet} | state.held]}
+        end
+      end)
+
+    {:noreply, state}
   end
 end

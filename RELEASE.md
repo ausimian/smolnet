@@ -33,6 +33,11 @@
 
 ### Added
 
+- Raw-IP links now receive bounded egress batches. Each native output envelope
+  is delivered as one `{:smol_stack, link_ref, :egress, packets}` message,
+  allowing links to amortize mailbox handling and transport writes while
+  preserving packet order.
+
 - `SmolNet.Loopback`, a link process that feeds every packet its stack emits
   back into that same stack. One stack then reaches its own addresses with no
   peer, no external transport, and no privileges, which makes a runnable
