@@ -71,6 +71,10 @@ defmodule SmolNet.InetBackend.Packet do
     ArgumentError -> {:error, :einval}
   end
 
+  # `packet_size` bounds a *frame*. A raw stream has none: `:gen_tcp.send/2` of any size is
+  # the contract, and the adapter's write loop already hands the stack bounded pieces.
+  defp validate_size(_payload, :raw, _packet_size), do: :ok
+
   defp validate_size(payload, packet, packet_size) do
     size = byte_size(payload)
 

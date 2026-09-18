@@ -403,7 +403,7 @@ defmodule SmolNet.InetBackend.Tcp do
       data.read != nil ->
         {:keep_state_and_data, [{:reply, from, {:error, :busy}}]}
 
-      length > Options.receive_limit(data.options) ->
+      data.options.packet != :raw and length > Options.receive_limit(data.options) ->
         {:keep_state_and_data, [{:reply, from, {:error, :emsgsize}}]}
 
       true ->
@@ -1018,7 +1018,7 @@ defmodule SmolNet.InetBackend.Tcp do
   end
 
   defp fetch_read_data(data, chunks, deliveries) do
-    available = receive_limit(data) - byte_size(data.read_buffer)
+    available = read_capacity(data) - byte_size(data.read_buffer)
 
     if available <= 0 do
       read_failure(data, :emsgsize)
@@ -1068,7 +1068,7 @@ defmodule SmolNet.InetBackend.Tcp do
   end
 
   defp append_read_data(data, binary) do
-    if byte_size(binary) + byte_size(data.read_buffer) <= receive_limit(data) do
+    if byte_size(binary) + byte_size(data.read_buffer) <= read_capacity(data) do
       {:ok, %{data | read_buffer: data.read_buffer <> binary}}
     else
       {:error, :emsgsize}
@@ -1490,6 +1490,16 @@ defmodule SmolNet.InetBackend.Tcp do
   defp consume_active(active) when is_integer(active) and active > 1, do: {active - 1, false}
 
   defp receive_limit(data), do: Options.receive_limit(data.options)
+
+  # How much may accumulate for the read in progress. A passive raw read that names its
+  # length is the caller asking for exactly that many bytes — `:gen_tcp.recv/3`'s contract
+  # regardless of the receive buffer, which bounds only what a chunk read (`recv(0)`), an
+  # active delivery, or a framed packet may return. Everything else keeps the bound.
+  defp read_capacity(%{options: %{packet: :raw}, read: %{kind: :passive, length: length}} = data)
+       when length > 0,
+       do: max(length, receive_limit(data))
+
+  defp read_capacity(data), do: receive_limit(data)
 
   defp arm_timer(_kind, :infinity), do: {nil, nil}
 

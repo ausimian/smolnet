@@ -1,5 +1,13 @@
 ### Fixed
 
+- Raw-mode `:gen_tcp` streams are no longer bounded by `packet_size` and the
+  receive buffer. A passive `recv/3` that names its length now accumulates to that
+  length however large, and `send/2` of any size is accepted and written in the
+  bounded pieces the adapter already used. Both previously returned `:emsgsize`
+  and closed the socket, which `:gen_tcp` never does for a raw stream. Chunk
+  reads (`recv(socket, 0)`), active delivery, and framed packet modes keep their
+  bound.
+
 - Fixed a `:gen_tcp` receive that could fail with `:busy` against its own socket.
   When a passive exact-length read got part of its data together with a select
   for the rest, the adapter immediately asked the stack for the remainder, which
