@@ -1,5 +1,10 @@
 ### Fixed
 
+- The two affected test suites now distinguish liveness waits from timing
+  assertions. Shared CI runners give operations that must eventually complete
+  extra headroom without relaxing tests whose timeout is the behaviour under
+  test.
+
 - Fixed keep-alive probes and other challenge ACKs never being sent. The stack
   passed the raw BEAM monotonic clock, which is negative, to smoltcp as its
   instant; smoltcp's challenge-ACK rate limiter compares the instant against a

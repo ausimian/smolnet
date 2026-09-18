@@ -2,6 +2,16 @@ defmodule SmolNet.LoopbackTest do
   use ExUnit.Case, async: false
 
   alias SmolNet.Loopback
+  alias SmolNet.Test.Timing
+
+  # Liveness budgets: bounds on how long a healthy run may take to make
+  # progress, not properties under test. See `SmolNet.Test.Timing`.
+  @wait_1s Timing.liveness(1_000)
+  @wait_2s Timing.liveness(2_000)
+
+  # `assert_eventually/2` polls every 10 ms, so its attempt count is the same
+  # one second liveness bound expressed in polls.
+  @poll_attempts div(@wait_1s, 10)
 
   @localhost4 {127, 0, 0, 1}
   @localhost6 {0, 0, 0, 0, 0, 0, 0, 1}
@@ -19,19 +29,19 @@ defmodule SmolNet.LoopbackTest do
     :ok = SmolNet.bind(listener, server)
     :ok = SmolNet.listen(listener, 1)
 
-    accept = Task.async(fn -> SmolNet.accept(listener, 1_000) end)
+    accept = Task.async(fn -> SmolNet.accept(listener, @wait_1s) end)
 
     {:ok, client} = SmolNet.open(:inet, :stream, :tcp, stack: stack)
-    assert :ok = SmolNet.connect(client, server, 1_000)
-    assert {:ok, accepted} = Task.await(accept, 2_000)
+    assert :ok = SmolNet.connect(client, server, @wait_1s)
+    assert {:ok, accepted} = Task.await(accept, @wait_2s)
 
     assert {:ok, %{addr: @localhost4, port: 41_101}} = SmolNet.peername(client)
     assert {:ok, %{addr: @localhost4}} = SmolNet.peername(accepted)
 
     assert :ok = SmolNet.send(client, "request")
-    assert {:ok, "request"} = SmolNet.recv(accepted, 7, 1_000)
+    assert {:ok, "request"} = SmolNet.recv(accepted, 7, @wait_1s)
     assert :ok = SmolNet.send(accepted, "response")
-    assert {:ok, "response"} = SmolNet.recv(client, 8, 1_000)
+    assert {:ok, "response"} = SmolNet.recv(client, 8, @wait_1s)
   end
 
   test "completes an IPv6 connection between two sockets on one stack" do
@@ -42,16 +52,16 @@ defmodule SmolNet.LoopbackTest do
     :ok = SmolNet.bind(listener, server)
     :ok = SmolNet.listen(listener, 1)
 
-    accept = Task.async(fn -> SmolNet.accept(listener, 1_000) end)
+    accept = Task.async(fn -> SmolNet.accept(listener, @wait_1s) end)
 
     {:ok, client} = SmolNet.open(:inet6, :stream, :tcp, stack: stack)
-    assert :ok = SmolNet.connect(client, server, 1_000)
-    assert {:ok, accepted} = Task.await(accept, 2_000)
+    assert :ok = SmolNet.connect(client, server, @wait_1s)
+    assert {:ok, accepted} = Task.await(accept, @wait_2s)
 
     assert {:ok, %{addr: @localhost6, port: 41_102}} = SmolNet.peername(client)
 
     assert :ok = SmolNet.send(client, "over the loop")
-    assert {:ok, "over the loop"} = SmolNet.recv(accepted, 13, 1_000)
+    assert {:ok, "over the loop"} = SmolNet.recv(accepted, 13, @wait_1s)
   end
 
   test "carries UDP datagrams back to the stack that sent them" do
@@ -65,7 +75,7 @@ defmodule SmolNet.LoopbackTest do
     :ok = SmolNet.bind(sender, endpoint4(0))
     assert :ok = SmolNet.sendto(sender, "datagram", server)
 
-    assert {:ok, datagram} = SmolNet.recvfrom(receiver, 0, 1_000)
+    assert {:ok, datagram} = SmolNet.recvfrom(receiver, 0, @wait_1s)
     assert datagram.data == "datagram"
     assert datagram.source.addr == @localhost4
   end
@@ -76,7 +86,7 @@ defmodule SmolNet.LoopbackTest do
     {:ok, client} = SmolNet.open(:inet, :stream, :tcp, stack: stack)
 
     assert {:error, :connection_refused} =
-             SmolNet.connect(client, endpoint4(41_104), 1_000)
+             SmolNet.connect(client, endpoint4(41_104), @wait_1s)
   end
 
   test "reaches any address the stack holds, not only conventional localhost" do
@@ -88,11 +98,11 @@ defmodule SmolNet.LoopbackTest do
     :ok = SmolNet.bind(listener, server)
     :ok = SmolNet.listen(listener, 1)
 
-    accept = Task.async(fn -> SmolNet.accept(listener, 1_000) end)
+    accept = Task.async(fn -> SmolNet.accept(listener, @wait_1s) end)
 
     {:ok, client} = SmolNet.open(:inet, :stream, :tcp, stack: stack)
-    assert :ok = SmolNet.connect(client, server, 1_000)
-    assert {:ok, _accepted} = Task.await(accept, 2_000)
+    assert :ok = SmolNet.connect(client, server, @wait_1s)
+    assert {:ok, _accepted} = Task.await(accept, @wait_2s)
   end
 
   test "rejects an explicit egress because the link is the stack's egress" do
@@ -127,7 +137,7 @@ defmodule SmolNet.LoopbackTest do
 
     assert :ok = SmolNet.stop_stack(stack)
 
-    assert_receive {:DOWN, ^monitor, :process, ^link, :normal}, 1_000
+    assert_receive {:DOWN, ^monitor, :process, ^link, :normal}, @wait_1s
   end
 
   test "accepts a registered name for the link process" do
@@ -154,7 +164,7 @@ defmodule SmolNet.LoopbackTest do
     end
   end
 
-  defp assert_eventually(assertion, attempts \\ 100)
+  defp assert_eventually(assertion, attempts \\ @poll_attempts)
   defp assert_eventually(assertion, 0), do: assert(assertion.())
 
   defp assert_eventually(assertion, attempts) do
