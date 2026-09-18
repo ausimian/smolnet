@@ -80,6 +80,29 @@ defmodule SmolNet.InetBackendListenerTest do
     assert :ok = :gen_tcp.close(listener)
   end
 
+  test "a passive raw read of an explicit length beyond the receive bound completes" do
+    {server_stack, client_stack} = linked_stacks()
+    {:ok, listener} = :gen_tcp.listen(40_021, server_options(server_stack, backlog: 1))
+    accept = accept_for_parent(listener)
+    {:ok, client} = :gen_tcp.connect(@server, 40_021, client_options(client_stack), 1_000)
+    {:ok, server} = Task.await(accept)
+
+    # 200 KB, well past the 64 KiB default receive buffer, read back in one call.
+    payload = :crypto.strong_rand_bytes(200_000)
+    sender = Task.async(fn -> :gen_tcp.send(server, payload) end)
+    assert {:ok, ^payload} = :gen_tcp.recv(client, byte_size(payload), 10_000)
+    assert :ok = Task.await(sender, 10_000)
+
+    # A chunk read and framed reads keep the bound.
+    assert {:error, :timeout} = :gen_tcp.recv(client, 0, 10)
+    assert :ok = :inet.setopts(client, packet: 4)
+    assert {:error, :emsgsize} = :gen_tcp.recv(client, 2_000_000, 10)
+
+    :ok = :gen_tcp.close(client)
+    :ok = :gen_tcp.close(server)
+    :ok = :gen_tcp.close(listener)
+  end
+
   test "a reusable gen_tcp listener accepts concurrent clients sequentially" do
     {server_stack, client_stack} = linked_stacks()
     {:ok, listener} = :gen_tcp.listen(40_011, server_options(server_stack, backlog: 3))
