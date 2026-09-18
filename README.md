@@ -542,10 +542,12 @@ maximum observed serialized native-call duration before result encoding.
 
 Local `mix precommit` enforces a 1 ms maximum for complete Elixir-visible NIF
 calls, including result encoding. The GitHub-hosted x86_64 Linux quality job
-plus the AArch64 Linux and macOS native-budget jobs enforce the full-call p99
-while retaining the absolute maximum as evidence, avoiding false failures from
-host preemption. Each maximum-state scenario uses 100 independently prepared
-samples in p99 mode.
+plus the AArch64 Linux and macOS native-budget jobs report the full-call
+maximum and p99 as evidence without gating on either, because the compute
+environment of a shared runner is outside this project's control. The
+deterministic caller-reduction budget stays enforced everywhere. Each
+maximum-state scenario uses 100 independently prepared samples outside
+`enforce` mode.
 Unexpected resource destruction remains synchronously bounded by the fixed
 socket, waiter, and packet capacities and is included in the benchmark.
 
