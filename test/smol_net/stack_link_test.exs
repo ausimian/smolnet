@@ -173,6 +173,62 @@ defmodule SmolNet.StackLinkTest do
     assert_receive {:DOWN, ^feeder_monitor, :process, ^feeder, :normal}
   end
 
+  test "a stale poll still releases a held ingress packet" do
+    configure_native_double(:wait)
+    Application.put_env(:smolnet, :native_poll_result, :wait)
+    packet = empty_ipv6_packet()
+    test = self()
+
+    feeder =
+      spawn(fn ->
+        receive do
+          {:feed, stack} ->
+            send(test, {:first_ingress, SmolNet.ingress(stack, packet)})
+            send(test, :second_ingress_started)
+            send(test, {:second_ingress, SmolNet.ingress(stack, packet)})
+
+            receive do
+              :stop -> :ok
+            end
+        end
+      end)
+
+    feeder_monitor = Process.monitor(feeder)
+    {:ok, stack} = SmolNet.start_stack(egress: {feeder, :stale_poll})
+    %{stack: stack_pid} = Ref.pids(stack)
+    send(feeder, {:feed, stack})
+
+    # The stack is blocked inside stack_ingress/3 for the first packet while
+    # the feeder's second packet queues behind it.
+    assert_receive {:first_ingress, :ok}
+    assert_receive {:native_stack_ingress, ^stack_pid, ^packet}
+    assert_receive :second_ingress_started
+    assert_eventually(fn -> message_queue_length(stack_pid) == 1 end)
+
+    # A socket call queued behind the second packet replaces the poll timer
+    # when it completes, which makes the continuation's self-sent poll stale.
+    request = :gen_server.send_request(stack_pid, {:socket_shutdown, 1, 1, :write})
+    assert_eventually(fn -> message_queue_length(stack_pid) == 2 end)
+
+    send(stack_pid, {:native_ingress_reply, empty_effects(more: true)})
+    assert {:reply, :ok} = :gen_server.receive_response(request, 1_000)
+
+    # The stale poll never reaches the native, but the held packet must still
+    # be admitted rather than leaving the feeder blocked.
+    assert_receive {:second_ingress, :ok}
+    assert_receive {:native_stack_ingress, ^stack_pid, ^packet}
+    refute_received {:native_stack_poll, _, _}
+    send(stack_pid, {:native_ingress_reply, empty_effects()})
+
+    assert_eventually(fn ->
+      {:ok, drained} = SmolNet.stack_info(stack)
+      drained.processed_ingress == 2 and drained.poll_at == nil
+    end)
+
+    send(feeder, :stop)
+    assert_receive {:DOWN, ^feeder_monitor, :process, ^feeder, :normal}
+  end
+
   test "continuation poll failure closes without admitting waiting ingress" do
     configure_native_double(:wait)
     Application.put_env(:smolnet, :native_poll_result, :wait)

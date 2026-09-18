@@ -1,3 +1,13 @@
+### Fixed
+
+- Fixed a bug where a call to `SmolNet.ingress/2` could hang. If the stack was
+  still busy with earlier work when a packet arrived, it held the packet and
+  planned to process it after its next poll. A socket call made at the same
+  time could cancel that poll. The stack then never processed the held packet,
+  and the link process that sent it waited forever, or until an unrelated
+  timer happened to fire. The stack now processes the held packet even when
+  the poll it was waiting for has been cancelled.
+
 ### Added
 
 - `SmolNet.Loopback`, a link process that feeds every packet its stack emits

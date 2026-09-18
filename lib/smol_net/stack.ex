@@ -389,11 +389,16 @@ defmodule SmolNet.Stack do
         {:stop, {:shutdown, {:native_poll_failed, reason}}, state}
 
       {:error, _reason} ->
-        {:noreply, replace_timer(state, nil)}
+        state |> replace_timer(nil) |> continue_pending_ingress()
     end
   end
 
-  def handle_info({:smolnet_poll, _stale_generation}, state), do: {:noreply, state}
+  # A poll can go stale while a feeder's packet is held: the `more: true`
+  # branch of apply_effects/3 self-sends the poll, and any socket call queued
+  # ahead of it bumps the generation again. The held packet was waiting on
+  # that poll, so drain here whenever no live continuation will do it, or the
+  # feeder blocks in SmolNet.ingress/2 with nothing left to release it.
+  def handle_info({:smolnet_poll, _stale_generation}, state), do: continue_pending_ingress(state)
 
   def handle_info(
         {:DOWN, monitor, :process, pid, reason},
