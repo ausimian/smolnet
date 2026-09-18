@@ -1,5 +1,12 @@
 ### Fixed
 
+- Fixed keep-alive probes and other challenge ACKs never being sent. The stack
+  passed the raw BEAM monotonic clock, which is negative, to smoltcp as its
+  instant; smoltcp's challenge-ACK rate limiter compares the instant against a
+  timer that starts at zero, so the gate never opened and a peer's TCP keep-alive
+  probe went unanswered — iOS, for one, resets an idle connection after three.
+  The clock now counts milliseconds since the VM started.
+
 - Raw-mode `:gen_tcp` streams are no longer bounded by `packet_size` and the
   receive buffer. A passive `recv/3` that names its length now accumulates to that
   length however large, and `send/2` of any size is accepted and written in the
