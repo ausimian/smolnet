@@ -100,9 +100,12 @@ jobs:
       - run: mix deps.get
       - run: mix precommit
         env:
-          # Enforce the full-call p99 while retaining the maximum as evidence;
-          # host preemption makes a shared-runner maximum unsuitable as a gate.
-          SMOLNET_NIF_WALL_CLOCK_MODE: p99
+          # Report full-call wall-clock timings as evidence without gating on
+          # them. Shared runners are preemptible and their compute environment
+          # is outside this project's control, so neither the maximum nor the
+          # p99 is a trustworthy gate here. The deterministic reduction budget
+          # still fails the job.
+          SMOLNET_NIF_WALL_CLOCK_MODE: report
       - run: mix coveralls.cobertura
       # Release-time checksums do not exist until tagged NIF assets have been
       # published. Supply a disposable manifest so this job still verifies the
@@ -154,7 +157,9 @@ jobs:
       - run: mix compile --warnings-as-errors
       - run: mix run scripts/nif_budget.exs
         env:
-          SMOLNET_NIF_WALL_CLOCK_MODE: p99
+          # See the quality job: wall-clock timings are evidence only on
+          # shared runners; the reduction budget remains enforced.
+          SMOLNET_NIF_WALL_CLOCK_MODE: report
 
   native-safety:
     name: native safety / ASan fuzz

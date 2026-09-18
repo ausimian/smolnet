@@ -24,7 +24,7 @@ defmodule SmolNet.NifBudget do
                       "report" -> :report
                       value -> raise "invalid SMOLNET_NIF_WALL_CLOCK_MODE: #{inspect(value)}"
                     end)
-  @scenario_iterations if(@wall_clock_mode == :p99, do: 100, else: 1)
+  @scenario_iterations if(@wall_clock_mode == :enforce, do: 1, else: 100)
 
   def run do
     IO.puts("wall-clock budget mode: #{@wall_clock_mode}")
@@ -293,8 +293,11 @@ defmodule SmolNet.NifBudget do
       :p99 ->
         IO.puts("  maximum overrun recorded with a passing p99")
 
+      :report when is_integer(p99) and p99 > @max_wall_nanoseconds ->
+        IO.puts("  p99 overrun recorded without failing in report-only mode")
+
       :report ->
-        IO.puts("  wall-clock overrun recorded without failing in report-only mode")
+        IO.puts("  maximum overrun recorded with a passing p99")
     end
   end
 
