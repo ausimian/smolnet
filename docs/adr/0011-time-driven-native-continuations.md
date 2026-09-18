@@ -112,10 +112,12 @@ integration path.
 The benchmark measures complete Elixir-visible calls, including result
 encoding, as well as caller reductions. Local runs enforce the absolute 1
 millisecond maximum. The GitHub-hosted x86_64 Linux quality job plus the
-AArch64 Linux and macOS native-budget jobs enforce the 1 millisecond p99 and
-retain maximum samples as evidence because runner preemption is outside the
-NIF's control. In p99 mode, each maximum-state scenario is rebuilt and
-measured 100 times rather than being treated as an ungated single sample.
+AArch64 Linux and macOS native-budget jobs treat both the maximum and the p99
+as evidence rather than as gates, because runner preemption, and the shared
+compute environment generally, are outside the NIF's control; the
+caller-reduction budget remains enforced there. Outside `enforce` mode, each
+maximum-state scenario is rebuilt and measured 100 times rather than being
+treated as a single sample.
 Shutdown and unexpected resource destruction remain part of the maximum-state
 benchmark.
 
