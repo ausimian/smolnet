@@ -498,6 +498,16 @@ Run the complete local quality gate before committing:
 mix precommit
 ```
 
+The suite's wall-clock budgets are strict by default so that a change which
+slows the stack fails locally. Budgets that only bound how long a healthy run
+may take are multiplied by `SMOLNET_TEST_TIMEOUT_SCALE`, which CI sets to `5`
+because its shared runners are preemptible; budgets whose expiry is the
+assertion are never scaled. Set it locally only to reproduce a CI run:
+
+```console
+SMOLNET_TEST_TIMEOUT_SCALE=5 mix test
+```
+
 Maintainers cutting a release should follow the complete Publisho, native
 asset, checksum, and Hex sequence in [MAINTAINING.md](MAINTAINING.md).
 

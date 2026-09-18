@@ -82,7 +82,14 @@ jobs:
       - run: mix local.rebar --force
       - run: mix deps.get
       - run: mix compile --warnings-as-errors
+      # Shared runners are preemptible, so a wall-clock budget that is
+      # generous on a developer's machine is not reliably generous here. The
+      # suite multiplies its liveness budgets (the bounds on how long a healthy
+      # run may take) by this factor. Budgets whose expiry is the assertion are
+      # unscaled, so a timing regression still fails. See `SmolNet.Test.Timing`.
       - run: mix test --warnings-as-errors
+        env:
+          SMOLNET_TEST_TIMEOUT_SCALE: "5"
 
   quality:
     name: precommit / coverage / package
@@ -142,8 +149,10 @@ jobs:
       - run: mix local.hex --force
       - run: mix local.rebar --force
       - run: mix deps.get
+      # Scale the suite's liveness budgets for this runner; see above.
       - run: mix precommit
         env:
+          SMOLNET_TEST_TIMEOUT_SCALE: "5"
           # Report full-call wall-clock timings as evidence without gating on
           # them. Shared runners are preemptible and their compute environment
           # is outside this project's control, so neither the maximum nor the
@@ -151,6 +160,8 @@ jobs:
           # still fails the job.
           SMOLNET_NIF_WALL_CLOCK_MODE: report
       - run: mix coveralls.cobertura
+        env:
+          SMOLNET_TEST_TIMEOUT_SCALE: "5"
       # Release-time checksums do not exist until tagged NIF assets have been
       # published. Supply a disposable manifest so this job still verifies the
       # package file list; release-nif.yml exercises the real consumer path.

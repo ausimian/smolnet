@@ -5,6 +5,21 @@ defmodule SmolNet.IPv4UdpTest do
   alias SmolNet.InetBackend.Udp4
   alias SmolNet.Test.IPv6Link
   alias SmolNet.Test.RawIpLink
+  alias SmolNet.Test.Timing
+
+  # Liveness budgets: bounds on how long a healthy run may take to make
+  # progress, not properties under test, so they scale with the host.
+  # Quiescence budgets below bound how long the suite waits to conclude that
+  # nothing happened, or assert that an operation times out; their expiry is
+  # the assertion, so they never scale. See `SmolNet.Test.Timing`.
+  @wait_1s Timing.liveness(1_000)
+  @wait_2s Timing.liveness(2_000)
+  @wait_3s Timing.liveness(3_000)
+  @wait_4s Timing.liveness(4_000)
+  @wait_5s Timing.liveness(5_000)
+  @wait_6s Timing.liveness(6_000)
+  @idle_10ms Timing.quiescence(10)
+  @idle_20ms Timing.quiescence(20)
 
   @server4 {192, 0, 2, 1}
   @client4 {192, 0, 2, 2}
@@ -29,7 +44,7 @@ defmodule SmolNet.IPv4UdpTest do
 
       assert {:select, select} = SmolNet.recvfrom(server, 0, :nowait)
       assert :ok = SmolNet.cancel(server, select)
-      assert {:error, :timeout} = SmolNet.recvfrom(server, 0, 10)
+      assert {:error, :timeout} = SmolNet.recvfrom(server, 0, @idle_10ms)
 
       assert {:error, :invalid_address} =
                SmolNet.sendto(client, "wrong family", endpoint6(@server6, port), :nowait)
@@ -40,7 +55,7 @@ defmodule SmolNet.IPv4UdpTest do
       assert {:error, :network_unreachable} =
                SmolNet.sendto(client, "no route", endpoint4({198, 51, 100, 1}, port), :nowait)
 
-      assert :ok = SmolNet.sendto(client, "hello", endpoint4(@server4, port), 1_000)
+      assert :ok = SmolNet.sendto(client, "hello", endpoint4(@server4, port), @wait_1s)
 
       assert {:ok,
               %{
@@ -48,18 +63,18 @@ defmodule SmolNet.IPv4UdpTest do
                 destination: %{family: :inet, addr: @server4, port: ^port},
                 data: "hello",
                 truncated: false
-              }} = SmolNet.recvfrom(server, 0, 1_000)
+              }} = SmolNet.recvfrom(server, 0, @wait_1s)
 
       assert client_port in 49_152..50_175
 
       assert {:ok, %{family: :inet, addr: @client4, port: ^client_port}} =
                SmolNet.sockname(client)
 
-      assert :ok = SmolNet.sendto(client, "abcdef", endpoint4(@server4, port), 1_000)
-      assert {:ok, %{data: "abc", truncated: true}} = SmolNet.recvfrom(server, 3, 1_000)
+      assert :ok = SmolNet.sendto(client, "abcdef", endpoint4(@server4, port), @wait_1s)
+      assert {:ok, %{data: "abc", truncated: true}} = SmolNet.recvfrom(server, 3, @wait_1s)
 
-      assert :ok = SmolNet.sendto(client, <<>>, endpoint4(@server4, port), 1_000)
-      assert {:ok, %{data: <<>>, truncated: false}} = SmolNet.recvfrom(server, 0, 1_000)
+      assert :ok = SmolNet.sendto(client, <<>>, endpoint4(@server4, port), @wait_1s)
+      assert {:ok, %{data: <<>>, truncated: false}} = SmolNet.recvfrom(server, 0, @wait_1s)
 
       assert {:error, :message_too_large} =
                SmolNet.sendto(
@@ -70,8 +85,8 @@ defmodule SmolNet.IPv4UdpTest do
                )
 
       maximum = :binary.copy("m", 1_472)
-      assert :ok = SmolNet.sendto(client, maximum, endpoint4(@server4, port), 1_000)
-      assert {:ok, %{data: ^maximum, truncated: false}} = SmolNet.recvfrom(server, 0, 1_000)
+      assert :ok = SmolNet.sendto(client, maximum, endpoint4(@server4, port), @wait_1s)
+      assert {:ok, %{data: ^maximum, truncated: false}} = SmolNet.recvfrom(server, 0, @wait_1s)
 
       {:ok, info} = SmolNet.stack_info(server_stack)
       assert info.native.result.udp_ipv4_max_datagram_bytes == 1_472
@@ -89,8 +104,10 @@ defmodule SmolNet.IPv4UdpTest do
       :ok = SmolNet.bind(client, endpoint4(@client4, 0))
 
       :ok = @link_module.fault(link, :drop)
-      assert :ok = SmolNet.sendto(client, "checksum", endpoint4(@server4, port), 1_000)
-      assert_receive {:test_link_egress, :client, <<4::4, 5::4, _rest::binary>> = packet}, 1_000
+      assert :ok = SmolNet.sendto(client, "checksum", endpoint4(@server4, port), @wait_1s)
+
+      assert_receive {:test_link_egress, :client, <<4::4, 5::4, _rest::binary>> = packet},
+                     @wait_1s
 
       <<prefix::binary-size(26), checksum::16, suffix::binary>> = packet
       refute checksum == 0
@@ -98,14 +115,14 @@ defmodule SmolNet.IPv4UdpTest do
       corrupted = <<prefix::binary, bad_checksum::16, suffix::binary>>
 
       assert :ok = SmolNet.ingress(server_stack, corrupted)
-      assert {:error, :timeout} = SmolNet.recvfrom(server, 0, 20)
+      assert {:error, :timeout} = SmolNet.recvfrom(server, 0, @idle_20ms)
 
       zero_checksum = <<prefix::binary, 0::16, suffix::binary>>
       assert :ok = SmolNet.ingress(server_stack, zero_checksum)
-      assert {:ok, %{data: "checksum"}} = SmolNet.recvfrom(server, 0, 1_000)
+      assert {:ok, %{data: "checksum"}} = SmolNet.recvfrom(server, 0, @wait_1s)
 
       assert :ok = SmolNet.ingress(server_stack, packet)
-      assert {:ok, %{data: "checksum"}} = SmolNet.recvfrom(server, 0, 1_000)
+      assert {:ok, %{data: "checksum"}} = SmolNet.recvfrom(server, 0, @wait_1s)
     end
 
     test "IPv4 UDP waiters cancel, retry, and abort via #{inspect(link_module)}" do
@@ -119,19 +136,19 @@ defmodule SmolNet.IPv4UdpTest do
 
       assert {:select, cancelled} = SmolNet.recvfrom(server, 0, :nowait)
       assert :ok = SmolNet.cancel(server, cancelled)
-      refute_receive {:"$smol_socket", _, :select, _}, 20
+      refute_receive {:"$smol_socket", _, :select, _}, @idle_20ms
 
       assert {:select, select} = SmolNet.recvfrom(server, 0, :nowait)
-      assert :ok = SmolNet.sendto(client, "once", endpoint4(@server4, port), 1_000)
+      assert :ok = SmolNet.sendto(client, "once", endpoint4(@server4, port), @wait_1s)
       {:select_info, :recvfrom, reference} = select
       identity = SmolNet.Socket.identity(server)
-      assert_receive {:"$smol_socket", ^identity, :select, ^reference}, 1_000
+      assert_receive {:"$smol_socket", ^identity, :select, ^reference}, @wait_1s
       assert {:ok, %{data: "once"}} = SmolNet.recvfrom(server, 0, :nowait)
 
       assert {:select, closing} = SmolNet.recvfrom(server, 0, :nowait)
       {:select_info, :recvfrom, closing_reference} = closing
       assert :ok = SmolNet.close(server)
-      assert_receive {:"$smol_socket", ^identity, :abort, ^closing_reference, :closed}, 1_000
+      assert_receive {:"$smol_socket", ^identity, :abort, ^closing_reference, :closed}, @wait_1s
       assert {:error, :invalid_socket} = SmolNet.recvfrom(server, 0, :nowait)
     end
 
@@ -163,7 +180,7 @@ defmodule SmolNet.IPv4UdpTest do
         Task.async(fn ->
           for _index <- 1..18 do
             {:ok, %{data: <<sequence::16, _padding::binary>>, truncated: false}} =
-              SmolNet.recvfrom(server, 0, 5_000)
+              SmolNet.recvfrom(server, 0, @wait_5s)
 
             sequence
           end
@@ -185,10 +202,10 @@ defmodule SmolNet.IPv4UdpTest do
                   {:"$smol_socket", identity, :select, ^reference} ->
                     assert identity == SmolNet.Socket.identity(client)
                 after
-                  5_000 -> flunk("full IPv4 UDP transmit ring never became writable")
+                  @wait_5s -> flunk("full IPv4 UDP transmit ring never became writable")
                 end
 
-                assert :ok = SmolNet.sendto(client, payload, endpoint4(@server4, port), 5_000)
+                assert :ok = SmolNet.sendto(client, payload, endpoint4(@server4, port), @wait_5s)
                 {sequence, :retried}
             end
           end)
@@ -200,8 +217,8 @@ defmodule SmolNet.IPv4UdpTest do
       end)
 
       :ok = :sys.resume(client_stack.stack)
-      send_results = Enum.map(sends, &Task.await(&1, 6_000))
-      received = Task.await(collector, 6_000)
+      send_results = Enum.map(sends, &Task.await(&1, @wait_6s))
+      received = Task.await(collector, @wait_6s)
 
       assert Enum.count(send_results, fn {_sequence, mode} -> mode == :retried end) == 1
       assert Enum.sort(received) == Enum.to_list(1..18)
@@ -237,7 +254,7 @@ defmodule SmolNet.IPv4UdpTest do
 
       send_task =
         Task.async(fn ->
-          SmolNet.sendto(sender, :binary.copy("x", 1_000), endpoint4(@server4, port), 1_000)
+          SmolNet.sendto(sender, :binary.copy("x", 1_000), endpoint4(@server4, port), @wait_1s)
         end)
 
       assert_eventually(fn -> call_queued?(client_stack.stack, send_task.pid) end)
@@ -245,9 +262,9 @@ defmodule SmolNet.IPv4UdpTest do
       assert_eventually(fn -> call_queued?(client_stack.stack, recv_task.pid) end)
       :ok = :sys.resume(client_stack.stack)
 
-      assert :ok = Task.await(send_task, 2_000)
-      assert {:select, _select_info} = Task.await(recv_task, 2_000)
-      assert {:ok, %{data: data}} = SmolNet.recvfrom(server, 0, 2_000)
+      assert :ok = Task.await(send_task, @wait_2s)
+      assert {:select, _select_info} = Task.await(recv_task, @wait_2s)
+      assert {:ok, %{data: data}} = SmolNet.recvfrom(server, 0, @wait_2s)
       assert data == :binary.copy("x", 1_000)
     end
 
@@ -293,17 +310,17 @@ defmodule SmolNet.IPv4UdpTest do
       assert :ok = SmolNet.connect(server, endpoint4(@client4, expected_port))
       assert :ok = SmolNet.connect(expected, endpoint4(@server4, port))
 
-      assert :ok = SmolNet.sendto(other, "discard", endpoint4(@server4, port), 1_000)
-      assert :ok = SmolNet.sendto(expected, "keep", endpoint4(@server4, port), 1_000)
+      assert :ok = SmolNet.sendto(other, "discard", endpoint4(@server4, port), @wait_1s)
+      assert :ok = SmolNet.sendto(expected, "keep", endpoint4(@server4, port), @wait_1s)
 
       assert {:ok, %{data: "keep", source: %{port: ^expected_port}}} =
-               SmolNet.recvfrom(server, 0, 1_000)
+               SmolNet.recvfrom(server, 0, @wait_1s)
 
       assert {:error, :invalid_socket_state} =
                SmolNet.sendto(expected, "wrong peer", endpoint4(@client4, 9), :nowait)
 
-      assert :ok = SmolNet.sendto(expected, "still usable", endpoint4(@server4, port), 1_000)
-      assert {:ok, %{data: "still usable"}} = SmolNet.recvfrom(server, 0, 1_000)
+      assert :ok = SmolNet.sendto(expected, "still usable", endpoint4(@server4, port), @wait_1s)
+      assert {:ok, %{data: "still usable"}} = SmolNet.recvfrom(server, 0, @wait_1s)
     end
 
     test "dual-family wildcard UDP stays isolated via #{inspect(link_module)}" do
@@ -328,10 +345,10 @@ defmodule SmolNet.IPv4UdpTest do
         {:ok, client6} = :gen_udp.open(0, udp6_options(client_stack))
         assert :ok = :gen_udp.send(client4, @server4, port, "four")
         assert :ok = :gen_udp.send(client6, @server6, port, "six")
-        assert {:ok, {@client4, _port4, "four"}} = :gen_udp.recv(server4, 0, 1_000)
-        assert {:ok, {@client6, _port6, "six"}} = :gen_udp.recv(server6, 0, 1_000)
-        assert {:error, :timeout} = :gen_udp.recv(server4, 0, 10)
-        assert {:error, :timeout} = :gen_udp.recv(server6, 0, 10)
+        assert {:ok, {@client4, _port4, "four"}} = :gen_udp.recv(server4, 0, @wait_1s)
+        assert {:ok, {@client6, _port6, "six"}} = :gen_udp.recv(server6, 0, @wait_1s)
+        assert {:error, :timeout} = :gen_udp.recv(server4, 0, @idle_10ms)
+        assert {:error, :timeout} = :gen_udp.recv(server6, 0, @idle_10ms)
       end
     end
 
@@ -357,7 +374,7 @@ defmodule SmolNet.IPv4UdpTest do
       {:ok, client} = SmolNet.open(:inet, :dgram, :udp, stack: client_stack)
       :ok = SmolNet.bind(client, endpoint4(@client4, 0))
 
-      assert :ok = SmolNet.sendto(client, "alternate", endpoint4(alternate, port), 1_000)
+      assert :ok = SmolNet.sendto(client, "alternate", endpoint4(alternate, port), @wait_1s)
 
       for sequence <- 1..16 do
         assert :ok =
@@ -365,19 +382,19 @@ defmodule SmolNet.IPv4UdpTest do
                    client,
                    <<sequence::16>>,
                    endpoint4(@server4, port),
-                   1_000
+                   @wait_1s
                  )
       end
 
       assert {:ok, %{destination: %{addr: @server4}, data: <<1::16>>}} =
-               SmolNet.recvfrom(server, 0, 1_000)
+               SmolNet.recvfrom(server, 0, @wait_1s)
 
       assert {:ok, %{destination: %{addr: ^alternate}, data: "alternate"}} =
-               SmolNet.recvfrom(server, 0, 1_000)
+               SmolNet.recvfrom(server, 0, @wait_1s)
 
       assert Enum.map(2..16, fn sequence ->
                assert {:ok, %{destination: %{addr: @server4}, data: <<^sequence::16>>}} =
-                        SmolNet.recvfrom(server, 0, 1_000)
+                        SmolNet.recvfrom(server, 0, @wait_1s)
 
                sequence
              end) == Enum.to_list(2..16)
@@ -426,27 +443,37 @@ defmodule SmolNet.IPv4UdpTest do
       {:ok, client6} = SmolNet.open(:inet6, :dgram, :udp, stack: client_stack)
       :ok = SmolNet.bind(client6, endpoint6({0, 0, 0, 0, 0, 0, 0, 0}, 0))
 
-      assert :ok = SmolNet.sendto(client4, "v4 primary", endpoint4(@server4, port), 1_000)
+      assert :ok = SmolNet.sendto(client4, "v4 primary", endpoint4(@server4, port), @wait_1s)
 
       assert {:ok, %{source: %{addr: @client4}, data: "v4 primary"}} =
-               SmolNet.recvfrom(server4, 0, 1_000)
+               SmolNet.recvfrom(server4, 0, @wait_1s)
 
       assert :ok =
-               SmolNet.sendto(client4, "v4 alternate", endpoint4(alternate_server4, port), 1_000)
+               SmolNet.sendto(
+                 client4,
+                 "v4 alternate",
+                 endpoint4(alternate_server4, port),
+                 @wait_1s
+               )
 
       assert {:ok, %{source: %{addr: ^alternate_client4}, data: "v4 alternate"}} =
-               SmolNet.recvfrom(server4, 0, 1_000)
+               SmolNet.recvfrom(server4, 0, @wait_1s)
 
-      assert :ok = SmolNet.sendto(client6, "v6 primary", endpoint6(@server6, port), 1_000)
+      assert :ok = SmolNet.sendto(client6, "v6 primary", endpoint6(@server6, port), @wait_1s)
 
       assert {:ok, %{source: %{addr: @client6}, data: "v6 primary"}} =
-               SmolNet.recvfrom(server6, 0, 1_000)
+               SmolNet.recvfrom(server6, 0, @wait_1s)
 
       assert :ok =
-               SmolNet.sendto(client6, "v6 alternate", endpoint6(alternate_server6, port), 1_000)
+               SmolNet.sendto(
+                 client6,
+                 "v6 alternate",
+                 endpoint6(alternate_server6, port),
+                 @wait_1s
+               )
 
       assert {:ok, %{source: %{addr: ^alternate_client6}, data: "v6 alternate"}} =
-               SmolNet.recvfrom(server6, 0, 1_000)
+               SmolNet.recvfrom(server6, 0, @wait_1s)
     end
 
     test "IPv4 gen_udp callback contract works via #{inspect(link_module)}" do
@@ -458,22 +485,22 @@ defmodule SmolNet.IPv4UdpTest do
       assert {:ok, client} = :gen_udp.open(0, udp_options(client_stack))
 
       assert :ok = :gen_udp.send(client, @server4, server_port, "address")
-      assert {:ok, {@client4, client_port, "address"}} = :gen_udp.recv(server, 0, 1_000)
+      assert {:ok, {@client4, client_port, "address"}} = :gen_udp.recv(server, 0, @wait_1s)
 
       assert :ok = :gen_udp.send(client, {@server4, server_port}, "destination")
-      assert {:ok, {@client4, ^client_port, "destination"}} = :gen_udp.recv(server, 0, 1_000)
+      assert {:ok, {@client4, ^client_port, "destination"}} = :gen_udp.recv(server, 0, @wait_1s)
 
       sockaddr = %{family: :inet, addr: @server4, port: server_port}
       assert :ok = :gen_udp.send(client, sockaddr, [], "sockaddr")
-      assert {:ok, {@client4, ^client_port, "sockaddr"}} = :gen_udp.recv(server, 0, 1_000)
+      assert {:ok, {@client4, ^client_port, "sockaddr"}} = :gen_udp.recv(server, 0, @wait_1s)
 
       assert :ok = :gen_udp.send(client, {@server4, server_port}, 0, "legacy")
-      assert {:ok, {@client4, ^client_port, "legacy"}} = :gen_udp.recv(server, 0, 1_000)
+      assert {:ok, {@client4, ^client_port, "legacy"}} = :gen_udp.recv(server, 0, @wait_1s)
 
       assert :ok = :gen_udp.send(client, @server4, server_port, [], "ancillary-free")
 
       assert {:ok, {@client4, ^client_port, "ancillary-free"}} =
-               :gen_udp.recv(server, 0, 1_000)
+               :gen_udp.recv(server, 0, @wait_1s)
 
       assert {:error, :einval} = :gen_udp.send(client, %{}, server_port, "bad host")
       assert {:error, :einval} = :gen_udp.send(client, @server4, %{}, "bad port")
@@ -490,14 +517,14 @@ defmodule SmolNet.IPv4UdpTest do
 
       assert :ok = :gen_udp.connect(client, @server4, server_port)
       assert :ok = :gen_udp.send(client, "connected")
-      assert {:ok, {@client4, ^client_port, "connected"}} = :gen_udp.recv(server, 0, 1_000)
+      assert {:ok, {@client4, ^client_port, "connected"}} = :gen_udp.recv(server, 0, @wait_1s)
 
       assert :ok = :inet.setopts(server, active: 2)
       assert :ok = :gen_udp.send(client, "counted one")
       assert :ok = :gen_udp.send(client, "counted two")
-      assert_receive {:udp, ^server, @client4, ^client_port, "counted one"}, 1_000
-      assert_receive {:udp, ^server, @client4, ^client_port, "counted two"}, 1_000
-      assert_receive {:udp_passive, ^server}, 1_000
+      assert_receive {:udp, ^server, @client4, ^client_port, "counted one"}, @wait_1s
+      assert_receive {:udp, ^server, @client4, ^client_port, "counted two"}, @wait_1s
+      assert_receive {:udp_passive, ^server}, @wait_1s
 
       assert :ok = :inet.setopts(server, active: true)
 
@@ -517,7 +544,7 @@ defmodule SmolNet.IPv4UdpTest do
       assert {:error, :einval} = :inet.getopts(server, [:packet])
 
       assert :ok = :gen_udp.send(client, "after errors")
-      assert {:ok, {@client4, ^client_port, "after errors"}} = :gen_udp.recv(server, 0, 1_000)
+      assert {:ok, {@client4, ^client_port, "after errors"}} = :gen_udp.recv(server, 0, @wait_1s)
       assert :ok = :gen_udp.close(server)
       assert :ok = :gen_udp.close(client)
 
@@ -546,11 +573,11 @@ defmodule SmolNet.IPv4UdpTest do
 
       new_owner = spawn(fn -> forward_to_test(parent) end)
       assert :ok = :gen_udp.controlling_process(server, new_owner)
-      assert_receive {:new_owner, {:udp, ^server, @client4, _port, "queued"}}, 1_000
+      assert_receive {:new_owner, {:udp, ^server, @client4, _port, "queued"}}, @wait_1s
 
       assert :ok = :gen_udp.send(client, @server4, server_port, "future")
-      assert_receive {:new_owner, {:udp, ^server, @client4, _port, "future"}}, 1_000
-      refute_receive {:udp, ^server, _address, _port, _packet}, 20
+      assert_receive {:new_owner, {:udp, ^server, @client4, _port, "future"}}, @wait_1s
+      refute_receive {:udp, ^server, _address, _port, _packet}, @idle_20ms
 
       send(new_owner, :stop)
       assert_eventually(fn -> Udp.info(server) == {:error, :closed} end)
@@ -567,10 +594,10 @@ defmodule SmolNet.IPv4UdpTest do
       assert :ok = :inet.setopts(server, active: :once)
       assert :ok = :gen_udp.send(client, @server4, server_port, "abcdef")
       assert :ok = :gen_udp.send(client, @server4, server_port, "ghijkl")
-      assert_receive {:udp, ^server, @client4, ^client_port, "abc"}, 1_000
-      refute_receive {:udp, ^server, @client4, ^client_port, "ghi"}, 20
-      assert {:ok, {@client4, ^client_port, "ghi"}} = :gen_udp.recv(server, 0, 1_000)
-      assert {:error, :timeout} = :gen_udp.recv(server, 0, 10)
+      assert_receive {:udp, ^server, @client4, ^client_port, "abc"}, @wait_1s
+      refute_receive {:udp, ^server, @client4, ^client_port, "ghi"}, @idle_20ms
+      assert {:ok, {@client4, ^client_port, "ghi"}} = :gen_udp.recv(server, 0, @wait_1s)
+      assert {:error, :timeout} = :gen_udp.recv(server, 0, @idle_10ms)
     end
   end
 
@@ -593,14 +620,14 @@ defmodule SmolNet.IPv4UdpTest do
     :ok = SmolNet.bind(tcp_listener6, endpoint6(@server6, port))
     :ok = SmolNet.listen(tcp_listener6, 2)
 
-    accept4 = Task.async(fn -> SmolNet.accept(tcp_listener4, 2_000) end)
-    accept6 = Task.async(fn -> SmolNet.accept(tcp_listener6, 2_000) end)
+    accept4 = Task.async(fn -> SmolNet.accept(tcp_listener4, @wait_2s) end)
+    accept6 = Task.async(fn -> SmolNet.accept(tcp_listener6, @wait_2s) end)
     {:ok, tcp_client4} = SmolNet.open(:inet, :stream, :tcp, stack: client_stack)
     {:ok, tcp_client6} = SmolNet.open(:inet6, :stream, :tcp, stack: client_stack)
-    assert :ok = SmolNet.connect(tcp_client4, endpoint4(@server4, port), 2_000)
-    assert :ok = SmolNet.connect(tcp_client6, endpoint6(@server6, port), 2_000)
-    assert {:ok, tcp_server4} = Task.await(accept4, 3_000)
-    assert {:ok, tcp_server6} = Task.await(accept6, 3_000)
+    assert :ok = SmolNet.connect(tcp_client4, endpoint4(@server4, port), @wait_2s)
+    assert :ok = SmolNet.connect(tcp_client6, endpoint6(@server6, port), @wait_2s)
+    assert {:ok, tcp_server4} = Task.await(accept4, @wait_3s)
+    assert {:ok, tcp_server6} = Task.await(accept6, @wait_3s)
 
     {:ok, udp_server4} = SmolNet.open(:inet, :dgram, :udp, stack: server_stack)
     :ok = SmolNet.bind(udp_server4, endpoint4(@server4, port))
@@ -621,43 +648,46 @@ defmodule SmolNet.IPv4UdpTest do
 
     tcp4_payload = :binary.copy("4", 512)
     tcp6_payload = :binary.copy("6", 512)
-    tcp_read4 = Task.async(fn -> SmolNet.recv(tcp_server4, 512, 3_000) end)
-    tcp_read6 = Task.async(fn -> SmolNet.recv(tcp_server6, 512, 3_000) end)
+    tcp_read4 = Task.async(fn -> SmolNet.recv(tcp_server4, 512, @wait_3s) end)
+    tcp_read6 = Task.async(fn -> SmolNet.recv(tcp_server6, 512, @wait_3s) end)
 
     udp_read4 = Task.async(fn -> receive_datagrams(udp_server4, 20, []) end)
     udp_read6 = Task.async(fn -> receive_datagrams(udp_server6, 20, []) end)
 
-    tcp_send4 = Task.async(fn -> SmolNet.send(tcp_client4, tcp4_payload, 3_000) end)
-    tcp_send6 = Task.async(fn -> SmolNet.send(tcp_client6, tcp6_payload, 3_000) end)
+    tcp_send4 = Task.async(fn -> SmolNet.send(tcp_client4, tcp4_payload, @wait_3s) end)
+    tcp_send6 = Task.async(fn -> SmolNet.send(tcp_client6, tcp6_payload, @wait_3s) end)
 
     for sequence <- 1..20 do
-      assert :ok = SmolNet.sendto(udp_client4, <<sequence::16>>, endpoint4(@server4, port), 3_000)
-      assert :ok = SmolNet.sendto(udp_client6, <<sequence::16>>, endpoint6(@server6, port), 3_000)
+      assert :ok =
+               SmolNet.sendto(udp_client4, <<sequence::16>>, endpoint4(@server4, port), @wait_3s)
+
+      assert :ok =
+               SmolNet.sendto(udp_client6, <<sequence::16>>, endpoint6(@server6, port), @wait_3s)
     end
 
-    assert :ok = Task.await(tcp_send4, 4_000)
-    assert :ok = Task.await(tcp_send6, 4_000)
-    assert {:ok, ^tcp4_payload} = Task.await(tcp_read4, 4_000)
-    assert {:ok, ^tcp6_payload} = Task.await(tcp_read6, 4_000)
-    assert Enum.sort(Task.await(udp_read4, 4_000)) == Enum.to_list(1..20)
-    assert Enum.sort(Task.await(udp_read6, 4_000)) == Enum.to_list(1..20)
+    assert :ok = Task.await(tcp_send4, @wait_4s)
+    assert :ok = Task.await(tcp_send6, @wait_4s)
+    assert {:ok, ^tcp4_payload} = Task.await(tcp_read4, @wait_4s)
+    assert {:ok, ^tcp6_payload} = Task.await(tcp_read6, @wait_4s)
+    assert Enum.sort(Task.await(udp_read4, @wait_4s)) == Enum.to_list(1..20)
+    assert Enum.sort(Task.await(udp_read6, @wait_4s)) == Enum.to_list(1..20)
 
-    assert :ok = SmolNet.sendto(udp_client4, "usable", endpoint4(@server4, port), 1_000)
-    assert {:ok, %{data: "usable"}} = SmolNet.recvfrom(udp_server4, 0, 1_000)
+    assert :ok = SmolNet.sendto(udp_client4, "usable", endpoint4(@server4, port), @wait_1s)
+    assert {:ok, %{data: "usable"}} = SmolNet.recvfrom(udp_server4, 0, @wait_1s)
 
     flush_link_egress()
     assert :ok = link_module.fault(link, :drop)
-    assert :ok = SmolNet.sendto(udp_client6, "checksum", endpoint6(@server6, port), 1_000)
-    assert_receive {:test_link_egress, :client, <<6::4, _rest::bitstring>> = packet}, 1_000
+    assert :ok = SmolNet.sendto(udp_client6, "checksum", endpoint6(@server6, port), @wait_1s)
+    assert_receive {:test_link_egress, :client, <<6::4, _rest::bitstring>> = packet}, @wait_1s
     <<prefix::binary-size(46), checksum::16, suffix::binary>> = packet
     bad_checksum = if checksum == 1, do: 2, else: 1
 
     assert :ok =
              SmolNet.ingress(server_stack, <<prefix::binary, bad_checksum::16, suffix::binary>>)
 
-    assert {:error, :timeout} = SmolNet.recvfrom(udp_server6, 0, 20)
+    assert {:error, :timeout} = SmolNet.recvfrom(udp_server6, 0, @idle_20ms)
     assert :ok = SmolNet.ingress(server_stack, packet)
-    assert {:ok, %{data: "checksum"}} = SmolNet.recvfrom(udp_server6, 0, 1_000)
+    assert {:ok, %{data: "checksum"}} = SmolNet.recvfrom(udp_server6, 0, @wait_1s)
     assert :ok = link_module.fault(link, :pass)
 
     for stack <- [server_stack, client_stack] do
@@ -674,7 +704,7 @@ defmodule SmolNet.IPv4UdpTest do
   defp receive_datagrams(_socket, 0, sequences), do: sequences
 
   defp receive_datagrams(socket, remaining, sequences) do
-    {:ok, %{data: <<sequence::16>>, truncated: false}} = SmolNet.recvfrom(socket, 0, 3_000)
+    {:ok, %{data: <<sequence::16>>, truncated: false}} = SmolNet.recvfrom(socket, 0, @wait_3s)
     receive_datagrams(socket, remaining - 1, [sequence | sequences])
   end
 
@@ -685,7 +715,7 @@ defmodule SmolNet.IPv4UdpTest do
       {:udp, ^socket, @client4, _port, packet} ->
         receive_active(socket, remaining - 1, [packet | packets])
     after
-      1_000 -> flunk("did not receive every active IPv4 datagram")
+      @wait_1s -> flunk("did not receive every active IPv4 datagram")
     end
   end
 
@@ -791,7 +821,7 @@ defmodule SmolNet.IPv4UdpTest do
     :exit, _reason -> :ok
   end
 
-  defp assert_eventually(check, timeout \\ 1_000) do
+  defp assert_eventually(check, timeout \\ @wait_1s) do
     deadline = System.monotonic_time(:millisecond) + timeout
     do_assert_eventually(check, deadline)
   end
