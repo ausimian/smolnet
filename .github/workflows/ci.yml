@@ -34,6 +34,7 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - uses: erlef/setup-beam@54075bcc5e249e4758d363f27d099f55d843f124 # v1
+        id: beam
         with:
           elixir-version: ${{ matrix.elixir }}
           otp-version: ${{ matrix.otp }}
@@ -56,6 +57,27 @@ jobs:
             mix-${{ runner.os }}-${{ matrix.elixir }}-${{ matrix.otp }}-
             ${{ hashFiles('mix.lock', 'native/Cargo.lock') }}
 
+      # Compiled Hex dependencies only. Mix builds every dependency with
+      # MIX_ENV=prod whatever env the parent runs in (the per-dependency :env
+      # option, which defaults to :prod), so the output is identical across
+      # envs: the key names no env and the glob picks up whichever envs a job
+      # happens to build. Every entry under _build/<env>/lib except smolnet is
+      # a dependency reproducible from mix.lock for a fixed OS, architecture,
+      # Elixir and OTP, so it is safe to restore. smolnet is excluded: it
+      # carries SmolNet's own BEAM files and the priv/native NIF copied there
+      # by Rustler, and restoring either would let a stale build mask source or
+      # toolchain changes. There are no restore-keys, so a key mismatch
+      # rebuilds from scratch rather than crossing incompatible Elixir/OTP or
+      # platform combinations.
+      # Do not drop the exclusions or widen `path` to _build/*.
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            _build/*/lib
+            !_build/*/lib/smolnet
+            !_build/*/lib/smolnet/**
+          key: mix-build-${{ runner.os }}-${{ runner.arch }}-elixir-${{ steps.beam.outputs.elixir-version }}-otp-${{ steps.beam.outputs.otp-version }}-${{ hashFiles('mix.lock', 'mix.exs') }}
+
       - run: mix local.hex --force
       - run: mix local.rebar --force
       - run: mix deps.get
@@ -71,6 +93,7 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - uses: erlef/setup-beam@54075bcc5e249e4758d363f27d099f55d843f124 # v1
+        id: beam
         with:
           elixir-version: "1.19.5"
           otp-version: "28.3"
@@ -94,6 +117,27 @@ jobs:
           key: >-
             quality-${{ runner.os }}-1.19.5-28.3-
             ${{ hashFiles('mix.lock', 'native/Cargo.lock') }}
+
+      # Compiled Hex dependencies only. Mix builds every dependency with
+      # MIX_ENV=prod whatever env the parent runs in (the per-dependency :env
+      # option, which defaults to :prod), so the output is identical across
+      # envs: the key names no env and the glob picks up whichever envs a job
+      # happens to build. Every entry under _build/<env>/lib except smolnet is
+      # a dependency reproducible from mix.lock for a fixed OS, architecture,
+      # Elixir and OTP, so it is safe to restore. smolnet is excluded: it
+      # carries SmolNet's own BEAM files and the priv/native NIF copied there
+      # by Rustler, and restoring either would let a stale build mask source or
+      # toolchain changes. There are no restore-keys, so a key mismatch
+      # rebuilds from scratch rather than crossing incompatible Elixir/OTP or
+      # platform combinations.
+      # Do not drop the exclusions or widen `path` to _build/*.
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            _build/*/lib
+            !_build/*/lib/smolnet
+            !_build/*/lib/smolnet/**
+          key: mix-build-${{ runner.os }}-${{ runner.arch }}-elixir-${{ steps.beam.outputs.elixir-version }}-otp-${{ steps.beam.outputs.otp-version }}-${{ hashFiles('mix.lock', 'mix.exs') }}
 
       - run: mix local.hex --force
       - run: mix local.rebar --force
