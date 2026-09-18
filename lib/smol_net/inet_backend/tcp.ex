@@ -1003,8 +1003,14 @@ defmodule SmolNet.InetBackend.Tcp do
       :more when data.read_closed ->
         finish_eof(data, chunks, deliveries)
 
+      # A low-level waiter already armed (a partial read handed back its select) is the
+      # continuation for the rest: asking the socket again while it stands returns
+      # `:busy`, which would fail the caller's read and leave the waiter behind to reject
+      # every later read until it fires. Wait for its notification instead.
       :more ->
-        fetch_read_data(data, chunks, deliveries)
+        if read_reference(read),
+          do: {:keep, data},
+          else: fetch_read_data(data, chunks, deliveries)
 
       {:error, reason} ->
         read_failure(data, reason)

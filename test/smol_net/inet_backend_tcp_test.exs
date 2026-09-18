@@ -64,6 +64,29 @@ defmodule SmolNet.InetBackendTcpTest do
     assert {:ok, ~c"pong"} = :gen_tcp.recv(socket, 4, 1_000)
   end
 
+  test "an exact-length passive read completes across a partial delivery, and times out cleanly" do
+    {stack, peer} = stack_and_peer()
+    {:ok, socket} = :gen_tcp.connect(@peer, 443, client_options(stack), 1_000)
+
+    # Only part of the requested length arrives: the read must wait for the rest, not fail
+    # `:busy` against its own low-level waiter, and must not leave that waiter behind.
+    assert :ok = IPv6TcpPeer.send_data(peer, "xy")
+    assert_eventually(fn -> Tcp.info(socket).read_pending == false end)
+    assert {:error, :timeout} = :gen_tcp.recv(socket, 4, 50)
+    assert {:error, :timeout} = :gen_tcp.recv(socket, 4, 0)
+
+    assert :ok = IPv6TcpPeer.send_data(peer, "zw")
+    assert {:ok, "xyzw"} = :gen_tcp.recv(socket, 4, 1_000)
+
+    # The same partial-then-complete sequence within one blocking read.
+    assert :ok = IPv6TcpPeer.send_data(peer, "ab")
+    receiver = Task.async(fn -> :gen_tcp.recv(socket, 4, 1_000) end)
+    assert_eventually(fn -> Tcp.info(socket).read_pending end)
+    assert :ok = IPv6TcpPeer.send_data(peer, "cd")
+    assert {:ok, "abcd"} = Task.await(receiver)
+    assert {:error, :timeout} = :gen_tcp.recv(socket, 1, 0)
+  end
+
   test "packet modes span arbitrary native chunk boundaries and frame sends" do
     cases = [
       {:line, ["hello", "\n"], "hello\n", "world"},

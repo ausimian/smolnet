@@ -1,5 +1,13 @@
 ### Fixed
 
+- Fixed a `:gen_tcp` receive that could fail with `:busy` against its own socket.
+  When a passive exact-length read got part of its data together with a select
+  for the rest, the adapter immediately asked the stack for the remainder, which
+  the stack rejected because that read's waiter was already armed. The caller's
+  read failed `:busy`, and the stray waiter made every later read fail the same
+  way until data happened to arrive. The adapter now waits for the select it
+  already holds.
+
 - Fixed a bug where a call to `SmolNet.ingress/2` could hang. If the stack was
   still busy with earlier work when a packet arrived, it held the packet and
   planned to process it after its next poll. A socket call made at the same
