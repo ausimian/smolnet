@@ -34,6 +34,7 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - uses: erlef/setup-beam@54075bcc5e249e4758d363f27d099f55d843f124 # v1
+        id: beam
         with:
           elixir-version: ${{ matrix.elixir }}
           otp-version: ${{ matrix.otp }}
@@ -56,6 +57,28 @@ jobs:
             mix-${{ runner.os }}-${{ matrix.elixir }}-${{ matrix.otp }}-
             ${{ hashFiles('mix.lock', 'native/Cargo.lock') }}
 
+      # Compiled Hex dependencies only. _build/<env>/lib holds one directory per
+      # application; every entry except smolnet is a dependency whose output is
+      # reproducible from mix.lock for a fixed OS/arch/Elixir/OTP/MIX_ENV, so it
+      # is safe to restore. _build/<env>/lib/smolnet is excluded: it carries
+      # SmolNet's own BEAM files and the priv/native NIF copied there by
+      # Rustler, and restoring either would let a stale build mask source or
+      # toolchain changes. The key pins every input that can change compiled
+      # dependency compatibility and there are no restore-keys, so a mismatch
+      # rebuilds from scratch rather than crossing incompatible combinations.
+      # Do not widen `path` to _build/<env> or drop the exclusions.
+      # This job builds dev (mix compile) and test (mix test).
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            _build/dev/lib
+            _build/test/lib
+            !_build/dev/lib/smolnet
+            !_build/dev/lib/smolnet/**
+            !_build/test/lib/smolnet
+            !_build/test/lib/smolnet/**
+          key: depsbuild-${{ runner.os }}-${{ runner.arch }}-elixir-${{ steps.beam.outputs.elixir-version }}-otp-${{ steps.beam.outputs.otp-version }}-env-dev.test-${{ hashFiles('mix.lock', 'mix.exs') }}
+
       - run: mix local.hex --force
       - run: mix local.rebar --force
       - run: mix deps.get
@@ -71,6 +94,7 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - uses: erlef/setup-beam@54075bcc5e249e4758d363f27d099f55d843f124 # v1
+        id: beam
         with:
           elixir-version: "1.19.5"
           otp-version: "28.3"
@@ -94,6 +118,29 @@ jobs:
           key: >-
             quality-${{ runner.os }}-1.19.5-28.3-
             ${{ hashFiles('mix.lock', 'native/Cargo.lock') }}
+
+      # Compiled Hex dependencies only. _build/<env>/lib holds one directory per
+      # application; every entry except smolnet is a dependency whose output is
+      # reproducible from mix.lock for a fixed OS/arch/Elixir/OTP/MIX_ENV, so it
+      # is safe to restore. _build/<env>/lib/smolnet is excluded: it carries
+      # SmolNet's own BEAM files and the priv/native NIF copied there by
+      # Rustler, and restoring either would let a stale build mask source or
+      # toolchain changes. The key pins every input that can change compiled
+      # dependency compatibility and there are no restore-keys, so a mismatch
+      # rebuilds from scratch rather than crossing incompatible combinations.
+      # Do not widen `path` to _build/<env> or drop the exclusions.
+      # mix precommit and mix coveralls.cobertura run in test; mix hex.build
+      # runs in dev.
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            _build/dev/lib
+            _build/test/lib
+            !_build/dev/lib/smolnet
+            !_build/dev/lib/smolnet/**
+            !_build/test/lib/smolnet
+            !_build/test/lib/smolnet/**
+          key: depsbuild-quality-${{ runner.os }}-${{ runner.arch }}-elixir-${{ steps.beam.outputs.elixir-version }}-otp-${{ steps.beam.outputs.otp-version }}-env-dev.test-${{ hashFiles('mix.lock', 'mix.exs') }}
 
       - run: mix local.hex --force
       - run: mix local.rebar --force
