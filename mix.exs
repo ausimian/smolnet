@@ -62,6 +62,7 @@ defmodule SmolNet.MixProject do
         "cmd cargo check --manifest-path native/fuzz/Cargo.toml --all-targets --locked",
         "run scripts/nif_budget.exs",
         "run examples/quickstart.exs",
+        "run examples/loopback.exs",
         "test --warnings-as-errors"
       ]
     ]
@@ -110,6 +111,7 @@ defmodule SmolNet.MixProject do
         "lib",
         "checksum-*.exs",
         "examples/quickstart.exs",
+        "examples/loopback.exs",
         ".formatter.exs",
         "mix.exs",
         "README.md",
