@@ -82,6 +82,40 @@ The message is only a retry hint. `SmolNet.cancel/2` removes the exact waiter
 and returns `:ok`, `:already_sent`, or `:not_found` according to which side of
 the readiness race won.
 
+## Loopback links
+
+`SmolNet.Loopback` is a link process that hands every packet its stack emits
+straight back to that same stack. One stack then reaches its own addresses with
+no peer, no external transport, and no privileges, which is the shortest path
+to a runnable example or test:
+
+```console
+mix run examples/loopback.exs
+```
+
+```elixir
+{:ok, link} =
+  SmolNet.Loopback.start_link(
+    addresses: [{{127, 0, 0, 1}, 8}, {{0, 0, 0, 0, 0, 0, 0, 1}, 128}]
+  )
+
+stack = SmolNet.Loopback.stack(link)
+```
+
+The link owns the stack it loops. `SmolNet.Loopback.start_link/1` takes the
+`SmolNet.start_stack/1` options apart from `:egress`, which the link supplies,
+and an optional `:name` for the link process. Stopping the link stops its stack
+through the stack's own `:link_down` policy, and `SmolNet.stop_stack/1` stops
+the link.
+
+A loopback link carries packets; it does not invent addresses. A stack answers
+only on the addresses it was configured with, so conventional localhost
+addresses are a convention here rather than a special case, and any other
+address the stack holds loops just as well. Packets re-enter through the public
+`SmolNet.ingress/2` and are validated exactly like packets from a real
+transport, so the loop is a worked example of the link contract above rather
+than a shortcut past it.
+
 ## Low-level TCP streams
 
 TCP endpoints use explicit `:socket`-style IPv4 or IPv6 maps. The family is
@@ -287,6 +321,9 @@ ipv4_options = [
 
 {:ok, socket} = :gen_tcp.connect({192, 0, 2, 2}, 443, ipv4_options, 5_000)
 ```
+
+`examples/loopback.exs` runs this end to end against a loopback link, so it
+needs no peer.
 
 The same options can create a server. `backlog` defaults to 5 and accepts
 values in `1..128`; accepted sockets inherit the listener's supported active,

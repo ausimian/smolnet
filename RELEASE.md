@@ -1,3 +1,14 @@
+### Added
+
+- `SmolNet.Loopback`, a link process that feeds every packet its stack emits
+  back into that same stack. One stack then reaches its own addresses with no
+  peer, no external transport, and no privileges, which makes a runnable
+  example or test out of what previously needed two stacks and a relay. The
+  link takes the `SmolNet.start_stack/1` options apart from `:egress`, which it
+  supplies, owns the stack it loops, and is stopped by `SmolNet.stop_stack/1`.
+  `examples/loopback.exs` runs a complete `gen_tcp` request and response over
+  one stack.
+
 ### Changed
 
 - The NIF now charges `enif_consume_timeslice` incrementally at work-loop chunk
