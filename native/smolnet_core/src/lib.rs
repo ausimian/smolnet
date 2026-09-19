@@ -40,6 +40,7 @@ mod atoms {
         wrong_socket_kind,
         invalid_socket_state,
         invalid_operation,
+        invalid_options,
         busy,
         system_limit,
         unsupported_socket,
@@ -190,10 +191,12 @@ fn tcp_open<'a>(
     env: Env<'a>,
     resource: ResourceArc<StackResource>,
     family: crate::tcp::AddressFamily,
+    rcvbuf: usize,
+    sndbuf: usize,
 ) -> Term<'a> {
     let result = catch_operation(|| {
         resource
-            .with_stack(|stack| stack.tcp_open(env, family))
+            .with_stack(|stack| stack.tcp_open(env, family, rcvbuf, sndbuf))
             .map_err(|_| atoms::ownership_invariant_violation())?
             .map_err(socket_error_atom)
     });
@@ -846,6 +849,7 @@ fn socket_error_atom(error: SocketError) -> Atom {
         SocketError::WrongKind => atoms::wrong_socket_kind(),
         SocketError::InvalidState => atoms::invalid_socket_state(),
         SocketError::InvalidOperation => atoms::invalid_operation(),
+        SocketError::InvalidOptions => atoms::invalid_options(),
         SocketError::Busy => atoms::busy(),
         SocketError::SystemLimit => atoms::system_limit(),
         SocketError::MessageTooLarge => atoms::message_too_large(),

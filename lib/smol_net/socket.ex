@@ -16,6 +16,9 @@ defmodule SmolNet.Socket do
   @max_immediate_retries 16
   @max_timeout 4_294_967_295
   @max_backlog 128
+  @default_tcp_buffer_bytes 65_536
+  @min_tcp_buffer_bytes 1_024
+  @max_tcp_buffer_bytes 1_048_576
 
   @enforce_keys [:stack, :id, :generation, :family, :kind]
   defstruct [:stack, :id, :generation, :family, :kind]
@@ -58,8 +61,19 @@ defmodule SmolNet.Socket do
   @spec open(atom(), atom(), atom(), keyword()) ::
           {:ok, t()}
           | {:error, :unsupported_family | :unsupported_socket | :invalid_options | atom()}
-  def open(family, :stream, :tcp, stack: stack) when family in [:inet, :inet6],
-    do: Stack.socket_open(stack, family, :stream)
+  def open(family, :stream, :tcp, options) when family in [:inet, :inet6] and is_list(options) do
+    with true <- Keyword.keyword?(options),
+         true <- unique_tcp_open_options?(options),
+         {:ok, stack} <- Keyword.fetch(options, :stack),
+         rcvbuf = Keyword.get(options, :rcvbuf, @default_tcp_buffer_bytes),
+         sndbuf = Keyword.get(options, :sndbuf, @default_tcp_buffer_bytes),
+         true <- valid_tcp_buffer_size?(rcvbuf),
+         true <- valid_tcp_buffer_size?(sndbuf) do
+      Stack.socket_open(stack, family, :stream, rcvbuf, sndbuf)
+    else
+      _invalid -> {:error, :invalid_options}
+    end
+  end
 
   def open(family, :dgram, :udp, stack: stack) when family in [:inet, :inet6],
     do: Stack.socket_open(stack, family, :datagram)
@@ -78,6 +92,17 @@ defmodule SmolNet.Socket do
   end
 
   def open(_domain, _type, _protocol, _options), do: {:error, :invalid_options}
+
+  defp unique_tcp_open_options?(options) do
+    keys = Keyword.keys(options)
+
+    Enum.all?(keys, &(&1 in [:stack, :rcvbuf, :sndbuf])) and
+      length(keys) == length(Enum.uniq(keys))
+  end
+
+  defp valid_tcp_buffer_size?(size) do
+    is_integer(size) and size in @min_tcp_buffer_bytes..@max_tcp_buffer_bytes
+  end
 
   @doc false
   @spec bind(t(), sockaddr_in() | sockaddr_in6()) :: :ok | {:error, atom()}

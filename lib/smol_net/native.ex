@@ -1,6 +1,8 @@
 defmodule SmolNet.Native do
   @moduledoc false
 
+  @tcp_default_buffer_bytes 65_536
+
   version = Mix.Project.config()[:version]
   source_build? = File.dir?(Path.expand("../../native/smolnet_nif", __DIR__))
 
@@ -37,7 +39,12 @@ defmodule SmolNet.Native do
   def socket_validate(_stack, _identity), do: :erlang.nif_error(:nif_not_loaded)
 
   @spec tcp_open(reference(), :inet | :inet6) :: {:ok, map()} | {:error, atom()}
-  def tcp_open(_stack, _family), do: :erlang.nif_error(:nif_not_loaded)
+  def tcp_open(stack, family),
+    do: tcp_open(stack, family, @tcp_default_buffer_bytes, @tcp_default_buffer_bytes)
+
+  @spec tcp_open(reference(), :inet | :inet6, pos_integer(), pos_integer()) ::
+          {:ok, map()} | {:error, atom()}
+  def tcp_open(_stack, _family, _rcvbuf, _sndbuf), do: :erlang.nif_error(:nif_not_loaded)
 
   @spec tcp_bind(reference(), map(), map()) :: {:ok, map()} | {:error, atom()}
   def tcp_bind(_stack, _identity, _endpoint), do: :erlang.nif_error(:nif_not_loaded)

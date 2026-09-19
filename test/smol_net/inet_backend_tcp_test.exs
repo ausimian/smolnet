@@ -17,7 +17,12 @@ defmodule SmolNet.InetBackendTcpTest do
     {stack, peer} = stack_and_peer()
 
     assert {:ok, socket = {:"$inet", Tcp, adapter}} =
-             :gen_tcp.connect(@peer, 443, client_options(stack), 1_000)
+             :gen_tcp.connect(
+               @peer,
+               443,
+               client_options(stack, recbuf: 32_768, sndbuf: 98_304),
+               1_000
+             )
 
     assert Process.alive?(adapter)
     assert :ok = :gen_tcp.send(socket, ["hel", "lo"])
@@ -34,8 +39,14 @@ defmodule SmolNet.InetBackendTcpTest do
               active: false,
               mode: :binary,
               packet: :raw,
-              packet_size: 65_536
-            ]} = :inet.getopts(socket, [:active, :mode, :packet, :packet_size])
+              packet_size: 65_536,
+              recbuf: 32_768,
+              sndbuf: 98_304
+            ]} =
+             :inet.getopts(socket, [:active, :mode, :packet, :packet_size, :recbuf, :sndbuf])
+
+    assert {:error, :einval} = :inet.setopts(socket, recbuf: 65_536)
+    assert {:error, :einval} = :inet.setopts(socket, sndbuf: 65_536)
 
     assert %{owner: owner, read_pending: false, write_pending: false} = :inet.info(socket)
     assert owner == self()
@@ -292,7 +303,7 @@ defmodule SmolNet.InetBackendTcpTest do
 
   test "independent read and write continuations coexist while competing operations are busy" do
     {stack, peer} = stack_and_peer()
-    {:ok, socket} = :gen_tcp.connect(@peer, 443, client_options(stack), 1_000)
+    {:ok, socket} = :gen_tcp.connect(@peer, 443, client_options(stack, sndbuf: 4_096), 1_000)
     assert :ok = IPv6TcpPeer.hold_acks(peer, true)
 
     receiver = Task.async(fn -> :gen_tcp.recv(socket, 4, 2_000) end)
@@ -320,7 +331,7 @@ defmodule SmolNet.InetBackendTcpTest do
       :gen_tcp.connect(
         @peer,
         443,
-        client_options(stack, send_timeout: 0, send_timeout_close: true),
+        client_options(stack, sndbuf: 4_096, send_timeout: 0, send_timeout_close: true),
         1_000
       )
 
@@ -347,7 +358,7 @@ defmodule SmolNet.InetBackendTcpTest do
     {write_stack, write_peer} = stack_and_peer()
 
     {:ok, write_socket = {:"$inet", Tcp, write_adapter}} =
-      :gen_tcp.connect(@peer, 443, client_options(write_stack), 1_000)
+      :gen_tcp.connect(@peer, 443, client_options(write_stack, sndbuf: 4_096), 1_000)
 
     assert :ok = IPv6TcpPeer.hold_acks(write_peer, true)
     payload = :binary.copy("reset", 3_000)
@@ -402,6 +413,17 @@ defmodule SmolNet.InetBackendTcpTest do
 
   test "invalid options and socket calls fail explicitly" do
     {stack, _peer} = stack_and_peer()
+
+    callback_options = [{:smolnet_stack, stack}, :inet6, :binary, {:active, false}]
+
+    assert {:error, :einval} =
+             Tcp.connect(@peer, 443, [{:recbuf, 1_023} | callback_options], 10)
+
+    assert {:error, :einval} =
+             Tcp.connect(@peer, 443, [{:sndbuf, 1_048_577} | callback_options], 10)
+
+    assert {:error, :einval} =
+             Tcp.connect(@peer, 443, [{:rcvbuf, 65_536} | callback_options], 10)
 
     assert catch_exit(
              :gen_tcp.connect(@peer, 443, [

@@ -23,6 +23,8 @@ defmodule SmolNet.InetBackendListenerTest do
                  packet: 2,
                  packet_size: 64,
                  buffer: 128,
+                 recbuf: 16_384,
+                 sndbuf: 32_768,
                  send_timeout: 321,
                  send_timeout_close: true
                )
@@ -54,7 +56,9 @@ defmodule SmolNet.InetBackendListenerTest do
               mode: :binary,
               packet: 2,
               packet_size: 64,
-              buffer: 128,
+              buffer: 16_384,
+              recbuf: 16_384,
+              sndbuf: 32_768,
               send_timeout: 321,
               send_timeout_close: true
             ]} =
@@ -64,9 +68,19 @@ defmodule SmolNet.InetBackendListenerTest do
                :packet,
                :packet_size,
                :buffer,
+               :recbuf,
+               :sndbuf,
                :send_timeout,
                :send_timeout_close
              ])
+
+    assert {:error, :einval} = :inet.setopts(listener, recbuf: 65_536)
+    assert {:error, :einval} = :inet.setopts(server, sndbuf: 65_536)
+
+    assert {:ok, info} = SmolNet.stack_info(server_stack)
+    assert %{sockets: server_buffers} = info.native.result.tcp_buffer_bytes
+    assert length(server_buffers) == 2
+    assert Enum.all?(server_buffers, &match?(%{rcvbuf: 16_384, sndbuf: 32_768}, &1))
 
     assert {:ok, {@server, ^port}} = :inet.sockname(server)
     assert {:ok, {@client, _client_port}} = :inet.peername(server)
@@ -258,7 +272,7 @@ defmodule SmolNet.InetBackendListenerTest do
   end
 
   defp server_options(stack, extra) do
-    [
+    options = [
       {:tcp_module, Tcp},
       {:smolnet_stack, stack},
       :inet6,
@@ -271,10 +285,12 @@ defmodule SmolNet.InetBackendListenerTest do
       {:send_timeout, Keyword.get(extra, :send_timeout, :infinity)},
       {:send_timeout_close, Keyword.get(extra, :send_timeout_close, false)}
     ]
+
+    options ++ Keyword.take(extra, [:recbuf, :sndbuf])
   end
 
   defp client_options(stack, extra \\ []) do
-    [
+    options = [
       {:tcp_module, Tcp},
       {:smolnet_stack, stack},
       :inet6,
@@ -284,6 +300,8 @@ defmodule SmolNet.InetBackendListenerTest do
       {:packet_size, Keyword.get(extra, :packet_size, 65_536)},
       {:buffer, Keyword.get(extra, :buffer, 65_536)}
     ]
+
+    options ++ Keyword.take(extra, [:recbuf, :sndbuf])
   end
 
   defp stop_all_stacks do

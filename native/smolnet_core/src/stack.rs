@@ -28,7 +28,7 @@ use crate::socket_table::{
 };
 use crate::tcp::{
     self as tcp_support, AddressFamily, ConnectFailure, ConnectPhase, EncodedEndpoint,
-    ListenerRecord, ShutdownHow, TcpEndpoint, TcpRecord, ValidatedEndpoint,
+    ListenerRecord, ShutdownHow, TcpBufferSizes, TcpEndpoint, TcpRecord, ValidatedEndpoint,
 };
 use crate::udp::{self as udp_support, UdpRecord};
 #[cfg(debug_assertions)]
@@ -296,6 +296,27 @@ impl NativeStack {
             .values()
             .map(|listener| listener.backlog)
             .sum();
+        let mut socket_buffer_bytes = self
+            .tcp_records
+            .values()
+            .map(|record| TcpSocketBufferBytes {
+                id: record.identity.id,
+                generation: record.identity.generation,
+                rcvbuf: record.rcvbuf,
+                sndbuf: record.sndbuf,
+            })
+            .chain(
+                self.tcp_listeners
+                    .values()
+                    .map(|listener| TcpSocketBufferBytes {
+                        id: listener.identity.id,
+                        generation: listener.identity.generation,
+                        rcvbuf: listener.rcvbuf,
+                        sndbuf: listener.sndbuf,
+                    }),
+            )
+            .collect::<Vec<_>>();
+        socket_buffer_bytes.sort_by_key(|buffer| buffer.id);
 
         Envelope {
             result: Snapshot {
@@ -312,7 +333,11 @@ impl NativeStack {
                 accepted_queue_count,
                 listener_backlog_capacity,
                 closing_tcp_socket_count: self.closing_tcp.len(),
-                tcp_buffer_bytes: tcp_support::BUFFER_BYTES,
+                tcp_buffer_bytes: TcpBufferBytes {
+                    default_rcvbuf: tcp_support::DEFAULT_BUFFER_BYTES,
+                    default_sndbuf: tcp_support::DEFAULT_BUFFER_BYTES,
+                    sockets: socket_buffer_bytes,
+                },
                 udp_packet_capacity: udp_support::PACKET_CAPACITY,
                 udp_payload_bytes: udp_support::PAYLOAD_BYTES,
                 udp_max_datagram_bytes: udp_support::max_datagram_bytes(
@@ -457,7 +482,7 @@ impl NativeStack {
         for _index in 0..count {
             self.ensure_logical_socket_capacity()?;
             self.ensure_native_socket_capacity(1, 0)?;
-            let handle = self.sockets.add(tcp_support::socket());
+            let handle = self.sockets.add(tcp_support::default_socket());
             let identity = match self.socket_table.insert(SocketKind::Tcp, 0) {
                 Ok(identity) => identity,
                 Err(error) => {
@@ -465,7 +490,13 @@ impl NativeStack {
                     return Err(error);
                 }
             };
-            let mut record = TcpRecord::new(identity, handle, AddressFamily::Inet6);
+            let mut record = TcpRecord::new(
+                identity,
+                handle,
+                AddressFamily::Inet6,
+                tcp_support::DEFAULT_BUFFER_BYTES,
+                tcp_support::DEFAULT_BUFFER_BYTES,
+            );
             record.phase = ConnectPhase::Connected;
             record.close_deadline = Some(deadline);
             self.tcp_records.insert(identity.id, record);
@@ -493,12 +524,14 @@ impl NativeStack {
         &mut self,
         env: Env<'_>,
         family: AddressFamily,
+        rcvbuf: usize,
+        sndbuf: usize,
     ) -> Result<Envelope<SocketIdentity>, SocketError> {
         self.ensure_running()?;
         self.ensure_logical_socket_capacity()?;
         self.ensure_native_socket_capacity(1, 0)?;
 
-        let handle = self.sockets.add(tcp_support::socket());
+        let handle = self.sockets.add(tcp_support::socket(rcvbuf, sndbuf)?);
         let identity = match self.socket_table.insert(SocketKind::Tcp, 0) {
             Ok(identity) => identity,
             Err(error) => {
@@ -507,8 +540,10 @@ impl NativeStack {
             }
         };
 
-        self.tcp_records
-            .insert(identity.id, TcpRecord::new(identity, handle, family));
+        self.tcp_records.insert(
+            identity.id,
+            TcpRecord::new(identity, handle, family, rcvbuf, sndbuf),
+        );
 
         Ok(self.finish_call(env, identity, Effects::empty(), Vec::new()))
     }
@@ -601,7 +636,10 @@ impl NativeStack {
         let mut handles = vec![record.handle];
 
         for _ in 1..pool_target {
-            handles.push(self.sockets.add(tcp_support::socket()));
+            handles.push(
+                self.sockets
+                    .add(tcp_support::socket(record.rcvbuf, record.sndbuf)?),
+            );
         }
 
         for handle in &handles {
@@ -620,7 +658,18 @@ impl NativeStack {
         self.remove_tcp_record(record);
         self.tcp_listeners.insert(
             identity.id,
-            ListenerRecord::new(identity, endpoint, listen_endpoint, local, backlog, handles),
+            ListenerRecord::new(
+                identity,
+                endpoint,
+                listen_endpoint,
+                local,
+                backlog,
+                handles,
+                TcpBufferSizes {
+                    rcvbuf: record.rcvbuf,
+                    sndbuf: record.sndbuf,
+                },
+            ),
         );
         self.request_listener_scan();
 
@@ -2473,6 +2522,8 @@ impl NativeStack {
                         local,
                         remote,
                         listener.endpoint.scope_id,
+                        listener.rcvbuf,
+                        listener.sndbuf,
                     );
                     self.tcp_connections
                         .insert(ConnectionKey::new(local, remote), child);
@@ -2504,7 +2555,10 @@ impl NativeStack {
 
     fn add_listener_member(&mut self, listener: &mut ListenerRecord) {
         debug_assert!(self.ensure_native_socket_capacity(1, 0).is_ok());
-        let handle = self.sockets.add(tcp_support::socket());
+        let handle = self.sockets.add(
+            tcp_support::socket(listener.rcvbuf, listener.sndbuf)
+                .expect("listener TCP buffer sizes remain valid"),
+        );
         let socket = self.sockets.get_mut::<tcp::Socket<'static>>(handle);
         socket.set_timeout(Some(Duration::from_millis(
             tcp_support::CONNECT_TIMEOUT_MILLIS,
@@ -3455,7 +3509,7 @@ fn fuzz_open_socket(
 
     match kind {
         SocketKind::Tcp => {
-            let handle = stack.sockets.add(tcp_support::socket());
+            let handle = stack.sockets.add(tcp_support::default_socket());
             let identity = match stack.socket_table.insert(kind, 0) {
                 Ok(identity) => identity,
                 Err(error) => {
@@ -3463,9 +3517,16 @@ fn fuzz_open_socket(
                     return Err(error);
                 }
             };
-            stack
-                .tcp_records
-                .insert(identity.id, TcpRecord::new(identity, handle, family));
+            stack.tcp_records.insert(
+                identity.id,
+                TcpRecord::new(
+                    identity,
+                    handle,
+                    family,
+                    tcp_support::DEFAULT_BUFFER_BYTES,
+                    tcp_support::DEFAULT_BUFFER_BYTES,
+                ),
+            );
             Ok(identity)
         }
         SocketKind::Udp => {
@@ -3576,6 +3637,10 @@ fn fuzz_advance_socket(
                     local,
                     1 + usize::from(operation % 4),
                     [record.handle],
+                    TcpBufferSizes {
+                        rcvbuf: record.rcvbuf,
+                        sndbuf: record.sndbuf,
+                    },
                 ),
             );
             stack.request_listener_scan();
@@ -4049,6 +4114,21 @@ impl Envelope<ResourceArc<StackResource>> {
 }
 
 #[derive(NifMap)]
+pub struct TcpSocketBufferBytes {
+    id: u64,
+    generation: u64,
+    rcvbuf: usize,
+    sndbuf: usize,
+}
+
+#[derive(NifMap)]
+pub struct TcpBufferBytes {
+    default_rcvbuf: usize,
+    default_sndbuf: usize,
+    sockets: Vec<TcpSocketBufferBytes>,
+}
+
+#[derive(NifMap)]
 pub struct Snapshot {
     id: u64,
     limits: Limits,
@@ -4063,7 +4143,7 @@ pub struct Snapshot {
     accepted_queue_count: usize,
     listener_backlog_capacity: usize,
     closing_tcp_socket_count: usize,
-    tcp_buffer_bytes: usize,
+    tcp_buffer_bytes: TcpBufferBytes,
     udp_packet_capacity: usize,
     udp_payload_bytes: usize,
     udp_max_datagram_bytes: usize,

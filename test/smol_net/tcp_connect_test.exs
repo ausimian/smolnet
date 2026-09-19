@@ -262,6 +262,48 @@ defmodule SmolNet.TcpConnectTest do
     assert {:error, :system_limit} = SmolNet.open(:inet6, :stream, :tcp, stack: stack)
   end
 
+  test "TCP open allocates bounded per-socket buffers and reports them" do
+    {:ok, stack} = SmolNet.start_stack(addresses: [{@client, 64}])
+
+    assert {:ok, default} = SmolNet.open(:inet6, :stream, :tcp, stack: stack)
+
+    assert {:ok, configured} =
+             SmolNet.open(:inet6, :stream, :tcp,
+               stack: stack,
+               rcvbuf: 32_768,
+               sndbuf: 196_608
+             )
+
+    assert {:ok, info} = SmolNet.stack_info(stack)
+
+    assert %{
+             default_rcvbuf: 65_536,
+             default_sndbuf: 65_536,
+             sockets: socket_buffers
+           } = info.native.result.tcp_buffer_bytes
+
+    assert %{id: default.id, generation: default.generation, rcvbuf: 65_536, sndbuf: 65_536} in socket_buffers
+
+    assert %{
+             id: configured.id,
+             generation: configured.generation,
+             rcvbuf: 32_768,
+             sndbuf: 196_608
+           } in socket_buffers
+
+    assert {:error, :invalid_options} =
+             SmolNet.open(:inet6, :stream, :tcp, stack: stack, rcvbuf: 1_023)
+
+    assert {:error, :invalid_options} =
+             SmolNet.open(:inet6, :stream, :tcp, stack: stack, sndbuf: 1_048_577)
+
+    assert {:error, :invalid_options} =
+             SmolNet.open(:inet6, :stream, :tcp, stack: stack, unknown: 65_536)
+
+    assert {:error, :invalid_options} =
+             SmolNet.open(:inet6, :stream, :tcp, stack: stack, recbuf: 32_768)
+  end
+
   test "address, port, scope, family, route, and timeout validation is explicit" do
     {:ok, stack} = SmolNet.start_stack(addresses: [{@client, 64}, {@link_local, 64}])
     {:ok, socket} = SmolNet.open(:inet6, :stream, :tcp, stack: stack)
@@ -345,7 +387,15 @@ defmodule SmolNet.TcpConnectTest do
     {:ok, blocked_info} = SmolNet.stack_info(blocked_stack)
     assert blocked_info.native.result.socket_count == 32
     assert blocked_info.native.result.waiter_count == 32
-    assert blocked_info.native.result.tcp_buffer_bytes == 4_096
+
+    assert %{
+             default_rcvbuf: 65_536,
+             default_sndbuf: 65_536,
+             sockets: blocked_buffers
+           } = blocked_info.native.result.tcp_buffer_bytes
+
+    assert length(blocked_buffers) == 32
+    assert Enum.all?(blocked_buffers, &match?(%{rcvbuf: 65_536, sndbuf: 65_536}, &1))
 
     {active_stack, _active_peer} = start_peer_stack(:accept)
     {:ok, active} = SmolNet.open(:inet6, :stream, :tcp, stack: active_stack)

@@ -85,7 +85,8 @@ defmodule SmolNet do
   Opens a bounded low-level TCP stream or UDP datagram socket on `stack`.
 
   Family and kind are explicit and immutable. TCP and UDP support both IPv4
-  and IPv6.
+  and IPv6. TCP accepts socket-style `:rcvbuf` and `:sndbuf` options from
+  1 KiB through 1 MiB; both default to 64 KiB and remain fixed after open.
   """
   @spec open(:inet6 | :inet, :stream | :dgram, :tcp | :udp, keyword()) ::
           {:ok, Socket.t()} | {:error, atom()}

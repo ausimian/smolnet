@@ -90,7 +90,7 @@ defmodule SmolNet.TcpStreamTest do
   end
 
   test "send timeout returns only the caller-owned unsent remainder" do
-    {_stack, peer, socket} = connected_socket()
+    {_stack, peer, socket} = connected_socket(sndbuf: 4_096)
     :ok = IPv6TcpPeer.hold_acks(peer, true)
     payload = :binary.copy("send", 2_000)
 
@@ -109,7 +109,7 @@ defmodule SmolNet.TcpStreamTest do
   end
 
   test "nonblocking partial operations use independent read and write waiters" do
-    {stack, peer, socket} = connected_socket()
+    {stack, peer, socket} = connected_socket(sndbuf: 4_096)
     assert {:select, read_select} = SmolNet.recv(socket, 10, :nowait)
 
     :ok = IPv6TcpPeer.hold_acks(peer, true)
@@ -125,7 +125,7 @@ defmodule SmolNet.TcpStreamTest do
   end
 
   test "waiter exhaustion never consumes send or receive bytes" do
-    {stack, peer, socket} = connected_socket(limits: %{ready_events: 1})
+    {stack, peer, socket} = connected_socket(limits: %{ready_events: 1}, sndbuf: 4_096)
     assert {:select, read_select} = SmolNet.recv(socket, 1, :nowait)
     assert :ok = IPv6TcpPeer.hold_acks(peer, true)
 
@@ -358,7 +358,7 @@ defmodule SmolNet.TcpStreamTest do
     Application.put_env(:smolnet, :manual_clock, clock)
 
     {stack, peer, busy_socket} =
-      connected_socket(limits: %{maintenance_work: 1, output_packets: 1})
+      connected_socket(limits: %{maintenance_work: 1, output_packets: 1}, sndbuf: 4_096)
 
     {:ok, closing_socket} = SmolNet.open(:inet6, :stream, :tcp, stack: stack)
 
@@ -404,7 +404,7 @@ defmodule SmolNet.TcpStreamTest do
   end
 
   test "a blocked large send cannot monopolize another stack" do
-    {blocked_stack, blocked_peer, blocked_socket} = connected_socket()
+    {blocked_stack, blocked_peer, blocked_socket} = connected_socket(sndbuf: 4_096)
     assert :ok = IPv6TcpPeer.hold_acks(blocked_peer, true)
 
     blocked =
@@ -476,7 +476,8 @@ defmodule SmolNet.TcpStreamTest do
 
   defp connected_socket(options \\ []) do
     connect_timeout = Keyword.get(options, :connect_timeout, :nowait)
-    stack_options = Keyword.drop(options, [:connect_timeout])
+    socket_options = Keyword.take(options, [:rcvbuf, :sndbuf])
+    stack_options = Keyword.drop(options, [:connect_timeout, :rcvbuf, :sndbuf])
     {:ok, peer} = IPv6TcpPeer.start_link(self(), :accept)
 
     {:ok, stack} =
@@ -485,7 +486,9 @@ defmodule SmolNet.TcpStreamTest do
       )
 
     :ok = IPv6TcpPeer.attach(peer, stack)
-    {:ok, socket} = SmolNet.open(:inet6, :stream, :tcp, stack: stack)
+
+    {:ok, socket} =
+      SmolNet.open(:inet6, :stream, :tcp, Keyword.put(socket_options, :stack, stack))
 
     case connect_timeout do
       :nowait ->
