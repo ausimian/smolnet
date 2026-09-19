@@ -54,6 +54,11 @@
 
 ### Changed
 
+- The README is now a concise introduction to SmolNet's motivation, raw-IP link
+  boundary, and available interfaces. Detailed `:gen_tcp`, `:gen_udp`, and
+  low-level socket usage now lives in dedicated ExDoc guides, while development
+  and native-build material has moved to the repository-only maintainer guide.
+
 - TCP receive and send buffers now default to 64 KiB and can be sized
   independently with socket-style `rcvbuf`/`sndbuf` at low-level open or inet
   `recbuf`/`sndbuf` when connecting and listening. Sizes from 1 KiB through

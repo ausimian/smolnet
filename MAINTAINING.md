@@ -1,5 +1,75 @@
 # Maintaining SmolNet
 
+This file covers repository development, native-build internals, performance
+budgets, and releases. It is kept with the source distribution but is not
+included in the published ExDoc site.
+
+## Development
+
+The supported development baseline is Elixir 1.19.5, Erlang/OTP 28.3, and Rust
+1.94.0. The compatibility matrix additionally covers the supported Elixir
+1.18–1.20 and OTP 27–29 combinations on Linux and macOS.
+
+Run the complete local quality gate before committing:
+
+```console
+mix precommit
+```
+
+The suite's wall-clock budgets are strict by default so that a change which
+slows the stack fails locally. Budgets that only bound how long a healthy run
+may take are multiplied by `SMOLNET_TEST_TIMEOUT_SCALE`, which CI sets to `5`
+because its shared runners are preemptible; budgets whose expiry is the
+assertion are never scaled. Set it locally only to reproduce a CI run:
+
+```console
+SMOLNET_TEST_TIMEOUT_SCALE=5 mix test
+```
+
+## Native development builds and work budgets
+
+Repository checkouts and CI always compile the NIF from source so native
+changes cannot be hidden by a restored or downloaded artifact. Source builds
+require Rust 1.91 or newer, a platform C linker, and Erlang development files;
+Rust 1.94.0 is the pinned development version. Hex packages intentionally omit
+the Rust workspace.
+
+Every native stack call has a 1 ms normal-scheduler target. Native work stops
+at a monotonic 750 microsecond deadline, reserving 250 microseconds for result
+encoding and handoff to the BEAM. Output packets are allocated as Rustler
+`OwnedBinary` values and released into the result without a second payload
+copy. Output, readiness and overflow delivery, listener and closing
+maintenance, and shutdown retain their cursors or queues when the deadline is
+reached; `more: true` asks the stack owner to run the next bounded slice.
+Native calls also report their measured scheduler share through
+`enif_consume_timeslice`, so repeated continuations yield fairly to other stack
+processes and ordinary mailbox traffic.
+
+Ingress remains a single-feeder interface with one admitted packet at a time.
+When a deadline continuation still owns that slot, another feeder call can
+return `{:error, :busy}` sooner than it did under quota-only batching. Feeders
+should treat `:busy` as backpressure and retry after yielding or waiting for
+their next input opportunity.
+
+The time budget is backed by deterministic per-call maxima of 65,575 copied
+bytes, 32 output packets, 128 readiness events, and 128 maintenance units.
+These bounds prevent clock or platform anomalies from creating unbounded work.
+A separate hard ceiling allows at most 64 native TCP/UDP backing sockets per
+stack, including listener pools and wildcard-UDP expansion across configured
+addresses. `SmolNet.stack_info/1` exposes the call target, work budget,
+encoding headroom, deadline-yield count, timeslice-exhaustion count, and
+maximum observed serialized native-call duration before result encoding.
+
+Local `mix precommit` enforces a 1 ms maximum for complete Elixir-visible NIF
+calls, including result encoding. The GitHub-hosted x86-64 Linux quality job
+plus the AArch64 Linux and macOS native-budget jobs report the full-call maximum
+and p99 as evidence without gating on either, because the compute environment
+of a shared runner is outside this project's control. The deterministic
+caller-reduction budget stays enforced everywhere. Each maximum-state scenario
+uses 100 independently prepared samples outside `enforce` mode. Unexpected
+resource destruction remains synchronously bounded by the fixed socket,
+waiter, and packet capacities and is included in the benchmark.
+
 ## Native release assets
 
 SmolNet has two deliberately separate native build paths:
