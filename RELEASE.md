@@ -49,6 +49,12 @@
 
 ### Changed
 
+- TCP receive and send buffers now default to 64 KiB and can be sized
+  independently with socket-style `rcvbuf`/`sndbuf` at low-level open or inet
+  `recbuf`/`sndbuf` when connecting and listening. Sizes from 1 KiB through
+  1 MiB are supported, accepted sockets inherit listener sizes, and stack
+  diagnostics report each socket's values.
+
 - The NIF now charges `enif_consume_timeslice` incrementally at work-loop chunk
   boundaries instead of once at the end of a call, and stops early when a charge
   reports the caller's reduction slice as spent. A stack owner that has already

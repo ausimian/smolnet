@@ -577,6 +577,7 @@ pub enum SocketError {
     WrongKind,
     InvalidState,
     InvalidOperation,
+    InvalidOptions,
     Busy,
     SystemLimit,
     InvalidAddress,

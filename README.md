@@ -142,7 +142,12 @@ remote = {0xFD00, 0, 0, 0, 0, 0, 0, 2}
     addresses: [{local, 64}]
   )
 
-{:ok, socket} = SmolNet.open(:inet6, :stream, :tcp, stack: stack)
+{:ok, socket} =
+  SmolNet.open(:inet6, :stream, :tcp,
+    stack: stack,
+    rcvbuf: 192 * 1024,
+    sndbuf: 192 * 1024
+  )
 :ok = SmolNet.bind(socket, %{family: :inet6, addr: local, port: 0})
 
 peer = %{family: :inet6, addr: remote, port: 443}
@@ -175,9 +180,24 @@ returns `{:error, :closed}`. Reset remains `:connection_reset`. If a timeout or
 error follows partial progress, send returns the unsent remainder and receive
 returns accumulated data in `{reason, continuation}`.
 
-Each TCP socket has fixed 4096-byte native RX and TX buffers. Automatic ports
-come from the bounded `49152..50175` range. Bind reservations are unique within
-one address family, so one dual-family stack may bind the same port once for
+Each TCP socket allocates fixed-size native RX and TX buffers when it opens.
+Socket-style `rcvbuf` and `sndbuf` select the respective capacities from 1 KiB
+through 1 MiB; both default to 64 KiB and cannot be resized later. The inet
+adapter exposes the corresponding `gen_tcp` names, `recbuf` and `sndbuf`.
+Accepted sockets inherit the listener's capacities, including newly replenished
+listener-pool members. `SmolNet.stack_info/1` reports the defaults and the
+configured capacities of each logical TCP socket under
+`native.result.tcp_buffer_bytes`.
+
+The two buffers remain allocated while a live socket is closing. Listener-pool
+members also allocate both buffers, and all of them count toward the stack's
+64-native-socket cap. The defaults therefore permit at most 8 MiB of TCP buffer
+memory per full stack; configuring both directions to 1 MiB raises that bound
+to 128 MiB. Native calls still copy at most 64 KiB per bounded call, so a larger
+buffer fills or drains over multiple polls.
+
+Automatic ports come from the bounded `49152..50175` range. Bind reservations
+are unique within one address family, so one dual-family stack may bind the same port once for
 IPv4 and once for IPv6; accepted children retain their listener's local port.
 Link-local `fe80::/10` endpoints require a positive integer `scope_id`; global
 addresses use scope zero. The native layer never stores arbitrary unsent
@@ -332,7 +352,8 @@ needs no peer.
 
 The same options can create a server. `backlog` defaults to 5 and accepts
 values in `1..128`; accepted sockets inherit the listener's supported active,
-mode, packet, packet-size, receive-buffer, and send-timeout options.
+mode, packet, packet-size, adapter-buffer, native `recbuf`/`sndbuf`, and
+send-timeout options.
 
 ```elixir
 server_options = [{:backlog, 16} | options]
@@ -349,12 +370,16 @@ The adapter supports `:binary` and `:list`, packet modes `:raw`, `:line`, `1`,
 `{:tcp_passive, socket}` when exhausted. Active delivery is limited to 16
 native reads or logical packets per mailbox turn.
 
-The receive buffer and `packet_size` default to 65,536 bytes and each is capped
-at 1 MiB. Oversized frames return `:emsgsize` and close the socket because the
-stream cannot be resynchronized. Passive raw receives larger than the current
-receive bound also return `:emsgsize`. One read and one write may proceed at
-the same time; a second operation in the same direction returns `:busy`.
-`send_timeout` and `send_timeout_close` control a blocked adapter send.
+The adapter `buffer` and `packet_size` default to 65,536 bytes and each is
+capped at 1 MiB. The separate native `recbuf` and `sndbuf` options default to
+65,536 bytes, accept 1 KiB through 1 MiB at connect or listen time, and return
+`:einval` from `setopts` because smoltcp cannot resize a live TCP socket.
+As with inet, setting `recbuf` also raises `buffer` to at least that size unless
+a later `buffer` option explicitly lowers it.
+Oversized frames return `:emsgsize` and close the socket because the stream
+cannot be resynchronized. One read and one write may proceed at the same time;
+a second operation in the same direction returns `:busy`. `send_timeout` and
+`send_timeout_close` control a blocked adapter send.
 
 Each OTP socket is a temporary process under its stack bundle. The controlling
 process owns active messages, and `:gen_tcp.controlling_process/2` transfers
@@ -436,7 +461,9 @@ the wrong lifecycle phase, and any option not listed as supported return
 | `:active` | `false`, `true`, `:once`, or `1..32767` | supported | same | supported |
 | `:packet` | `:raw`, `:line`, `1`, `2`, or `4` | supported | unsupported | unsupported |
 | `:packet_size` | `0..1048576` | supported | unsupported | unsupported |
-| `:buffer` / `:recbuf` | `1..1048576` | supported | supported | supported |
+| `:buffer` | `1..1048576` | supported | `1..1048576` | supported |
+| `:recbuf` | `1024..1048576` | fixed | `1..1048576` | supported |
+| `:sndbuf` | `1024..1048576` | fixed | unsupported | unsupported |
 | `:send_timeout` / `:send_timeout_close` | supported | supported | unsupported | unsupported |
 | `:ip` / `:ifaddr` / `:port` | supported | fixed | supported | fixed |
 | `:backlog` | listen only, `1..128` | fixed | unsupported | unsupported |

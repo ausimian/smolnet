@@ -4,6 +4,7 @@ defmodule SmolNet.InetBackend.Options do
   alias SmolNet.Stack.Ref
 
   @default_buffer 65_536
+  @min_tcp_buffer 1_024
   @max_buffer 1_048_576
   @max_timeout 4_294_967_295
   @default_backlog 5
@@ -17,6 +18,8 @@ defmodule SmolNet.InetBackend.Options do
             packet: :raw,
             packet_size: @default_buffer,
             buffer: @default_buffer,
+            recbuf: @default_buffer,
+            sndbuf: @default_buffer,
             send_timeout: :infinity,
             send_timeout_close: false,
             bind_address: nil,
@@ -35,6 +38,8 @@ defmodule SmolNet.InetBackend.Options do
           packet: packet(),
           packet_size: pos_integer(),
           buffer: pos_integer(),
+          recbuf: pos_integer(),
+          sndbuf: pos_integer(),
           send_timeout: timeout(),
           send_timeout_close: boolean(),
           bind_address: :inet.ip_address() | nil,
@@ -126,7 +131,17 @@ defmodule SmolNet.InetBackend.Options do
   @spec get_udp(t(), list()) :: {:ok, list()} | {:error, atom()}
   def get_udp(%__MODULE__{} = options, names) when is_list(names) do
     if Enum.all?(names, &(&1 in [:active, :mode, :buffer, :recbuf])) do
-      get(options, names)
+      values =
+        Enum.map(names, fn
+          :recbuf ->
+            {:recbuf, options.buffer}
+
+          name ->
+            {:ok, value} = option_value(options, name)
+            value
+        end)
+
+      {:ok, values}
     else
       {:error, :einval}
     end
@@ -222,8 +237,26 @@ defmodule SmolNet.InetBackend.Options do
     {:ok, %{options | packet_size: size}}
   end
 
-  defp put_option(options, {name, size}, _context)
-       when name in [:buffer, :recbuf] and is_integer(size) and size in 1..@max_buffer do
+  defp put_option(options, {:buffer, size}, _context)
+       when is_integer(size) and size in 1..@max_buffer do
+    {:ok, %{options | buffer: size}}
+  end
+
+  defp put_option(options, {:recbuf, size}, context)
+       when context in [:connect, :listen] and is_integer(size) and
+              size in @min_tcp_buffer..@max_buffer do
+    {:ok, %{options | buffer: max(options.buffer, size), recbuf: size}}
+  end
+
+  defp put_option(options, {:sndbuf, size}, context)
+       when context in [:connect, :listen] and is_integer(size) and
+              size in @min_tcp_buffer..@max_buffer do
+    {:ok, %{options | sndbuf: size}}
+  end
+
+  defp put_option(options, {:recbuf, size}, context)
+       when context in [:udp_open, :udp_runtime] and is_integer(size) and
+              size in 1..@max_buffer do
     {:ok, %{options | buffer: size}}
   end
 
@@ -383,7 +416,8 @@ defmodule SmolNet.InetBackend.Options do
   defp option_value(options, :packet), do: {:ok, {:packet, options.packet}}
   defp option_value(options, :packet_size), do: {:ok, {:packet_size, options.packet_size}}
   defp option_value(options, :buffer), do: {:ok, {:buffer, options.buffer}}
-  defp option_value(options, :recbuf), do: {:ok, {:recbuf, options.buffer}}
+  defp option_value(options, :recbuf), do: {:ok, {:recbuf, options.recbuf}}
+  defp option_value(options, :sndbuf), do: {:ok, {:sndbuf, options.sndbuf}}
   defp option_value(options, :send_timeout), do: {:ok, {:send_timeout, options.send_timeout}}
   defp option_value(options, :backlog), do: {:ok, {:backlog, options.backlog}}
 

@@ -22,6 +22,9 @@ defmodule SmolNet.Stack do
   # invocations rather than work units because a runtime deadline can expire
   # before a cleanup unit; its purpose is to bound a non-convergent fault.
   @shutdown_continuation_limit 1_024
+  @tcp_default_buffer_bytes 65_536
+  @tcp_min_buffer_bytes 1_024
+  @tcp_max_buffer_bytes 1_048_576
 
   @type limits :: %{
           bytes_copied: pos_integer(),
@@ -69,14 +72,38 @@ defmodule SmolNet.Stack do
   @doc false
   @spec socket_open(term(), :inet | :inet6, :stream | :datagram) ::
           {:ok, Socket.t()} | {:error, atom()}
+  def socket_open(stack, family, :stream),
+    do:
+      socket_open(
+        stack,
+        family,
+        :stream,
+        @tcp_default_buffer_bytes,
+        @tcp_default_buffer_bytes
+      )
+
   def socket_open(%Ref{stack: stack}, family, kind)
-      when family in [:inet, :inet6] and kind in [:stream, :datagram] do
+      when family in [:inet, :inet6] and kind == :datagram do
     GenServer.call(stack, {:socket_open, family, kind})
   catch
     :exit, _reason -> {:error, :closed}
   end
 
   def socket_open(_stack, _family, _kind), do: {:error, :invalid_options}
+
+  @spec socket_open(term(), :inet | :inet6, :stream, pos_integer(), pos_integer()) ::
+          {:ok, Socket.t()} | {:error, atom()}
+  def socket_open(%Ref{stack: stack}, family, :stream, rcvbuf, sndbuf)
+      when family in [:inet, :inet6] and is_integer(rcvbuf) and is_integer(sndbuf) and
+             rcvbuf in @tcp_min_buffer_bytes..@tcp_max_buffer_bytes and
+             sndbuf in @tcp_min_buffer_bytes..@tcp_max_buffer_bytes do
+    GenServer.call(stack, {:socket_open, family, :stream, rcvbuf, sndbuf})
+  catch
+    :exit, _reason -> {:error, :closed}
+  end
+
+  def socket_open(_stack, _family, _kind, _rcvbuf, _sndbuf),
+    do: {:error, :invalid_options}
 
   @doc false
   @spec socket_bind(Socket.t(), map()) :: :ok | {:error, atom()}
@@ -513,6 +540,15 @@ defmodule SmolNet.Stack do
     |> reply_native(
       state,
       fn identity -> {:ok, Socket.new(self(), identity, family, kind)} end,
+      :preserve_timer
+    )
+  end
+
+  def handle_call({:socket_open, family, :stream, rcvbuf, sndbuf}, _from, state) do
+    state.native_module.tcp_open(state.native, family, rcvbuf, sndbuf)
+    |> reply_native(
+      state,
+      fn identity -> {:ok, Socket.new(self(), identity, family, :stream)} end,
       :preserve_timer
     )
   end

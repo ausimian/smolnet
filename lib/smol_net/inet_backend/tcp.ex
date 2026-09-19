@@ -232,7 +232,12 @@ defmodule SmolNet.InetBackend.Tcp do
   def init(%{owner: owner, role: :listener, options: %Options{} = options}) do
     data = base_data(owner, options, :listener, nil, nil)
 
-    with {:ok, socket} <- SmolNet.open(options.family, :stream, :tcp, stack: options.stack),
+    with {:ok, socket} <-
+           SmolNet.open(options.family, :stream, :tcp,
+             stack: options.stack,
+             rcvbuf: options.recbuf,
+             sndbuf: options.sndbuf
+           ),
          :ok <- Stack.socket_watch_owner(socket, self()),
          :ok <- SmolNet.bind(socket, listener_endpoint(options)),
          :ok <- SmolNet.listen(socket, options.backlog) do
@@ -718,7 +723,11 @@ defmodule SmolNet.InetBackend.Tcp do
   end
 
   defp handle_continue(data, :open_and_connect) do
-    case SmolNet.open(data.options.family, :stream, :tcp, stack: data.stack) do
+    case SmolNet.open(data.options.family, :stream, :tcp,
+           stack: data.stack,
+           rcvbuf: data.options.recbuf,
+           sndbuf: data.options.sndbuf
+         ) do
       {:ok, socket} ->
         data = %{data | low_socket: socket}
 

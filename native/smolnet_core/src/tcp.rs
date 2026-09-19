@@ -9,7 +9,9 @@ use smoltcp::wire::{IpAddress, IpEndpoint, IpListenEndpoint, Ipv4Address, Ipv6Ad
 use crate::socket_table::SocketError;
 use crate::waiter::SocketIdentity;
 
-pub const BUFFER_BYTES: usize = 4 * 1024;
+pub const DEFAULT_BUFFER_BYTES: usize = 64 * 1024;
+pub const MIN_BUFFER_BYTES: usize = 1024;
+pub const MAX_BUFFER_BYTES: usize = 1024 * 1024;
 pub const CONNECT_TIMEOUT_MILLIS: u64 = 30_000;
 pub const CLOSE_TIMEOUT_MILLIS: u64 = 30_000;
 pub const EPHEMERAL_PORT_FIRST: u16 = 49_152;
@@ -182,6 +184,12 @@ impl ConnectFailure {
 }
 
 #[derive(Clone, Copy, Debug)]
+pub struct TcpBufferSizes {
+    pub rcvbuf: usize,
+    pub sndbuf: usize,
+}
+
+#[derive(Clone, Copy, Debug)]
 pub struct TcpRecord {
     pub identity: SocketIdentity,
     pub handle: SocketHandle,
@@ -195,6 +203,8 @@ pub struct TcpRecord {
     pub write_shutdown: bool,
     pub close_deadline: Option<Instant>,
     pub accepted: bool,
+    pub rcvbuf: usize,
+    pub sndbuf: usize,
 }
 
 #[derive(Debug)]
@@ -207,6 +217,8 @@ pub struct ListenerRecord {
     pub pool_target: usize,
     pub pool: BTreeSet<SocketHandle>,
     pub accepted: VecDeque<SocketIdentity>,
+    pub rcvbuf: usize,
+    pub sndbuf: usize,
 }
 
 impl ListenerRecord {
@@ -217,6 +229,7 @@ impl ListenerRecord {
         local: IpEndpoint,
         backlog: usize,
         handles: impl IntoIterator<Item = SocketHandle>,
+        buffer_sizes: TcpBufferSizes,
     ) -> Self {
         Self {
             identity,
@@ -227,12 +240,20 @@ impl ListenerRecord {
             pool_target: backlog.min(LISTENER_POOL_MAX),
             pool: handles.into_iter().collect(),
             accepted: VecDeque::with_capacity(backlog),
+            rcvbuf: buffer_sizes.rcvbuf,
+            sndbuf: buffer_sizes.sndbuf,
         }
     }
 }
 
 impl TcpRecord {
-    pub fn new(identity: SocketIdentity, handle: SocketHandle, family: AddressFamily) -> Self {
+    pub fn new(
+        identity: SocketIdentity,
+        handle: SocketHandle,
+        family: AddressFamily,
+        rcvbuf: usize,
+        sndbuf: usize,
+    ) -> Self {
         Self {
             identity,
             handle,
@@ -246,6 +267,8 @@ impl TcpRecord {
             write_shutdown: false,
             close_deadline: None,
             accepted: false,
+            rcvbuf,
+            sndbuf,
         }
     }
 
@@ -255,6 +278,8 @@ impl TcpRecord {
         local: IpEndpoint,
         remote: IpEndpoint,
         scope_id: u32,
+        rcvbuf: usize,
+        sndbuf: usize,
     ) -> Self {
         Self {
             identity,
@@ -269,6 +294,8 @@ impl TcpRecord {
             write_shutdown: false,
             close_deadline: None,
             accepted: true,
+            rcvbuf,
+            sndbuf,
         }
     }
 }
@@ -277,11 +304,24 @@ fn ipv4_mapped(octets: &[u8; 16]) -> bool {
     octets[..10].iter().all(|byte| *byte == 0) && octets[10..12] == [0xff, 0xff]
 }
 
-pub fn socket() -> tcp::Socket<'static> {
-    tcp::Socket::new(
-        tcp::SocketBuffer::new(vec![0; BUFFER_BYTES]),
-        tcp::SocketBuffer::new(vec![0; BUFFER_BYTES]),
-    )
+pub fn valid_buffer_bytes(bytes: usize) -> bool {
+    (MIN_BUFFER_BYTES..=MAX_BUFFER_BYTES).contains(&bytes)
+}
+
+pub fn socket(rcvbuf: usize, sndbuf: usize) -> Result<tcp::Socket<'static>, SocketError> {
+    if !valid_buffer_bytes(rcvbuf) || !valid_buffer_bytes(sndbuf) {
+        return Err(SocketError::InvalidOptions);
+    }
+
+    Ok(tcp::Socket::new(
+        tcp::SocketBuffer::new(vec![0; rcvbuf]),
+        tcp::SocketBuffer::new(vec![0; sndbuf]),
+    ))
+}
+
+pub fn default_socket() -> tcp::Socket<'static> {
+    socket(DEFAULT_BUFFER_BYTES, DEFAULT_BUFFER_BYTES)
+        .expect("the TCP default buffer size is within the validated range")
 }
 
 pub fn allocate_ephemeral(
@@ -313,16 +353,25 @@ mod tests {
     use std::collections::BTreeSet;
 
     use super::{
-        BUFFER_BYTES, EPHEMERAL_PORT_FIRST, EPHEMERAL_PORT_LAST, TcpEndpoint, allocate_ephemeral,
-        socket,
+        DEFAULT_BUFFER_BYTES, EPHEMERAL_PORT_FIRST, EPHEMERAL_PORT_LAST, MAX_BUFFER_BYTES,
+        MIN_BUFFER_BYTES, TcpEndpoint, allocate_ephemeral, socket,
     };
     use crate::socket_table::SocketError;
 
     #[test]
-    fn tcp_buffers_have_fixed_bounded_capacity() {
-        let socket = socket();
-        assert_eq!(socket.recv_capacity(), BUFFER_BYTES);
-        assert_eq!(socket.send_capacity(), BUFFER_BYTES);
+    fn tcp_buffers_have_configurable_bounded_capacity() {
+        let configured = socket(32 * 1024, 96 * 1024).unwrap();
+        assert_eq!(configured.recv_capacity(), 32 * 1024);
+        assert_eq!(configured.send_capacity(), 96 * 1024);
+
+        assert_eq!(
+            socket(MIN_BUFFER_BYTES - 1, DEFAULT_BUFFER_BYTES).unwrap_err(),
+            SocketError::InvalidOptions
+        );
+        assert_eq!(
+            socket(DEFAULT_BUFFER_BYTES, MAX_BUFFER_BYTES + 1).unwrap_err(),
+            SocketError::InvalidOptions
+        );
     }
 
     #[test]
