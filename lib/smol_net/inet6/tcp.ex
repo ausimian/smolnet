@@ -1,13 +1,13 @@
-defmodule SmolNet.InetBackend.Tcp do
+defmodule SmolNet.Inet6.Tcp do
   @moduledoc """
-  TCP adapter for Erlang `:gen_tcp` and `:inet`.
+  IPv6 TCP callback and shared adapter for Erlang `:gen_tcp` and `:inet`.
 
   Select this callback with the `:tcp_module` option and pass the target stack
   with the `:smolnet_stack` option. Each returned OTP socket is backed by one
   temporary `:gen_statem` child of that stack's inet supervisor.
 
   This module is the IPv6 callback and shared socket implementation. Use
-  `SmolNet.InetBackend.Tcp4` as the callback for IPv4. File descriptors and
+  `SmolNet.Inet.Tcp` as the callback for IPv4. File descriptors and
   packet modes other than raw, line, 1, 2, and 4 fail explicitly.
   """
 
@@ -25,7 +25,7 @@ defmodule SmolNet.InetBackend.Tcp do
   @max_active_deliveries 16
   @max_timeout 4_294_967_295
 
-  @type socket_term :: {:"$inet", __MODULE__, pid()}
+  @type socket_term :: {:"$inet", SmolNet.Inet.Tcp | __MODULE__, pid()}
 
   # OTP TCP callback entry points
 
@@ -662,7 +662,7 @@ defmodule SmolNet.InetBackend.Tcp do
     child = child_spec(%{owner: owner, role: :listener, options: options})
 
     case StackSupervisor.start_inet_backend(options.stack, child) do
-      {:ok, pid} -> {:ok, module_socket(pid)}
+      {:ok, pid} -> {:ok, module_socket(pid, options.family)}
       {:error, reason} -> {:error, start_error(reason)}
     end
   catch
@@ -673,7 +673,7 @@ defmodule SmolNet.InetBackend.Tcp do
     child = child_spec(%{owner: owner, accepted_socket: socket, options: options})
 
     case StackSupervisor.start_inet_backend(options.stack, child) do
-      {:ok, pid} -> {:ok, module_socket(pid)}
+      {:ok, pid} -> {:ok, module_socket(pid, options.family)}
       {:error, reason} -> {:error, start_error(reason)}
     end
   catch
@@ -693,7 +693,7 @@ defmodule SmolNet.InetBackend.Tcp do
       stack_monitor: Process.monitor(stack_pid),
       options: options,
       endpoint: endpoint,
-      public_socket: module_socket(self()),
+      public_socket: module_socket(self(), options.family),
       low_socket: low_socket,
       connect_result: nil,
       connect_select: nil,
@@ -1438,9 +1438,13 @@ defmodule SmolNet.InetBackend.Tcp do
     if family in options, do: options, else: [family | options]
   end
 
-  defp module_socket(pid), do: {:"$inet", __MODULE__, pid}
+  defp module_socket(pid, :inet), do: {:"$inet", SmolNet.Inet.Tcp, pid}
+  defp module_socket(pid, :inet6), do: {:"$inet", __MODULE__, pid}
 
-  defp socket_pid({:"$inet", __MODULE__, pid}) when is_pid(pid), do: pid
+  defp socket_pid({:"$inet", module, pid})
+       when module in [SmolNet.Inet.Tcp, __MODULE__] and is_pid(pid),
+       do: pid
+
   defp socket_pid(_socket), do: nil
 
   defp socket_call(socket, request) do

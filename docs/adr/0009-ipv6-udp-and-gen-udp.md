@@ -39,7 +39,7 @@ Elixir rather than the native stack.
 - UDP connect stores a peer after bind and route validation. Connected sends
   must use that peer, `peername` reports it, and receive discards datagrams from
   other sources with a scan bounded by the 16-entry packet ring.
-- `SmolNet.InetBackend.Udp` is both the thin IPv6 OTP callback and the
+- `SmolNet.Inet6.Udp` is both the thin IPv6 OTP callback and the
   `:gen_statem` implementation for each socket. `init/1` installs only local
   state and monitors; open, owner registration, and bind begin in an internal
   event. Each adapter is a temporary child of its stack's anonymous inet

@@ -12,7 +12,7 @@
   )
 
 options = [
-  {:tcp_module, SmolNet.InetBackend.Tcp4},
+  {:tcp_module, SmolNet.Inet.Tcp},
   {:smolnet_stack, stack},
   :inet,
   :binary,

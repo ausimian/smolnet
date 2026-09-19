@@ -632,7 +632,8 @@ semantics.
 - TCP and UDP sockets share the same `SocketSet` and stack-driving machinery.
 - IPv4 and IPv6 UDP use one native record type, waiter path, and adapter state
   machine. Family is immutable per socket and is validated before native
-  mutation; the IPv4 `Udp4` callback only selects `:inet` resolution.
+  mutation; the IPv4 `SmolNet.Inet.Udp` callback only selects `:inet`
+  resolution.
 - UDP preserves datagram boundaries and source/destination metadata.
 - `sendto` is all-or-error at the public datagram level unless target OTP
   semantics require another explicit convention; it must not expose a partial

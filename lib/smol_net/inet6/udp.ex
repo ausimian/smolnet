@@ -1,13 +1,13 @@
-defmodule SmolNet.InetBackend.Udp do
+defmodule SmolNet.Inet6.Udp do
   @moduledoc """
-  Shared UDP adapter for Erlang `:gen_udp` and `:inet`.
+  IPv6 UDP callback and shared adapter for Erlang `:gen_udp` and `:inet`.
 
-  Select this callback with `{:udp_module, SmolNet.InetBackend.Udp}` and pass
+  Select this callback with `{:udp_module, SmolNet.Inet6.Udp}` and pass
   the target stack with `{:smolnet_stack, stack}`. Each returned OTP socket is
   backed by one temporary `:gen_statem` child of the stack's inet supervisor.
 
-  `SmolNet.InetBackend.Udp` is the IPv6 callback. The IPv4 callback
-  `SmolNet.InetBackend.Udp4` selects the other address family and delegates its
+  `SmolNet.Inet6.Udp` is the IPv6 callback. The IPv4 callback
+  `SmolNet.Inet.Udp` selects the other address family and delegates its
   socket operations here, so both families have identical bounded behaviour.
 
   Datagram boundaries are preserved. Ancillary data, multicast, and file
@@ -27,7 +27,7 @@ defmodule SmolNet.InetBackend.Udp do
   @max_active_deliveries 16
   @max_timeout 4_294_967_295
 
-  @type socket_term :: {:"$inet", __MODULE__, pid()}
+  @type socket_term :: {:"$inet", SmolNet.Inet.Udp | __MODULE__, pid()}
 
   # OTP UDP callback entry points
 
@@ -216,7 +216,7 @@ defmodule SmolNet.InetBackend.Udp do
       stack_pid: stack_pid,
       stack_monitor: Process.monitor(stack_pid),
       options: options,
-      public_socket: module_socket(self()),
+      public_socket: module_socket(self(), options.family),
       low_socket: nil,
       peer: nil,
       open_from: nil,
@@ -837,9 +837,13 @@ defmodule SmolNet.InetBackend.Udp do
   defp endpoint_result({:ok, %{addr: address, port: port}}), do: {:ok, {address, port}}
   defp endpoint_result({:error, reason}), do: {:error, translate_reason(reason)}
 
-  defp module_socket(pid), do: {:"$inet", __MODULE__, pid}
+  defp module_socket(pid, :inet), do: {:"$inet", SmolNet.Inet.Udp, pid}
+  defp module_socket(pid, :inet6), do: {:"$inet", __MODULE__, pid}
 
-  defp socket_pid({:"$inet", __MODULE__, pid}) when is_pid(pid), do: pid
+  defp socket_pid({:"$inet", module, pid})
+       when module in [SmolNet.Inet.Udp, __MODULE__] and is_pid(pid),
+       do: pid
+
   defp socket_pid(_socket), do: nil
 
   defp socket_call(socket, request) do

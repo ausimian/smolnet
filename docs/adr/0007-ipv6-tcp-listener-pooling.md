@@ -46,7 +46,7 @@ invariants.
   Children already returned by `accept` are independent and remain usable.
   Stack shutdown drains listener and connected state together; stale or late
   readiness and packets cannot address a replacement identity.
-- `SmolNet.InetBackend.Tcp` uses one adapter state for a listener and starts a
+- `SmolNet.Inet6.Tcp` uses one adapter state for a listener and starts a
   separate temporary connected-stream adapter for every accepted child. The
   process calling `:gen_tcp.accept/2` initially owns that child. Supported
   active, mode, packet, packet-size, buffer, and send-timeout options are

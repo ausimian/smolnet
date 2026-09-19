@@ -14,7 +14,7 @@ registered stack or sharing mutable state between logical sockets.
 
 ## Decision
 
-- `SmolNet.InetBackend.Tcp` is both the thin OTP callback module and a
+- `SmolNet.Inet6.Tcp` is both the thin OTP callback module and a
   per-socket `:gen_statem`. OTP socket terms have the callback form
   `{'$inet', module, pid}`. Each adapter is a temporary child of its stack's
   anonymous inet-backend supervisor and starts bounded open/connect work only

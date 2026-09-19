@@ -15,14 +15,14 @@ Use matching callback and family options:
 
 | Family | Callback | Family option |
 | --- | --- | --- |
-| IPv4 | `SmolNet.InetBackend.Tcp4` | `:inet` |
-| IPv6 | `SmolNet.InetBackend.Tcp` | `:inet6` |
+| IPv4 | `SmolNet.Inet.Tcp` | `:inet` |
+| IPv6 | `SmolNet.Inet6.Tcp` | `:inet6` |
 
 For example, these are passive binary IPv4 options:
 
 ```elixir
 options = [
-  {:tcp_module, SmolNet.InetBackend.Tcp4},
+  {:tcp_module, SmolNet.Inet.Tcp},
   {:smolnet_stack, stack},
   :inet,
   :binary,
@@ -44,7 +44,7 @@ stack's packets straight back to the same stack:
   SmolNet.Loopback.start_link(addresses: [{{127, 0, 0, 1}, 8}])
 
 options = [
-  {:tcp_module, SmolNet.InetBackend.Tcp4},
+  {:tcp_module, SmolNet.Inet.Tcp},
   {:smolnet_stack, stack},
   :inet,
   :binary,
@@ -83,7 +83,7 @@ selected family:
 
 ```elixir
 ipv6_options = [
-  {:tcp_module, SmolNet.InetBackend.Tcp},
+  {:tcp_module, SmolNet.Inet6.Tcp},
   {:smolnet_stack, stack},
   :inet6,
   :binary,

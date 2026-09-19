@@ -41,8 +41,8 @@ mutate stack state.
   listener's four bounded pool members are considered. Half-open and connected
   members already have concrete tuples and are never retargeted. Public
   `sockname` continues to report the requested wildcard endpoint.
-- The existing `SmolNet.InetBackend.Tcp` remains the IPv6 OTP callback and the
-  shared adapter process implementation. `SmolNet.InetBackend.Tcp4` is a thin
+- `SmolNet.Inet6.Tcp` is the IPv6 OTP callback and the shared adapter process
+  implementation. `SmolNet.Inet.Tcp` is a thin
   IPv4 callback that delegates address parsing to OTP's `:inet_tcp`, selects
   `:inet`, and returns sockets backed by the shared adapter. Framing, active
   mode, ownership, deadlines, and lifecycle policy therefore do not fork.

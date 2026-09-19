@@ -1,7 +1,7 @@
 defmodule SmolNet.UdpTest do
   use ExUnit.Case, async: false
 
-  alias SmolNet.InetBackend.Udp
+  alias SmolNet.Inet6.Udp
   alias SmolNet.Test.RawIpLink
 
   @server {0xFD00, 0, 0, 0, 0, 0, 0, 1}
@@ -275,9 +275,13 @@ defmodule SmolNet.UdpTest do
   test "gen_udp callback supports passive, connected, and active delivery" do
     {server_stack, client_stack, _link} = stacks()
 
-    assert {:ok, server} = :gen_udp.open(0, options(server_stack))
+    assert {:ok, server = {:"$inet", Udp, _server_pid}} =
+             :gen_udp.open(0, options(server_stack))
+
     assert {:ok, {{0, 0, 0, 0, 0, 0, 0, 0}, server_port}} = :inet.sockname(server)
-    assert {:ok, client} = :gen_udp.open(0, options(client_stack))
+
+    assert {:ok, client = {:"$inet", Udp, _client_pid}} =
+             :gen_udp.open(0, options(client_stack))
 
     assert :ok = :gen_udp.send(client, @server, server_port, "passive")
     assert {:ok, {@client, client_port, "passive"}} = :gen_udp.recv(server, 0, 1_000)

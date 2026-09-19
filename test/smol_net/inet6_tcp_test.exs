@@ -1,7 +1,7 @@
-defmodule SmolNet.InetBackendTcpTest do
+defmodule SmolNet.Inet6TcpTest do
   use ExUnit.Case, async: false
 
-  alias SmolNet.InetBackend.Tcp
+  alias SmolNet.Inet6.Tcp
   alias SmolNet.Stack.Ref
   alias SmolNet.Test.IPv6TcpPeer
 
