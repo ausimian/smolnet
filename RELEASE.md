@@ -59,6 +59,12 @@
   stack is also returned as child information when a loopback link is started
   under a supervisor.
 
+- The `:gen_tcp` and `:gen_udp` callback modules now follow their OTP address
+  family names. Use `SmolNet.Inet.Tcp` and `SmolNet.Inet.Udp` with `:inet`, or
+  `SmolNet.Inet6.Tcp` and `SmolNet.Inet6.Udp` with `:inet6`. These replace the
+  former `SmolNet.InetBackend.Tcp4`, `SmolNet.InetBackend.Udp4`,
+  `SmolNet.InetBackend.Tcp`, and `SmolNet.InetBackend.Udp` names, respectively.
+
 - The README is now a concise introduction to SmolNet's motivation, raw-IP link
   boundary, and available interfaces. Detailed `:gen_tcp`, `:gen_udp`, and
   low-level socket usage now lives in dedicated ExDoc guides, while development

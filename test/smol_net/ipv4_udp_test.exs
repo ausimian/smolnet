@@ -1,8 +1,8 @@
 defmodule SmolNet.IPv4UdpTest do
   use ExUnit.Case, async: false
 
-  alias SmolNet.InetBackend.Udp
-  alias SmolNet.InetBackend.Udp4
+  alias SmolNet.Inet.Udp, as: InetUdp
+  alias SmolNet.Inet6.Udp, as: Inet6Udp
   alias SmolNet.Test.IPv6Link
   alias SmolNet.Test.RawIpLink
   alias SmolNet.Test.Timing
@@ -479,10 +479,15 @@ defmodule SmolNet.IPv4UdpTest do
     test "IPv4 gen_udp callback contract works via #{inspect(link_module)}" do
       {server_stack, client_stack, _link} = ipv4_stacks(@link_module)
 
-      assert Udp4.family() == :inet
-      assert {:ok, server} = :gen_udp.open(0, udp_options(server_stack))
+      assert InetUdp.family() == :inet
+
+      assert {:ok, server = {:"$inet", InetUdp, _server_pid}} =
+               :gen_udp.open(0, udp_options(server_stack))
+
       assert {:ok, {{0, 0, 0, 0}, server_port}} = :inet.sockname(server)
-      assert {:ok, client} = :gen_udp.open(0, udp_options(client_stack))
+
+      assert {:ok, client = {:"$inet", InetUdp, _client_pid}} =
+               :gen_udp.open(0, udp_options(client_stack))
 
       assert :ok = :gen_udp.send(client, @server4, server_port, "address")
       assert {:ok, {@client4, client_port, "address"}} = :gen_udp.recv(server, 0, @wait_1s)
@@ -504,8 +509,8 @@ defmodule SmolNet.IPv4UdpTest do
 
       assert {:error, :einval} = :gen_udp.send(client, %{}, server_port, "bad host")
       assert {:error, :einval} = :gen_udp.send(client, @server4, %{}, "bad port")
-      assert {:error, :einval} = Udp.connect(client, %{}, server_port)
-      assert is_map(Udp.info(client))
+      assert {:error, :einval} = InetUdp.connect(client, %{}, server_port)
+      assert is_map(InetUdp.info(client))
 
       assert {:error, :eafnosupport} =
                :gen_udp.send(
@@ -551,7 +556,7 @@ defmodule SmolNet.IPv4UdpTest do
       assert {:error, :einval} = :gen_udp.open(0, udp_options(server_stack, packet: 2))
 
       assert {:error, :eafnosupport} =
-               Udp4.open(0, [
+               InetUdp.open(0, [
                  :inet6,
                  {:smolnet_stack, server_stack},
                  :binary,
@@ -580,7 +585,7 @@ defmodule SmolNet.IPv4UdpTest do
       refute_receive {:udp, ^server, _address, _port, _packet}, @idle_20ms
 
       send(new_owner, :stop)
-      assert_eventually(fn -> Udp.info(server) == {:error, :closed} end)
+      assert_eventually(fn -> InetUdp.info(server) == {:error, :closed} end)
       assert :ok = :gen_udp.close(client)
     end
 
@@ -755,7 +760,7 @@ defmodule SmolNet.IPv4UdpTest do
 
   defp udp_options(stack, extra \\ []) do
     [
-      {:udp_module, Udp4},
+      {:udp_module, InetUdp},
       {:smolnet_stack, stack},
       :inet,
       :binary,
@@ -766,7 +771,7 @@ defmodule SmolNet.IPv4UdpTest do
 
   defp udp6_options(stack, extra \\ []) do
     [
-      {:udp_module, Udp},
+      {:udp_module, Inet6Udp},
       {:smolnet_stack, stack},
       :inet6,
       :binary,

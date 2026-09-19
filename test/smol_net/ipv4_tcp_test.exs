@@ -1,8 +1,8 @@
 defmodule SmolNet.IPv4TcpTest do
   use ExUnit.Case, async: false
 
-  alias SmolNet.InetBackend.Tcp
-  alias SmolNet.InetBackend.Tcp4
+  alias SmolNet.Inet.Tcp, as: InetTcp
+  alias SmolNet.Inet6.Tcp, as: Inet6Tcp
   alias SmolNet.Test.RawIpLink
 
   import Bitwise, only: [band: 2, bnot: 1]
@@ -71,7 +71,7 @@ defmodule SmolNet.IPv4TcpTest do
   test "the IPv4 gen_tcp callback supports framing, active delivery, and ownership" do
     {server_stack, client_stack, _link} = ipv4_stacks()
 
-    assert {:ok, listener} =
+    assert {:ok, listener = {:"$inet", InetTcp, _listener_pid}} =
              :gen_tcp.listen(
                0,
                server_options(server_stack, packet: 2, backlog: 2)
@@ -80,7 +80,7 @@ defmodule SmolNet.IPv4TcpTest do
     assert {:ok, {{0, 0, 0, 0}, port}} = :inet.sockname(listener)
     accept = accept_for_parent(listener)
 
-    assert {:ok, client} =
+    assert {:ok, client = {:"$inet", InetTcp, _client_pid}} =
              :gen_tcp.connect(
                @server4,
                port,
@@ -88,7 +88,7 @@ defmodule SmolNet.IPv4TcpTest do
                1_000
              )
 
-    assert {:ok, server} = Task.await(accept)
+    assert {:ok, server = {:"$inet", InetTcp, _server_pid}} = Task.await(accept)
     assert {:ok, {@server4, ^port}} = :inet.sockname(server)
     assert {:ok, {@client4, _client_port}} = :inet.peername(server)
 
@@ -122,7 +122,7 @@ defmodule SmolNet.IPv4TcpTest do
     port = 41_002
 
     ipv6_server_options = [
-      {:tcp_module, Tcp},
+      {:tcp_module, Inet6Tcp},
       {:smolnet_stack, server_stack},
       :inet6,
       :binary,
@@ -138,7 +138,7 @@ defmodule SmolNet.IPv4TcpTest do
     assert {:error, :timeout} = :gen_tcp.accept(listener6, 20)
 
     ipv6_client_options = [
-      {:tcp_module, Tcp},
+      {:tcp_module, Inet6Tcp},
       {:smolnet_stack, client_stack},
       :inet6,
       :binary,
@@ -329,7 +329,7 @@ defmodule SmolNet.IPv4TcpTest do
 
   defp server_options(stack, extra \\ []) do
     [
-      {:tcp_module, Tcp4},
+      {:tcp_module, InetTcp},
       {:smolnet_stack, stack},
       :inet,
       :binary,
@@ -341,7 +341,7 @@ defmodule SmolNet.IPv4TcpTest do
 
   defp client_options(stack, extra \\ []) do
     [
-      {:tcp_module, Tcp4},
+      {:tcp_module, InetTcp},
       {:smolnet_stack, stack},
       :inet,
       :binary,

@@ -164,8 +164,8 @@ SmolNet.Supervisor                       # name of root DynamicSupervisor
 └── SmolNet.StackSupervisor              # temporary static supervisor; module
     ├── SmolNet.Stack                    # temporary significant GenServer
     └── DynamicSupervisor                # anonymous, significant; id :inet_backends
-        ├── SmolNet.InetBackend.Tcp       # temporary gen_statem
-        ├── SmolNet.InetBackend.Udp       # temporary gen_statem
+        ├── SmolNet.Inet6.Tcp             # temporary gen_statem
+        ├── SmolNet.Inet6.Udp             # temporary gen_statem
         └── ...
 ```
 
@@ -252,9 +252,13 @@ lib/
     stack/
       ref.ex                     # opaque stack runtime reference
     socket.ex
+    inet/
+      tcp.ex                     # IPv4 gen_tcp callback
+      udp.ex                     # IPv4 gen_udp callback
+    inet6/
+      tcp.ex                     # IPv6 gen_tcp callback and shared gen_statem
+      udp.ex                     # IPv6 gen_udp callback and shared gen_statem
     inet_backend/
-      tcp.ex                     # gen_tcp backend and TCP inet gen_statem
-      udp.ex                     # gen_udp backend and UDP inet gen_statem
       options.ex
       packet.ex
 native/
@@ -1104,7 +1108,7 @@ policy in Elixir.
 
 #### Work
 
-- Implement `SmolNet.InetBackend.Tcp` as both the thin `gen_tcp` backend module
+- Implement `SmolNet.Inet6.Tcp` as both the thin `gen_tcp` backend module
   and the `gen_statem` module used by each logical TCP socket process. Keep its
   public backend entry points as thin translations into per-socket process
   calls; it does not share a module or state machine with UDP.
@@ -1130,7 +1134,7 @@ policy in Elixir.
   cannot be delivered to the wrong owner. Owner death closes the low-level
   socket.
 - Implement the OTP 27/28/29 TCP callback contract on
-  `SmolNet.InetBackend.Tcp`, including
+  `SmolNet.Inet6.Tcp`, including
   IPv6 client connect and socket-term translation. Version-gate only where
   executable contract fixtures prove a difference.
 - Match standard `{tcp, socket, data}`, `{tcp_closed, socket}`,
@@ -1162,7 +1166,7 @@ policy in Elixir.
 #### Regular review focus
 
 The sub-agent reviews the thin backend-entry-point/process boundary within
-`SmolNet.InetBackend.Tcp`, `gen_statem`
+`SmolNet.Inet6.Tcp`, `gen_statem`
 transitions, framing across chunks, active drain bounds, ownership races, OTP
 tuple compatibility, callback dispatch, and continuation isolation. Fix
 compatibility and state-machine defects; defer listeners, IPv4, extra packet
@@ -1284,14 +1288,14 @@ machinery.
   behavior.
 - Reuse generic waiter, cancellation, deadline, output, and timer paths without
   creating UDP-specific readiness machinery.
-- Implement `SmolNet.InetBackend.Udp` as both the distinct, thin `gen_udp`
+- Implement `SmolNet.Inet6.Udp` as both the distinct, thin `gen_udp`
   backend module and the `gen_statem` module used by each temporary per-socket
   process under the stack's anonymous `:inet_backends` DynamicSupervisor.
 - Implement UDP message shapes, active modes, ownership, options, and drain
   bounds in the UDP socket process while sharing narrowly scoped option,
   ownership, deadline, and error helpers with TCP where semantics truly match.
 - Implement the OTP 27/28/29 UDP callback contract on
-  `SmolNet.InetBackend.Udp` and exercise it through real `gen_udp` entry points.
+  `SmolNet.Inet6.Udp` and exercise it through real `gen_udp` entry points.
 
 #### Verification and acceptance criteria
 

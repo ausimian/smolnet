@@ -1,9 +1,11 @@
-defmodule SmolNet.InetBackendTcpTest do
+defmodule SmolNet.Inet6TcpTest do
   use ExUnit.Case, async: false
 
-  alias SmolNet.InetBackend.Tcp
+  alias SmolNet.Inet6.Tcp
   alias SmolNet.Stack.Ref
   alias SmolNet.Test.IPv6TcpPeer
+
+  import Bitwise, only: [band: 2]
 
   @client {0xFD00, 0, 0, 0, 0, 0, 0, 1}
   @peer {0xFD00, 0, 0, 0, 0, 0, 0, 2}
@@ -129,6 +131,13 @@ defmodule SmolNet.InetBackendTcpTest do
       end)
 
       :ok = :gen_tcp.close(socket)
+
+      assert_receive {:tcp_peer_egress, flags, _packet} when band(flags, 0x01) != 0, 1_000
+
+      # The call is a mailbox barrier: the peer has ACKed the FIN before the
+      # stack it replies through is stopped.
+      _stats = IPv6TcpPeer.stats(peer)
+
       :ok = SmolNet.stop_stack(stack)
     end
   end
