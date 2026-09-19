@@ -39,10 +39,8 @@ This example opens two IPv4 UDP sockets on one looped stack and sends a
 datagram between them:
 
 ```elixir
-{:ok, link} =
+{:ok, _link, stack} =
   SmolNet.Loopback.start_link(addresses: [{{127, 0, 0, 1}, 8}])
-
-stack = SmolNet.Loopback.stack(link)
 
 options = [
   {:udp_module, SmolNet.InetBackend.Udp4},

@@ -54,6 +54,11 @@
 
 ### Changed
 
+- `SmolNet.Loopback.start_link/1` now returns `{:ok, link, stack}`, exposing the
+  newly created stack without a follow-up `SmolNet.Loopback.stack/1` call. The
+  stack is also returned as child information when a loopback link is started
+  under a supervisor.
+
 - The README is now a concise introduction to SmolNet's motivation, raw-IP link
   boundary, and available interfaces. Detailed `:gen_tcp`, `:gen_udp`, and
   low-level socket usage now lives in dedicated ExDoc guides, while development

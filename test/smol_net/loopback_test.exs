@@ -90,8 +90,7 @@ defmodule SmolNet.LoopbackTest do
   end
 
   test "reaches any address the stack holds, not only conventional localhost" do
-    {:ok, link} = Loopback.start_link(addresses: [{{192, 0, 2, 1}, 24}])
-    stack = Loopback.stack(link)
+    {:ok, _link, stack} = Loopback.start_link(addresses: [{{192, 0, 2, 1}, 24}])
     server = %{family: :inet, addr: {192, 0, 2, 1}, port: 41_105}
 
     {:ok, listener} = SmolNet.open(:inet, :stream, :tcp, stack: stack)
@@ -119,8 +118,7 @@ defmodule SmolNet.LoopbackTest do
   end
 
   test "stopping the link stops the stack it loops" do
-    {:ok, link} = Loopback.start_link(addresses: @addresses)
-    stack = Loopback.stack(link)
+    {:ok, link, stack} = Loopback.start_link(addresses: @addresses)
 
     assert {:ok, _info} = SmolNet.stack_info(stack)
 
@@ -131,8 +129,7 @@ defmodule SmolNet.LoopbackTest do
   end
 
   test "stopping the stack stops the link that loops it" do
-    {:ok, link} = Loopback.start_link(addresses: @addresses)
-    stack = Loopback.stack(link)
+    {:ok, link, stack} = Loopback.start_link(addresses: @addresses)
     monitor = Process.monitor(link)
 
     assert :ok = SmolNet.stop_stack(stack)
@@ -141,15 +138,27 @@ defmodule SmolNet.LoopbackTest do
   end
 
   test "accepts a registered name for the link process" do
-    {:ok, link} = Loopback.start_link(name: :loopback_test_link, addresses: @addresses)
+    {:ok, link, stack} =
+      Loopback.start_link(name: :loopback_test_link, addresses: @addresses)
 
     assert Process.whereis(:loopback_test_link) == link
-    assert {:ok, _info} = :loopback_test_link |> Loopback.stack() |> SmolNet.stack_info()
+    assert Loopback.stack(:loopback_test_link) == stack
+    assert {:ok, _info} = SmolNet.stack_info(stack)
+  end
+
+  test "returns the stack as child information when supervised" do
+    supervisor = start_supervised!({DynamicSupervisor, strategy: :one_for_one})
+
+    assert {:ok, link, stack} =
+             DynamicSupervisor.start_child(supervisor, {Loopback, addresses: @addresses})
+
+    assert Loopback.stack(link) == stack
+    assert {:ok, _info} = SmolNet.stack_info(stack)
   end
 
   defp loopback_stack do
-    {:ok, link} = Loopback.start_link(addresses: @addresses)
-    Loopback.stack(link)
+    {:ok, _link, stack} = Loopback.start_link(addresses: @addresses)
+    stack
   end
 
   defp endpoint4(port), do: %{family: :inet, addr: @localhost4, port: port}

@@ -10,12 +10,10 @@ defmodule SmolNet.Loopback do
   it the simplest way to exercise the library in an example, a doctest, or a
   test case.
 
-      {:ok, link} =
+      {:ok, link, stack} =
         SmolNet.Loopback.start_link(
           addresses: [{{0, 0, 0, 0, 0, 0, 0, 1}, 128}, {{127, 0, 0, 1}, 8}]
         )
-
-      stack = SmolNet.Loopback.stack(link)
 
   The link owns the stack it loops. `start_link/1` accepts the same options as
   `SmolNet.start_stack/1` apart from `:egress`, which the link supplies, and
@@ -36,8 +34,8 @@ defmodule SmolNet.Loopback do
   addresses the example needs. Conventional localhost addresses work, and so
   does any other address the stack holds:
 
-      {:ok, link} = SmolNet.Loopback.start_link(addresses: [{{192, 0, 2, 1}, 24}])
-      stack = SmolNet.Loopback.stack(link)
+      {:ok, _link, stack} =
+        SmolNet.Loopback.start_link(addresses: [{{192, 0, 2, 1}, 24}])
 
       {:ok, listener} = SmolNet.open(:inet, :stream, :tcp, stack: stack)
       :ok = SmolNet.bind(listener, %{family: :inet, addr: {192, 0, 2, 1}, port: 8080})
@@ -59,19 +57,26 @@ defmodule SmolNet.Loopback do
 
   Options are the `SmolNet.start_stack/1` options, plus an optional `:name` for
   the link process itself. Supplying `:egress` is an error, because the link is
-  the stack's egress.
+  the stack's egress. Returns the link process and the stack reference as
+  `{:ok, link, stack}`.
   """
-  @spec start_link(keyword()) :: GenServer.on_start()
+  @spec start_link(keyword()) :: {:ok, pid(), Ref.t()} | :ignore | {:error, term()}
   def start_link(options) when is_list(options) do
     {name, stack_options} = Keyword.pop(options, :name)
 
-    case name do
-      nil -> GenServer.start_link(__MODULE__, stack_options)
-      name -> GenServer.start_link(__MODULE__, stack_options, name: name)
+    result =
+      case name do
+        nil -> GenServer.start_link(__MODULE__, stack_options)
+        name -> GenServer.start_link(__MODULE__, stack_options, name: name)
+      end
+
+    case result do
+      {:ok, link} -> {:ok, link, stack(link)}
+      other -> other
     end
   end
 
-  @doc "Returns the stack this link loops."
+  @doc "Returns the stack for an already-running loopback link."
   @spec stack(GenServer.server()) :: Ref.t()
   def stack(link), do: GenServer.call(link, :stack)
 
