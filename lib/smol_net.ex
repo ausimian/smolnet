@@ -53,7 +53,7 @@ defmodule SmolNet do
   `:maintenance_work`; unspecified values retain their safe defaults.
 
   `SmolNet.Loopback.start_link/1` starts a stack whose egress is a link back
-  into itself, which needs no external transport.
+  into itself, returns both references, and needs no external transport.
   """
   @spec start_stack(keyword()) :: {:ok, Stack.Ref.t()} | {:error, term()}
   defdelegate start_stack(options \\ []), to: SmolNet.StackSupervisor, as: :start_stack

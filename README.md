@@ -84,12 +84,10 @@ For a self-contained stack with no external transport, use
 `SmolNet.Loopback`. It feeds every emitted packet back into the same stack:
 
 ```elixir
-{:ok, link} =
+{:ok, _link, stack} =
   SmolNet.Loopback.start_link(
     addresses: [{{127, 0, 0, 1}, 8}, {{0, 0, 0, 0, 0, 0, 0, 1}, 128}]
   )
-
-stack = SmolNet.Loopback.stack(link)
 ```
 
 Run the complete loopback TCP example from a source checkout with:

@@ -40,10 +40,8 @@ not replace the node-wide inet backend.
 stack's packets straight back to the same stack:
 
 ```elixir
-{:ok, link} =
+{:ok, _link, stack} =
   SmolNet.Loopback.start_link(addresses: [{{127, 0, 0, 1}, 8}])
-
-stack = SmolNet.Loopback.stack(link)
 
 options = [
   {:tcp_module, SmolNet.InetBackend.Tcp4},

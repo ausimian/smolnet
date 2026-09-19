@@ -6,12 +6,10 @@
 #
 #     mix run examples/loopback.exs
 
-{:ok, link} =
+{:ok, _link, stack} =
   SmolNet.Loopback.start_link(
     addresses: [{{127, 0, 0, 1}, 8}, {{0, 0, 0, 0, 0, 0, 0, 1}, 128}]
   )
-
-stack = SmolNet.Loopback.stack(link)
 
 options = [
   {:tcp_module, SmolNet.InetBackend.Tcp4},
