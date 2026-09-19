@@ -8,6 +8,13 @@ and this project adheres to
 
 <!-- %% CHANGELOG_ENTRIES %% -->
 
+## 0.2.1 - 2026-09-19
+
+### Fixed
+
+- Documentation guide links now resolve in ExDoc's Markdown output and the
+  published package by keeping the guides at the package root.
+
 ## 0.2.0 - 2026-09-19
 
 ### Fixed
