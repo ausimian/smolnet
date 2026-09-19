@@ -102,9 +102,9 @@ SmolNet provides three interfaces over the same stack and socket machinery:
 
 | Interface | Use it when | Guide |
 | --- | --- | --- |
-| `:gen_tcp` and `:inet` | Existing code expects OTP TCP sockets, active mode, or packet framing | [Using `:gen_tcp`](guides/gen_tcp.md) |
-| `:gen_udp` and `:inet` | Existing code expects OTP UDP sockets and active or passive delivery | [Using `:gen_udp`](guides/gen_udp.md) |
-| `SmolNet` | You want explicit endpoint maps, direct timeouts, or nonblocking readiness | [Using the low-level socket API](guides/socket_api.md) |
+| `:gen_tcp` and `:inet` | Existing code expects OTP TCP sockets, active mode, or packet framing | [Using `:gen_tcp`](gen_tcp.md) |
+| `:gen_udp` and `:inet` | Existing code expects OTP UDP sockets and active or passive delivery | [Using `:gen_udp`](gen_udp.md) |
+| `SmolNet` | You want explicit endpoint maps, direct timeouts, or nonblocking readiness | [Using the low-level socket API](socket_api.md) |
 
 Both address families are supported. The OTP adapters use `SmolNet.Inet.Tcp`
 and `SmolNet.Inet.Udp` for IPv4, and `SmolNet.Inet6.Tcp` and

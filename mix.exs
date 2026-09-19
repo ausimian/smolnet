@@ -96,9 +96,9 @@ defmodule SmolNet.MixProject do
 
   defp docs do
     guides = [
-      "guides/gen_tcp.md",
-      "guides/gen_udp.md",
-      "guides/socket_api.md"
+      "gen_tcp.md",
+      "gen_udp.md",
+      "socket_api.md"
     ]
 
     [
@@ -119,7 +119,9 @@ defmodule SmolNet.MixProject do
         "checksum-*.exs",
         "examples/quickstart.exs",
         "examples/loopback.exs",
-        "guides",
+        "gen_tcp.md",
+        "gen_udp.md",
+        "socket_api.md",
         ".formatter.exs",
         "mix.exs",
         "README.md",
