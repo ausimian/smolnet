@@ -95,9 +95,16 @@ defmodule SmolNet.MixProject do
   end
 
   defp docs do
+    guides = [
+      "guides/gen_tcp.md",
+      "guides/gen_udp.md",
+      "guides/socket_api.md"
+    ]
+
     [
       main: "readme",
-      extras: ["README.md", "MAINTAINING.md", "CHANGELOG.md"],
+      extras: ["README.md" | guides] ++ ["CHANGELOG.md"],
+      groups_for_extras: [Guides: guides, Releases: ["CHANGELOG.md"]],
       source_ref: @version,
       source_url: @source_url
     ]
@@ -112,6 +119,7 @@ defmodule SmolNet.MixProject do
         "checksum-*.exs",
         "examples/quickstart.exs",
         "examples/loopback.exs",
+        "guides",
         ".formatter.exs",
         "mix.exs",
         "README.md",
