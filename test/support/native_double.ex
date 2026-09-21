@@ -34,6 +34,24 @@ defmodule SmolNet.Test.NativeDouble do
     end
   end
 
+  def stack_ingress_batch(_resource, packets, _now) do
+    test = Application.fetch_env!(:smolnet, :native_test_process)
+    send(test, {:native_stack_ingress_batch, self(), packets})
+
+    case Application.get_env(:smolnet, :native_ingress_result, :default) do
+      :default ->
+        empty_effects()
+
+      :wait ->
+        receive do
+          {:native_ingress_reply, reply} -> reply
+        end
+
+      reply ->
+        reply
+    end
+  end
+
   def stack_poll(_resource, now) do
     test = Application.fetch_env!(:smolnet, :native_test_process)
     result = Application.get_env(:smolnet, :native_poll_result, empty_effects())

@@ -158,8 +158,8 @@ Representative state:
 Its responsibilities are:
 
 - serialize all socket operations for the stack through its mailbox;
-- accept one inbound raw IP packet at a time from the stack's serialized link
-  feeder and pass it to one bounded ingress invocation;
+- accept one raw IP packet or one bounded packet batch from the stack's
+  serialized link feeder and pass it to one bounded ingress invocation;
 - emit outbound raw IP packets to the configured link-layer recipient;
 - schedule and replace the next BEAM timer from native `poll_at` data;
 - invoke a bounded native timer poll when that timer fires;
@@ -322,7 +322,8 @@ link adapter C ⇄ SmolNet.Stack C ⇄ native Stack C
 
 The boundary is deliberately two-way:
 
-1. A transport-neutral ingress function accepts one raw IP packet for a stack.
+1. A transport-neutral ingress function accepts one raw IP packet or a bounded
+   list of packets for a stack.
 2. A configured BEAM recipient receives each outbound raw IP packet, normally
    as a message, and is responsible for writing it to the actual link.
 
@@ -332,21 +333,23 @@ The public boundary should be a function rather than a transport-specific
 mailbox protocol:
 
 ```elixir
-SmolNet.Stack.ingress(stack, raw_ip_packet)
+SmolNet.ingress(stack, raw_ip_packet)
+SmolNet.ingress(stack, [raw_ip_packet, ...])
 ```
 
-This function synchronously hands the packet to the owning `SmolNet.Stack`; it
-does not call the NIF from the transport process. The packet must begin with an
-IPv4 or IPv6 header. Link framing, stream reassembly, checksums belonging to the
-link, reconnect behavior, extraction of individual IP packets, and upstream
+This function synchronously hands the input to the owning `SmolNet.Stack`; it
+does not call the NIF from the transport process. Every packet must begin with
+an IPv4 or IPv6 header. Link framing, stream reassembly, checksums belonging to
+the link, reconnect behavior, extraction of individual IP packets, and upstream
 backpressure are responsibilities of the external adapter.
 
 Each stack has exactly one serialized ingress feeder. The call waits until the
-stack validates and accepts the packet, then returns before bounded native
-processing runs in a GenServer continuation. The same feeder may have one later
-call waiting. If native `more` work remains, the stack retains that call without
-acknowledging it until immediate native polling finishes. Thus at most one packet
-is in native processing and one later packet is waiting at the stack boundary.
+stack validates and accepts one packet or atomically accepts one bounded batch,
+then returns before bounded native processing runs in a GenServer continuation.
+The same feeder may have one later call waiting. If native `more` work remains,
+the stack retains that call without acknowledging it until immediate native
+polling finishes. Thus at most one admitted call is in native processing and
+one later call is waiting at the stack boundary.
 
 ### Outbound contract
 
@@ -399,8 +402,9 @@ struct BeamDevice {
 }
 ```
 
-In practice, ingress should enqueue only the packet being processed, and egress
-collection must be bounded so no NIF call drains an unbounded amount of work.
+In practice, ingress enqueues at most the configured `input_packets` and
+`bytes_copied` limits, and egress collection is also bounded so no NIF call
+drains an unbounded amount of work.
 The native `BeamDevice` is an internal adapter between the NIF entry points and
 smoltcp; it is not the external transport abstraction.
 
@@ -426,8 +430,7 @@ mutex.
 
 ### Every NIF call is bounded
 
-- Ingress handles at most one queued packet with the bounded single-ingress
-  primitive.
+- Ingress handles at most the configured bounded packet batch.
 - Egress uses bounded polling.
 - Send copies/enqueues at most a configured chunk or the available TX capacity.
 - Receive removes at most the requested/configured amount.
@@ -707,8 +710,8 @@ Completion:
 
 ```text
 SYN/ACK raw IP packet
-  → external link adapter calls SmolNet.Stack.ingress(stack, packet)
-  → bounded Native.ingress
+  → external link adapter calls SmolNet.ingress(stack, packet)
+  → bounded native ingress
   → smoltcp transitions socket state
   → waker sets native write/state-ready bit
   → after poll, native code consumes matching waiter
@@ -800,29 +803,30 @@ are otherwise identical to TCP.
 
 ```text
 external raw-IP link adapter
-  → calls SmolNet.Stack.ingress(stack, raw_ip_packet)
-  → stack validates and accepts one packet from its serialized feeder
+  → calls SmolNet.ingress(stack, raw_ip_packet_or_bounded_batch)
+  → stack validates and atomically accepts the input from its serialized feeder
   → stack replies, then enters an ingress continuation before another message
-  → SmolNet.Stack invokes Native.ingress(stack, one_packet, now)
+  → SmolNet.Stack invokes the single-packet or batch native ingress function
   → native code try-locks stack
-  → place packet in BeamDevice RX token/path
-  → run at most one bounded ingress operation
+  → place the accepted packet(s) in the bounded BeamDevice receive queue
+  → run at most `input_packets` bounded ingress operations
   → run bounded maintenance/egress as required
   → smoltcp wakers only mark native readiness
   → collect a bounded set of outbound raw IP packets
   → drain readiness and send matching notifications
   → compute poll_at
   → unlock/return
-  → SmolNet.Stack sends one outbound message per packet to configured egress PID
+  → SmolNet.Stack sends each bounded output batch to the configured egress PID
   → SmolNet.Stack replaces its timer from poll_at
   → any native `more` work drains before a waiting feeder call is acknowledged
   → SmolNet.Stack returns to mailbox
 ```
 
-There is no native loop over all pending ingress packets. Additional packets are
-separate serialized feeder calls and NIF invocations. The feeder owns upstream
-transport backpressure, while bounded native continuations preserve scheduling
-fairness without a separate ingress queue.
+The native ingress loop is bounded by `input_packets`, `bytes_copied`, output
+capacity, and the native time/reduction budget. Unconsumed packets stay in the
+bounded receive queue and set `more`, so continuations preserve scheduling
+fairness. The feeder still owns upstream transport backpressure and only one
+feeder call is processed at a time.
 
 ### Readiness delivery and retry
 
@@ -999,7 +1003,7 @@ native/fuzz/fuzz_targets/
 Recommended planning slices:
 
 1. Define the raw-IP link contract and prove one `Medium::Ip` stack can accept
-   packets through `SmolNet.Stack.ingress/2` and emit packets as
+   packets through `SmolNet.ingress/2` and emit packets as
    transport-neutral messages with bounded polling and BEAM-scheduled timers.
 2. Add stable socket IDs, lifecycle validation, and outbound TCP open/connect.
 3. Add native waiter slots, waker-to-ready-bit plumbing, safe NIF-epilogue sends,
@@ -1023,8 +1027,8 @@ The implementation plan should include at least:
   `SmolNet.Stack`, `SmolNet.Socket`, or the native engine;
 - the `SmolNet` facade delegates each documented socket operation to
   `SmolNet.Socket` without changing its return or readiness semantics;
-- ingress accepts one complete raw IP packet through the public function and
-  never invokes the NIF in the link process;
+- ingress accepts a complete raw IP packet or bounded packet list through the
+  public function and never invokes the NIF in the link process;
 - each native outbound packet becomes one correctly addressed egress message;
 - link-recipient termination follows the configured link-down policy;
 - ingress and large sends are split into bounded calls;

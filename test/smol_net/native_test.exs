@@ -281,6 +281,7 @@ defmodule SmolNet.NativeTest do
   test "bounds every ABI work dimension and reports a continuation" do
     limits = %{
       bytes_copied: 1_500,
+      input_packets: 1,
       output_packets: 2,
       ready_events: 3,
       maintenance_work: 4
@@ -298,6 +299,7 @@ defmodule SmolNet.NativeTest do
             }} =
              Stack.test_bounded_work(stack, %{
                bytes_copied: 10_000,
+               input_packets: 100,
                output_packets: 100,
                ready_events: 100,
                maintenance_work: 100
@@ -305,6 +307,7 @@ defmodule SmolNet.NativeTest do
 
     assert {:ok, %{result: %{counters: counters}}} = Stack.native_snapshot(stack)
     assert counters.max_bytes_copied == 1_500
+    assert counters.max_input_packets == 1
     assert counters.max_output_packets == 2
     assert counters.max_ready_events == 3
     assert counters.max_maintenance_work == 4
@@ -420,6 +423,39 @@ defmodule SmolNet.NativeTest do
     assert counters.ingress_packets == 0
     assert counters.rejected_packets == 4
     assert Native.health() == :ok
+  end
+
+  test "native batch admission is atomic and bounded across continuations" do
+    limits = %{Stack.default_limits() | input_packets: 2}
+    config = %{mtu: 1_280, addresses: [], routes: []}
+    {:ok, %{result: resource}} = Native.stack_new(limits, config, 0)
+    first = <<6::4, 1::28, 0::16, 59, 64, 0::256>>
+    second = <<6::4, 2::28, 0::16, 59, 64, 0::256>>
+    invalid = <<6::4, 0::308>>
+
+    assert Native.stack_ingress_batch(resource, [first, :not_a_packet], 0) ==
+             {:error, :invalid_packet}
+
+    assert Native.stack_ingress_batch(resource, [first, invalid], 0) ==
+             {:error, :invalid_packet}
+
+    assert {:ok, %{result: rejected}} = Native.stack_snapshot(resource)
+    assert rejected.receive_packets == 0
+    assert rejected.counters.ingress_packets == 0
+
+    assert {:ok, %{result: :ok}} = Native.test_set_budget_checkpoints(resource, 1)
+
+    assert {:ok, %{result: 2, output: [], more: true}} =
+             Native.stack_ingress_batch(resource, [first, second], 0)
+
+    assert {:ok, %{result: retained}} = Native.stack_snapshot(resource)
+    assert retained.receive_packets == 1
+    assert retained.counters.ingress_packets == 2
+    assert retained.counters.max_input_packets == 1
+
+    assert {:ok, %{output: [], more: false}} = poll_until_complete(resource)
+    assert {:ok, %{result: completed}} = Native.stack_snapshot(resource)
+    assert completed.receive_packets == 0
   end
 
   test "native configuration rejects multicast and broadcast addresses without panicking" do

@@ -68,6 +68,58 @@ defmodule SmolNet.StackLinkTest do
     end)
   end
 
+  test "accepts a bounded ingress batch and drives every packet in one native call" do
+    {:ok, stack} =
+      SmolNet.start_stack(
+        egress: {self(), :ingress_batch},
+        mtu: 1_280,
+        addresses: [{@address_a, 64}],
+        routes: [{{0, 0, 0, 0, 0, 0, 0, 0}, 0, @address_b}],
+        limits: %{input_packets: 2}
+      )
+
+    first = echo_request(@address_b, @address_a, "first")
+    second = echo_request(@address_b, @address_a, "second")
+    assert {:ok, 2} = SmolNet.ingress(stack, [first, second])
+
+    assert_receive {:smol_stack, :ingress_batch, :egress, responses}
+    assert length(responses) == 2
+    assert Enum.map(responses, &binary_part(&1, 48, byte_size(&1) - 48)) == ["first", "second"]
+    refute_receive {:smol_stack, :ingress_batch, :egress, _duplicate}, 50
+
+    assert_eventually(fn ->
+      {:ok, info} = SmolNet.stack_info(stack)
+
+      info.processed_ingress == 2 and info.native.result.counters.ingress_packets == 2 and
+        info.native.result.counters.max_input_packets == 2 and
+        info.native.result.counters.native_calls == 1
+    end)
+  end
+
+  test "batch ingress validates and admits atomically" do
+    {:ok, stack} =
+      SmolNet.start_stack(
+        egress: {self(), :batch_validation},
+        mtu: 1_280,
+        addresses: [{@address_a, 64}],
+        limits: %{bytes_copied: 1_280, input_packets: 2}
+      )
+
+    valid = empty_ipv6_packet()
+    large = <<6::4, 0::28, 660::16, 59, 64, 0::256, 0::size(660 * 8)>>
+
+    assert {:ok, 0} = SmolNet.ingress(stack, [])
+    assert {:error, :invalid_packet} = SmolNet.ingress(stack, [valid, :not_a_packet])
+    assert {:error, :invalid_packet} = SmolNet.ingress(stack, [valid | :improper])
+    assert {:error, :batch_too_large} = SmolNet.ingress(stack, [valid, valid, valid])
+    assert {:error, :batch_too_large} = SmolNet.ingress(stack, [large, large])
+
+    assert {:ok, info} = SmolNet.stack_info(stack)
+    assert info.processed_ingress == 0
+    assert info.native.result.counters.ingress_packets == 0
+    assert info.ingress.rejected == 4
+  end
+
   test "egress emits one ordered list per native output envelope" do
     first = empty_ipv6_packet(1)
     second = empty_ipv6_packet(2)
@@ -190,6 +242,43 @@ defmodule SmolNet.StackLinkTest do
 
     send(feeder, :stop)
     assert_receive {:DOWN, ^feeder_monitor, :process, ^feeder, :normal}
+  end
+
+  test "batched ingress preserves the pending slot and busy backpressure" do
+    configure_native_double(:wait)
+    Application.put_env(:smolnet, :native_poll_result, :wait)
+    batch = [empty_ipv6_packet(1), empty_ipv6_packet(2)]
+
+    {:ok, stack} =
+      SmolNet.start_stack(egress: {self(), :batch_pending}, limits: %{input_packets: 2})
+
+    %{stack: stack_pid} = Ref.pids(stack)
+
+    assert {:ok, 2} = SmolNet.ingress(stack, batch)
+    assert_receive {:native_stack_ingress_batch, ^stack_pid, ^batch}
+
+    second = Task.async(fn -> SmolNet.ingress(stack, batch) end)
+    third = Task.async(fn -> SmolNet.ingress(stack, batch) end)
+    assert_eventually(fn -> message_queue_length(stack_pid) == 2 end)
+
+    send(stack_pid, {:native_ingress_reply, empty_effects(more: true)})
+    assert_receive {:native_stack_poll, ^stack_pid, _now}
+
+    pending =
+      case {Task.yield(second, 1_000), Task.yield(third, 1_000)} do
+        {{:ok, {:error, :busy}}, nil} -> third
+        {nil, {:ok, {:error, :busy}}} -> second
+      end
+
+    send(stack_pid, {:native_poll_reply, empty_effects()})
+    assert Task.await(pending) == {:ok, 2}
+    assert_receive {:native_stack_ingress_batch, ^stack_pid, ^batch}
+    send(stack_pid, {:native_ingress_reply, empty_effects()})
+
+    assert_eventually(fn ->
+      {:ok, info} = SmolNet.stack_info(stack)
+      info.processed_ingress == 4 and info.ingress.rejected == 1
+    end)
   end
 
   test "a stale poll still releases a held ingress packet" do

@@ -37,16 +37,20 @@ The egress recipient receives non-empty, bounded batches in packet order:
 {:smol_stack, :tunnel, :egress, [complete_ip_packet, ...]}
 ```
 
-Feed one complete IPv4 or IPv6 packet back with:
+Feed one complete IPv4 or IPv6 packet back, or atomically admit a configured
+bounded batch, with:
 
 ```elixir
 :ok = SmolNet.ingress(stack, complete_ip_packet)
+{:ok, 2} = SmolNet.ingress(stack, [first_ip_packet, second_ip_packet])
 ```
 
 Ingress accepts raw IP packets, not Ethernet frames. IPv4 input is validated
 for header length, total length, checksum, MTU, and fragmentation before it
 mutates the stack. Fragmented IPv4 input is rejected; reassembly belongs
-outside this API.
+outside this API. Batch size is controlled by the stack's `input_packets`
+limit, which defaults to one and may be raised to 32. The sum of batch payload
+bytes must also fit `bytes_copied`; over-limit batches are rejected atomically.
 
 Each stack has one serialized link feeder. The link is responsible for
 transport-level buffering and backpressure. If a bounded native continuation

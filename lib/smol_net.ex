@@ -49,8 +49,10 @@ defmodule SmolNet do
   the same family. One stack may contain both families.
 
   Native work limits can be reduced with the `:limits` option. It accepts a map
-  containing any of `:bytes_copied`, `:output_packets`, `:ready_events`, and
-  `:maintenance_work`; unspecified values retain their safe defaults.
+  containing any of `:bytes_copied`, `:input_packets`, `:output_packets`,
+  `:ready_events`, and `:maintenance_work`; unspecified values retain their
+  safe defaults. `:input_packets` defaults to one and may be raised to 32 for
+  bounded batched ingress.
 
   `SmolNet.Loopback.start_link/1` starts a stack whose egress is a link back
   into itself, returns both references, and needs no external transport.
@@ -63,13 +65,19 @@ defmodule SmolNet do
   defdelegate stop_stack(stack), to: SmolNet.StackSupervisor, as: :stop_stack
 
   @doc """
-  Hands one complete raw IPv4 or IPv6 packet from the stack's link feeder to the stack.
+  Hands raw IPv4 or IPv6 packets from the stack's link feeder to the stack.
 
   Each stack has one serialized feeder. This call returns after the stack owner
-  validates and accepts the packet, then native processing runs before the
-  stack accepts another message. The feeder must bound its own transport input.
+  validates and accepts the input, then native processing runs before the stack
+  accepts another message. A binary preserves the single-packet `:ok` result.
+  A list is admitted atomically and returns `{:ok, packet_count}`; an empty list
+  is a no-op. A batch exceeding `:input_packets` or `:bytes_copied` is rejected
+  with `{:error, :batch_too_large}`. The feeder must bound its own transport
+  input.
   """
   @spec ingress(Stack.Ref.t(), binary()) :: :ok | {:error, atom()}
+  @spec ingress(Stack.Ref.t(), [binary()]) ::
+          {:ok, non_neg_integer()} | {:error, atom()}
   defdelegate ingress(stack, packet), to: Stack
 
   @doc "Returns ingress, link, timer, and native stack metrics."

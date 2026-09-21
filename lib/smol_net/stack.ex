@@ -13,6 +13,7 @@ defmodule SmolNet.Stack do
 
   @default_limits %{
     bytes_copied: 64 * 1024,
+    input_packets: 1,
     output_packets: 32,
     ready_events: 128,
     maintenance_work: 128
@@ -28,6 +29,7 @@ defmodule SmolNet.Stack do
 
   @type limits :: %{
           bytes_copied: pos_integer(),
+          input_packets: pos_integer(),
           output_packets: pos_integer(),
           ready_events: pos_integer(),
           maintenance_work: pos_integer()
@@ -48,6 +50,15 @@ defmodule SmolNet.Stack do
              :invalid_packet
              | :unsupported_family
              | :packet_too_large
+             | :busy
+             | :link_down
+             | :closed}
+  @spec ingress(Ref.t(), [binary()]) ::
+          {:ok, non_neg_integer()}
+          | {:error,
+             :invalid_packet
+             | :packet_too_large
+             | :batch_too_large
              | :busy
              | :link_down
              | :closed}
@@ -385,9 +396,9 @@ defmodule SmolNet.Stack do
     end
   end
 
-  def handle_continue({:process_ingress, packet}, state) do
+  def handle_continue({:process_ingress, input, packet_count}, state) do
     state
-    |> process_ingress(packet)
+    |> process_ingress(input, packet_count)
     |> continue_pending_ingress()
   end
 
@@ -467,18 +478,18 @@ defmodule SmolNet.Stack do
 
   @impl true
   def handle_call(
-        {:ingress, ingress_token, packet},
+        {:ingress, ingress_token, input},
         from,
         %{ingress_token: ingress_token} = state
       ) do
-    case validate_packet(packet, state.native_config.mtu) do
-      :ok when state.shutdown_requested ->
+    case validate_ingress(input, state.native_config.mtu, state.limits) do
+      {:ok, _packet_count} when state.shutdown_requested ->
         reject_ingress(state, :closed)
 
-      :ok when state.link_status == :up ->
-        accept_ingress(state, from, packet)
+      {:ok, packet_count} when state.link_status == :up ->
+        accept_ingress(state, from, input, packet_count)
 
-      :ok ->
+      {:ok, _packet_count} ->
         reject_ingress(state, :link_down)
 
       {:error, reason} ->
@@ -848,6 +859,55 @@ defmodule SmolNet.Stack do
   @spec default_limits() :: limits()
   def default_limits, do: @default_limits
 
+  defp validate_ingress(packet, mtu, _limits) when is_binary(packet) do
+    case validate_packet(packet, mtu) do
+      :ok -> {:ok, 1}
+      {:error, _reason} = error -> error
+    end
+  end
+
+  defp validate_ingress(packets, mtu, limits) when is_list(packets) do
+    validate_batch(packets, mtu, limits, 0, 0)
+  end
+
+  defp validate_ingress(_input, _mtu, _limits), do: {:error, :invalid_packet}
+
+  defp validate_batch([], _mtu, _limits, packet_count, _byte_count),
+    do: {:ok, packet_count}
+
+  defp validate_batch([packet | packets], mtu, limits, packet_count, byte_count) do
+    next_packet_count = packet_count + 1
+
+    cond do
+      next_packet_count > limits.input_packets ->
+        {:error, :batch_too_large}
+
+      not is_binary(packet) ->
+        {:error, :invalid_packet}
+
+      byte_count + byte_size(packet) > limits.bytes_copied ->
+        {:error, :batch_too_large}
+
+      true ->
+        case validate_packet(packet, mtu) do
+          :ok ->
+            validate_batch(
+              packets,
+              mtu,
+              limits,
+              next_packet_count,
+              byte_count + byte_size(packet)
+            )
+
+          {:error, _reason} = error ->
+            error
+        end
+    end
+  end
+
+  defp validate_batch(_improper_tail, _mtu, _limits, _packet_count, _byte_count),
+    do: {:error, :invalid_packet}
+
   defp validate_packet(packet, mtu) when is_binary(packet) and byte_size(packet) >= 20 do
     case packet do
       <<6::4, _rest::bitstring>> ->
@@ -917,23 +977,25 @@ defmodule SmolNet.Stack do
     {pid, link_ref, Process.monitor(pid), :up}
   end
 
-  defp process_ingress(state, packet) do
+  defp process_ingress(state, input, packet_count) do
     result =
-      state.native_module.stack_ingress(
-        state.native,
-        packet,
-        state.clock.now()
-      )
+      case input do
+        packet when is_binary(packet) ->
+          state.native_module.stack_ingress(state.native, packet, state.clock.now())
+
+        packets when is_list(packets) ->
+          state.native_module.stack_ingress_batch(state.native, packets, state.clock.now())
+      end
 
     case result do
       {:ok, envelope} ->
         state
-        |> Map.update!(:processed_ingress, &(&1 + 1))
+        |> Map.update!(:processed_ingress, &(&1 + packet_count))
         |> apply_effects(envelope)
 
       {:error, _reason} ->
         state
-        |> Map.update!(:failed_ingress, &(&1 + 1))
+        |> Map.update!(:failed_ingress, &(&1 + packet_count))
         |> Map.put(:native_continuation, false)
     end
   end
@@ -1039,19 +1101,24 @@ defmodule SmolNet.Stack do
     {:reply, {:error, reason}, state}
   end
 
-  defp accept_ingress(%{native_continuation: false} = state, _from, packet) do
-    {:reply, :ok, state, {:continue, {:process_ingress, packet}}}
+  defp accept_ingress(state, _from, [], 0) do
+    {:reply, {:ok, 0}, state}
   end
 
-  defp accept_ingress(%{pending_ingress: nil} = state, from, packet) do
-    {:noreply, %{state | pending_ingress: {from, packet}}}
+  defp accept_ingress(%{native_continuation: false} = state, _from, input, packet_count) do
+    {:reply, ingress_reply(input, packet_count), state,
+     {:continue, {:process_ingress, input, packet_count}}}
   end
 
-  defp accept_ingress(state, _from, _packet), do: reject_ingress(state, :busy)
+  defp accept_ingress(%{pending_ingress: nil} = state, from, input, packet_count) do
+    {:noreply, %{state | pending_ingress: {from, input, packet_count}}}
+  end
+
+  defp accept_ingress(state, _from, _input, _packet_count), do: reject_ingress(state, :busy)
 
   defp reject_pending_ingress(%{pending_ingress: nil} = state, _reason), do: state
 
-  defp reject_pending_ingress(%{pending_ingress: {from, _packet}} = state, reason) do
+  defp reject_pending_ingress(%{pending_ingress: {from, _input, _packet_count}} = state, reason) do
     GenServer.reply(from, {:error, reason})
     %{state | pending_ingress: nil}
   end
@@ -1064,11 +1131,14 @@ defmodule SmolNet.Stack do
     {:noreply, state}
   end
 
-  defp continue_pending_ingress(%{pending_ingress: {from, packet}} = state) do
-    GenServer.reply(from, :ok)
+  defp continue_pending_ingress(%{pending_ingress: {from, input, packet_count}} = state) do
+    GenServer.reply(from, ingress_reply(input, packet_count))
     state = %{state | pending_ingress: nil}
-    {:noreply, state, {:continue, {:process_ingress, packet}}}
+    {:noreply, state, {:continue, {:process_ingress, input, packet_count}}}
   end
+
+  defp ingress_reply(input, packet_count) when is_list(input), do: {:ok, packet_count}
+  defp ingress_reply(_packet, _packet_count), do: :ok
 
   defp timer_deadline(nil), do: nil
   defp timer_deadline(timer), do: timer.deadline

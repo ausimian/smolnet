@@ -36,6 +36,7 @@ mod atoms {
         invalid_stack_config,
         invalid_packet,
         packet_too_large,
+        batch_too_large,
         invalid_socket,
         wrong_socket_kind,
         invalid_socket_state,
@@ -121,6 +122,30 @@ fn stack_ingress<'a>(
                 stack
                     .ingress(packet.as_slice(), now)
                     .map(|effects| stack.finish_call(env, atoms::ok(), effects, Vec::new()))
+            })
+            .map_err(|_| atoms::ownership_invariant_violation())?
+            .map_err(stack_error_atom)
+    });
+
+    encode_envelope_result(env, result)
+}
+
+#[rustler::nif]
+fn stack_ingress_batch<'a>(
+    env: Env<'a>,
+    resource: ResourceArc<StackResource>,
+    packets_term: Term<'a>,
+    now_millis: i64,
+) -> Term<'a> {
+    let result = catch_operation(|| {
+        let packets = decode_packet_batch(packets_term)?;
+        let packet_slices = packets.iter().map(Binary::as_slice).collect::<Vec<_>>();
+        let now = time::instant_from_millis(now_millis).map_err(|_| atoms::time_overflow())?;
+        resource
+            .with_stack(|stack| {
+                stack
+                    .ingress_batch(&packet_slices, now)
+                    .map(|effects| stack.finish_call(env, packet_slices.len(), effects, Vec::new()))
             })
             .map_err(|_| atoms::ownership_invariant_violation())?
             .map_err(stack_error_atom)
@@ -910,6 +935,26 @@ where
     Ok(values)
 }
 
+fn decode_packet_batch<'a>(term: Term<'a>) -> Result<Vec<Binary<'a>>, Atom> {
+    let iterator = term
+        .decode::<ListIterator<'a>>()
+        .map_err(|_| atoms::invalid_packet())?;
+    let mut packets = Vec::with_capacity(Limits::MAX_INPUT_PACKETS);
+
+    for item in iterator {
+        if packets.len() == Limits::MAX_INPUT_PACKETS {
+            return Err(atoms::batch_too_large());
+        }
+
+        packets.push(
+            item.decode::<Binary<'a>>()
+                .map_err(|_| atoms::invalid_packet())?,
+        );
+    }
+
+    Ok(packets)
+}
+
 fn stack_error_atom(error: StackError) -> Atom {
     match error {
         StackError::Closed => atoms::closed(),
@@ -917,6 +962,7 @@ fn stack_error_atom(error: StackError) -> Atom {
         StackError::InvalidStackConfig => atoms::invalid_stack_config(),
         StackError::InvalidPacket => atoms::invalid_packet(),
         StackError::PacketTooLarge => atoms::packet_too_large(),
+        StackError::BatchTooLarge => atoms::batch_too_large(),
         StackError::OwnershipInvariantViolation => atoms::ownership_invariant_violation(),
     }
 }
