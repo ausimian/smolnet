@@ -19,6 +19,9 @@ defmodule SmolNetTest do
     assert SmolNet.start_stack(limits: %{bytes_copied: 65_576}) ==
              {:error, :invalid_limits}
 
+    assert SmolNet.start_stack(limits: %{input_packets: 0}) == {:error, :invalid_limits}
+    assert SmolNet.start_stack(limits: %{input_packets: 33}) == {:error, :invalid_limits}
+
     assert SmolNet.start_stack(limits: :invalid) == {:error, :invalid_limits}
     assert SmolNet.start_stack(:invalid) == {:error, :invalid_options}
     assert SmolNet.start_stack([:bad]) == {:error, :invalid_options}

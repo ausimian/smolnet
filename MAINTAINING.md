@@ -45,15 +45,17 @@ Native calls also report their measured scheduler share through
 `enif_consume_timeslice`, so repeated continuations yield fairly to other stack
 processes and ordinary mailbox traffic.
 
-Ingress remains a single-feeder interface with one admitted packet at a time.
-When a deadline continuation still owns that slot, another feeder call can
-return `{:error, :busy}` sooner than it did under quota-only batching. Feeders
-should treat `:busy` as backpressure and retry after yielding or waiting for
-their next input opportunity.
+Ingress remains a single-feeder interface with one admitted call at a time.
+That call carries either one packet or a batch bounded by `input_packets` and
+`bytes_copied`. When a deadline continuation still owns that slot, another
+feeder call can return `{:error, :busy}`. Feeders should treat `:busy` as
+backpressure and retry after yielding or waiting for their next input
+opportunity.
 
 The time budget is backed by deterministic per-call maxima of 65,575 copied
-bytes, 32 output packets, 128 readiness events, and 128 maintenance units.
-These bounds prevent clock or platform anomalies from creating unbounded work.
+bytes, 32 input packets, 32 output packets, 128 readiness events, and 128
+maintenance units. These bounds prevent clock or platform anomalies from
+creating unbounded work.
 A separate hard ceiling allows at most 64 native TCP/UDP backing sockets per
 stack, including listener pools and wildcard-UDP expansion across configured
 addresses. `SmolNet.stack_info/1` exposes the call target, work budget,

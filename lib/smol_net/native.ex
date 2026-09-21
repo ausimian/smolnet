@@ -24,6 +24,10 @@ defmodule SmolNet.Native do
   @spec stack_ingress(reference(), binary(), integer()) :: {:ok, map()} | {:error, atom()}
   def stack_ingress(_stack, _packet, _now), do: :erlang.nif_error(:nif_not_loaded)
 
+  @spec stack_ingress_batch(reference(), [binary()], integer()) ::
+          {:ok, map()} | {:error, atom()}
+  def stack_ingress_batch(_stack, _packets, _now), do: :erlang.nif_error(:nif_not_loaded)
+
   @spec stack_poll(reference(), integer()) :: {:ok, map()} | {:error, atom()}
   def stack_poll(_stack, _now), do: :erlang.nif_error(:nif_not_loaded)
 

@@ -81,7 +81,8 @@ to run. Separate stack owners remain independently schedulable.
 
 Unexpected resource destruction remains synchronous. This is intentionally
 different from explicit shutdown: the resource contains at most 64 native
-sockets, 128 logical entries and waiters, and 32 queued output packets.
+sockets, 128 logical entries and waiters, 32 queued input packets, and 32
+queued output packets.
 Worst-case destruction is measured as a complete process-exit-to-release path.
 A permanent cleanup thread was rejected because its lifetime, NIF unload, and
 failure behavior would be more complex than the already small, fixed

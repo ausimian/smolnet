@@ -6,6 +6,7 @@ defmodule SmolNet.Stack.Options do
   @default_mtu 1_500
   @max_limits %{
     bytes_copied: 65_575,
+    input_packets: 32,
     output_packets: 32,
     ready_events: 128,
     maintenance_work: 128

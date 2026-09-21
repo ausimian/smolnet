@@ -110,8 +110,9 @@ These invariants are release blockers, not implementation preferences.
 
 - Every NIF invocation has explicit limits for input packets, output packets,
   copied bytes, readiness events, and protocol polling work.
-- Ingress processes one complete raw IP packet per accepted feeder call. At
-  most one packet is in native processing and one later feeder call is waiting.
+- Ingress processes one complete raw IP packet or one explicitly bounded batch
+  per accepted feeder call. At most one call is in native processing and one
+  later feeder call is waiting.
 - The NIF never loops until a socket becomes ready and never owns an arbitrary
   unsent application payload.
 - If bounded work remains, it is represented by another BEAM message,

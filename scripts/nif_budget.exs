@@ -3,11 +3,15 @@ defmodule SmolNet.NifBudget do
 
   @maximum_limits %{
     bytes_copied: 65_575,
+    input_packets: 32,
     output_packets: 32,
     ready_events: 128,
     maintenance_work: 128
   }
   @maximum_mtu 65_575
+  @maximum_batch_packets 32
+  @maximum_batch_packet_bytes 2_048
+  @maximum_batch_bytes @maximum_batch_packets * @maximum_batch_packet_bytes
   @native_socket_capacity 64
   @maximum_addresses 8
   @maximum_wildcard_udp_sockets div(@native_socket_capacity, @maximum_addresses)
@@ -47,6 +51,23 @@ defmodule SmolNet.NifBudget do
       ingress = new_stack(@maximum_limits, maximum_ingress_config())
       {:ok, _envelope} = Native.stack_ingress(ingress, packet, index)
     end)
+
+    batch = List.duplicate(maximum_batch_ipv6_packet(), @maximum_batch_packets)
+
+    scenario(
+      "maximum batch ingress",
+      fn ->
+        limits = %{@maximum_limits | bytes_copied: @maximum_batch_bytes}
+        new_stack(limits, maximum_ingress_config(@maximum_batch_packet_bytes))
+      end,
+      fn resource ->
+        {:ok, %{result: @maximum_batch_packets}} =
+          result = Native.stack_ingress_batch(resource, batch, 0)
+
+        result
+      end,
+      fn resource, {:ok, envelope} -> continue_native_work(resource, envelope, 0) end
+    )
 
     scenario(
       "maximum closing-socket maintenance",
@@ -130,11 +151,11 @@ defmodule SmolNet.NifBudget do
       fn {resource, identity} ->
         {:ok, %{result: :ok}} =
           result =
-            Native.udp_bind(resource, identity, %{
-              address: List.duplicate(0, 16),
-              port: 39_999,
-              scope_id: 0
-            })
+          Native.udp_bind(resource, identity, %{
+            address: List.duplicate(0, 16),
+            port: 39_999,
+            scope_id: 0
+          })
 
         result
       end,
@@ -308,8 +329,8 @@ defmodule SmolNet.NifBudget do
 
   defp empty_config(mtu \\ 1_500), do: %{mtu: mtu, addresses: [], routes: []}
 
-  defp maximum_ingress_config do
-    %{mtu: @maximum_mtu, addresses: [%{address: destination(), prefix_length: 64}], routes: []}
+  defp maximum_ingress_config(mtu \\ @maximum_mtu) do
+    %{mtu: mtu, addresses: [%{address: destination(), prefix_length: 64}], routes: []}
   end
 
   defp maximum_ipv6_packet do
@@ -317,6 +338,16 @@ defmodule SmolNet.NifBudget do
     destination = destination() |> :erlang.list_to_binary()
     payload = :binary.copy(<<0>>, 65_535)
     <<6::4, 0::28, 65_535::16, 59, 64, source::binary, destination::binary, payload::binary>>
+  end
+
+  defp maximum_batch_ipv6_packet do
+    source = <<0xFD, 0::112, 1>>
+    destination = destination() |> :erlang.list_to_binary()
+    payload_bytes = @maximum_batch_packet_bytes - 40
+    payload = :binary.copy(<<0>>, payload_bytes)
+
+    <<6::4, 0::28, payload_bytes::16, 59, 64, source::binary, destination::binary,
+      payload::binary>>
   end
 
   defp destination, do: [0xFD, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2]

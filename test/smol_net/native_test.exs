@@ -6,6 +6,9 @@ defmodule SmolNet.NativeTest do
   alias SmolNet.Native
   alias SmolNet.Stack
   alias SmolNet.Stack.Ref
+  alias SmolNet.Test.Timing
+
+  @wait_1s Timing.liveness(1_000)
 
   setup do
     on_exit(fn -> stop_all_stacks() end)
@@ -234,23 +237,29 @@ defmodule SmolNet.NativeTest do
 
     unconstrained = native_stack()
     keys = arm_read_waiters(unconstrained, ready_events)
-    # Arming the waiters spends this process's slice; yield for a fresh one so
-    # the reference call is not itself throttled.
-    :erlang.yield()
-    assert {:ok, _envelope} = Native.test_socket_ready(unconstrained, keys)
-    delivered_unconstrained = drain_select_messages()
+    # Arming the waiters spends this process's slice. Use a fresh process so
+    # the reference call cannot inherit a nearly exhausted reduction slice.
+    assert {:ok, _envelope} =
+             with_fresh_reduction_slice(fn ->
+               Native.test_socket_ready(unconstrained, keys)
+             end)
+
+    delivered_unconstrained = await_select_messages()
 
     starved = native_stack()
     keys = arm_read_waiters(starved, ready_events)
-    :erlang.yield()
 
     # The first incremental charge reports the caller's slice as spent, so the
     # call stops after the chunk that charge covers instead of continuing to
     # drain readiness.
     assert {:ok, %{result: :ok}} = Native.test_set_slice_exhaustion(starved, 0)
-    assert {:ok, %{more: true}} = Native.test_socket_ready(starved, keys)
 
-    delivered_starved = drain_select_messages()
+    assert {:ok, %{more: true}} =
+             with_fresh_reduction_slice(fn ->
+               Native.test_socket_ready(starved, keys)
+             end)
+
+    delivered_starved = await_select_messages()
     assert delivered_starved > 0
     assert delivered_starved < delivered_unconstrained
 
@@ -263,7 +272,7 @@ defmodule SmolNet.NativeTest do
     # Readiness retained by the shortened slice still completes across ordinary
     # continuations rather than being dropped.
     assert {:ok, %{more: false}} = poll_until_complete(starved)
-    assert delivered_starved + drain_select_messages() == ready_events
+    assert delivered_starved + await_select_messages() == ready_events
   end
 
   @tag :debug_nif
@@ -281,6 +290,7 @@ defmodule SmolNet.NativeTest do
   test "bounds every ABI work dimension and reports a continuation" do
     limits = %{
       bytes_copied: 1_500,
+      input_packets: 1,
       output_packets: 2,
       ready_events: 3,
       maintenance_work: 4
@@ -298,6 +308,7 @@ defmodule SmolNet.NativeTest do
             }} =
              Stack.test_bounded_work(stack, %{
                bytes_copied: 10_000,
+               input_packets: 100,
                output_packets: 100,
                ready_events: 100,
                maintenance_work: 100
@@ -305,6 +316,7 @@ defmodule SmolNet.NativeTest do
 
     assert {:ok, %{result: %{counters: counters}}} = Stack.native_snapshot(stack)
     assert counters.max_bytes_copied == 1_500
+    assert counters.max_input_packets == 1
     assert counters.max_output_packets == 2
     assert counters.max_ready_events == 3
     assert counters.max_maintenance_work == 4
@@ -420,6 +432,39 @@ defmodule SmolNet.NativeTest do
     assert counters.ingress_packets == 0
     assert counters.rejected_packets == 4
     assert Native.health() == :ok
+  end
+
+  test "native batch admission is atomic and bounded across continuations" do
+    limits = %{Stack.default_limits() | input_packets: 2}
+    config = %{mtu: 1_280, addresses: [], routes: []}
+    {:ok, %{result: resource}} = Native.stack_new(limits, config, 0)
+    first = <<6::4, 1::28, 0::16, 59, 64, 0::256>>
+    second = <<6::4, 2::28, 0::16, 59, 64, 0::256>>
+    invalid = <<6::4, 0::308>>
+
+    assert Native.stack_ingress_batch(resource, [first, :not_a_packet], 0) ==
+             {:error, :invalid_packet}
+
+    assert Native.stack_ingress_batch(resource, [first, invalid], 0) ==
+             {:error, :invalid_packet}
+
+    assert {:ok, %{result: rejected}} = Native.stack_snapshot(resource)
+    assert rejected.receive_packets == 0
+    assert rejected.counters.ingress_packets == 0
+
+    assert {:ok, %{result: :ok}} = Native.test_set_budget_checkpoints(resource, 1)
+
+    assert {:ok, %{result: 2, output: [], more: true}} =
+             Native.stack_ingress_batch(resource, [first, second], 0)
+
+    assert {:ok, %{result: retained}} = Native.stack_snapshot(resource)
+    assert retained.receive_packets == 1
+    assert retained.counters.ingress_packets == 2
+    assert retained.counters.max_input_packets == 1
+
+    assert {:ok, %{output: [], more: false}} = poll_until_complete(resource)
+    assert {:ok, %{result: completed}} = Native.stack_snapshot(resource)
+    assert completed.receive_packets == 0
   end
 
   test "native configuration rejects multicast and broadcast addresses without panicking" do
@@ -541,6 +586,7 @@ defmodule SmolNet.NativeTest do
   end
 
   test "repeated create and destroy cycles release their native resources" do
+    assert_eventually(fn -> Native.resource_counts().active == 0 end)
     baseline = Native.resource_counts().active
 
     for _index <- 1..25 do
@@ -548,7 +594,11 @@ defmodule SmolNet.NativeTest do
       assert :ok = SmolNet.stop_stack(ref)
     end
 
-    assert_eventually(fn -> Native.resource_counts().active == baseline end)
+    assert_eventually(fn ->
+      :erlang.garbage_collect()
+      Native.resource_counts().active == baseline
+    end)
+
     counts = Native.resource_counts()
     assert counts.created >= 25
     assert counts.dropped >= 25
@@ -587,7 +637,18 @@ defmodule SmolNet.NativeTest do
     end)
   end
 
-  defp drain_select_messages(count \\ 0) do
+  defp await_select_messages do
+    assert_receive {:"$smol_socket", _identity, :select, _reference}, @wait_1s
+    drain_select_messages(1)
+  end
+
+  defp with_fresh_reduction_slice(call) do
+    call
+    |> Task.async()
+    |> Task.await(@wait_1s)
+  end
+
+  defp drain_select_messages(count) do
     receive do
       {:"$smol_socket", _identity, :select, _reference} -> drain_select_messages(count + 1)
     after
@@ -643,15 +704,21 @@ defmodule SmolNet.NativeTest do
     end
   end
 
-  defp assert_eventually(assertion, attempts \\ 100)
-  defp assert_eventually(assertion, 0), do: assert(assertion.())
+  defp assert_eventually(assertion, timeout \\ @wait_1s) do
+    deadline = System.monotonic_time(:millisecond) + timeout
+    do_assert_eventually(assertion, deadline)
+  end
 
-  defp assert_eventually(assertion, attempts) do
+  defp do_assert_eventually(assertion, deadline) do
     if assertion.() do
       :ok
     else
-      Process.sleep(10)
-      assert_eventually(assertion, attempts - 1)
+      if System.monotonic_time(:millisecond) >= deadline do
+        assert assertion.()
+      else
+        Process.sleep(10)
+        do_assert_eventually(assertion, deadline)
+      end
     end
   end
 end

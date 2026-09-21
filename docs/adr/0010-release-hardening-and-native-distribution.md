@@ -34,8 +34,9 @@ source repository's history.
 - Waiters retain one saved PID and reference per read direction and per write
   direction. Ready queues, ingress work, output packets, maintenance scans, and
   copied bytes all have explicit per-call limits: at most 128 readiness events,
-  128 maintenance units, 32 output packets, and 65,575 copied bytes. Remaining
-  work sets the envelope's `more` flag so the stack owner promptly polls again.
+  128 maintenance units, 32 input packets, 32 output packets, and 65,575 copied
+  bytes. Remaining work sets the envelope's `more` flag so the stack owner
+  promptly polls again.
 - Native configuration decoding accepts at most eight addresses, four routes,
   16 address bytes, and 128 debug ready keys. It decodes incrementally rather
   than allocating an unbounded intermediate list.

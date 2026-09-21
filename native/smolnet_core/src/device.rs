@@ -57,15 +57,17 @@ impl OutputPacket {
 pub struct BeamDevice {
     mtu: usize,
     receive: VecDeque<Vec<u8>>,
+    receive_limit: usize,
     transmit: VecDeque<OutputPacket>,
     transmit_limit: usize,
 }
 
 impl BeamDevice {
-    pub fn new(mtu: usize) -> Self {
+    pub fn new(mtu: usize, receive_limit: usize) -> Self {
         Self {
             mtu,
             receive: VecDeque::new(),
+            receive_limit,
             transmit: VecDeque::new(),
             transmit_limit: 0,
         }
@@ -75,13 +77,25 @@ impl BeamDevice {
         self.transmit_limit = transmit_limit;
     }
 
-    pub fn enqueue_receive(&mut self, packet: Vec<u8>) -> Result<(), ()> {
-        if !self.receive.is_empty() {
+    pub fn enqueue_receive_batch(&mut self, packets: Vec<Vec<u8>>) -> Result<(), ()> {
+        let Some(queued) = self.receive.len().checked_add(packets.len()) else {
+            return Err(());
+        };
+
+        if queued > self.receive_limit {
             return Err(());
         }
 
-        self.receive.push_back(packet);
+        self.receive.extend(packets);
         Ok(())
+    }
+
+    pub fn take_receive(&mut self) -> Option<Vec<u8>> {
+        self.receive.pop_front()
+    }
+
+    pub fn return_receive(&mut self, packet: Vec<u8>) {
+        self.receive.push_front(packet);
     }
 
     pub fn take_transmit(
@@ -123,6 +137,10 @@ impl BeamDevice {
 
     pub fn has_receive(&self) -> bool {
         !self.receive.is_empty()
+    }
+
+    pub fn can_receive(&self) -> bool {
+        self.transmit.len() < self.transmit_limit
     }
 
     pub fn queued_packets(&self) -> (usize, usize) {
@@ -199,6 +217,9 @@ impl Device for BeamDevice {
         let mut capabilities = DeviceCapabilities::default();
         capabilities.medium = Medium::Ip;
         capabilities.max_transmission_unit = self.mtu;
+        // smoltcp uses this capability to clamp the advertised TCP receive
+        // window. Ingress batching is an ABI boundary optimization, not a TCP
+        // flow-control setting, so preserve the established one-segment value.
         capabilities.max_burst_size = Some(1);
         capabilities
     }
@@ -213,7 +234,7 @@ mod tests {
 
     #[test]
     fn reports_raw_ip_capabilities() {
-        let device = BeamDevice::new(1_500);
+        let device = BeamDevice::new(1_500, 4);
         let capabilities = device.capabilities();
 
         assert_eq!(capabilities.medium, Medium::Ip);
@@ -223,11 +244,14 @@ mod tests {
 
     #[test]
     fn receive_and_transmit_queues_are_explicitly_bounded() {
-        let mut device = BeamDevice::new(1_500);
+        let mut device = BeamDevice::new(1_500, 2);
         device.begin_call(1);
 
-        assert_eq!(device.enqueue_receive(vec![0; 40]), Ok(()));
-        assert_eq!(device.enqueue_receive(vec![0; 40]), Err(()));
+        assert_eq!(
+            device.enqueue_receive_batch(vec![vec![0; 40], vec![0; 40]]),
+            Ok(())
+        );
+        assert_eq!(device.enqueue_receive_batch(vec![vec![0; 40]]), Err(()));
 
         let (_rx, tx) = device.receive(smoltcp::time::Instant::ZERO).unwrap();
         tx.consume(40, |packet| packet[0] = 0x60);
@@ -241,5 +265,6 @@ mod tests {
         let packets = device.take_transmit(1, 40, &mut budget);
         assert_eq!(packets.len(), 1);
         assert_eq!(packets[0].as_slice(), expected);
+        assert!(device.receive(smoltcp::time::Instant::ZERO).is_some());
     }
 }

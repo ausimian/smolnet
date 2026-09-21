@@ -167,7 +167,7 @@ impl NativeStack {
             .map(RouteConfig::to_cidr)
             .collect();
 
-        let mut device = BeamDevice::new(stack_config.mtu);
+        let mut device = BeamDevice::new(stack_config.mtu, limits.input_packets);
         let mut interface_config = Config::new(HardwareAddress::Ip);
         interface_config.random_seed = NEXT_STACK_ID.fetch_add(1, Ordering::Relaxed);
         let id = interface_config.random_seed;
@@ -404,6 +404,7 @@ impl NativeStack {
     pub fn test_maximum_work(&mut self) -> Envelope<Work> {
         let completed = Work {
             bytes_copied: self.limits.bytes_copied,
+            input_packets: self.limits.input_packets,
             output_packets: self.limits.output_packets,
             ready_events: self.limits.ready_events,
             maintenance_work: self.limits.maintenance_work,
@@ -450,6 +451,7 @@ impl NativeStack {
 
         let completed = Work {
             bytes_copied: self.limits.bytes_copied,
+            input_packets: self.limits.input_packets,
             output_packets: self.limits.output_packets,
             ready_events: self.limits.ready_events,
             maintenance_work: self.limits.maintenance_work,
@@ -1599,20 +1601,40 @@ impl NativeStack {
     }
 
     pub fn ingress(&mut self, packet: &[u8], now: Instant) -> Result<Effects, StackError> {
+        self.ingress_batch(&[packet], now)
+    }
+
+    pub fn ingress_batch(
+        &mut self,
+        packets: &[&[u8]],
+        now: Instant,
+    ) -> Result<Effects, StackError> {
         if !matches!(self.lifecycle, Lifecycle::Running) {
             return Err(StackError::Closed);
         }
 
-        self.validate_packet(packet)?;
-        self.retarget_wildcard_listener(packet);
-        let reset = self.inbound_reset(packet);
+        if packets.len() > self.limits.input_packets {
+            return Err(StackError::BatchTooLarge);
+        }
+
+        let mut copied_bytes = 0usize;
+        for packet in packets {
+            self.validate_packet(packet)?;
+            copied_bytes = copied_bytes
+                .checked_add(packet.len())
+                .filter(|bytes| *bytes <= self.limits.bytes_copied)
+                .ok_or(StackError::BatchTooLarge)?;
+        }
+
+        let owned_packets = packets
+            .iter()
+            .map(|packet| packet.to_vec())
+            .collect::<Vec<_>>();
         self.device
-            .enqueue_receive(packet.to_vec())
+            .enqueue_receive_batch(owned_packets)
             .map_err(|_| StackError::OwnershipInvariantViolation)?;
-        self.counters.ingress_packets += 1;
-        let effects = self.drive(now, Some(packet.len()))?;
-        self.record_inbound_reset(reset);
-        Ok(effects)
+        self.counters.ingress_packets += packets.len();
+        self.drive(now, Some(copied_bytes))
     }
 
     pub fn poll(&mut self, now: Instant) -> Effects {
@@ -3053,15 +3075,39 @@ impl NativeStack {
         );
         let mut output_bytes: usize = output.iter().map(|packet| packet.len()).sum();
 
-        if self.device.has_receive() && self.within_budget() {
+        let mut deadline_work_deferred = false;
+        let mut ingress_work = 0usize;
+
+        while ingress_work < self.limits.input_packets
+            && self.device.has_receive()
+            && self.device.can_receive()
+        {
+            if !self.within_budget() {
+                deadline_work_deferred = true;
+                break;
+            }
+
+            let packet = self
+                .device
+                .take_receive()
+                .expect("receive queue was checked as non-empty");
+            self.retarget_wildcard_listener(&packet);
+            let reset = self.inbound_reset(&packet);
+            self.device.return_receive(packet);
+            let queued_before = self.device.queued_packets().0;
             let _ = self
                 .interface
                 .poll_ingress_single(now, &mut self.device, &mut self.sockets);
+
+            if self.device.queued_packets().0 == queued_before {
+                break;
+            }
+
+            ingress_work += 1;
+            self.record_inbound_reset(reset);
             self.request_closing_cleanup();
             self.request_listener_scan();
         }
-
-        let mut deadline_work_deferred = false;
 
         if self.within_budget() {
             self.interface.poll_maintenance(now);
@@ -3201,6 +3247,7 @@ impl NativeStack {
 
         self.counters.observe(Work {
             bytes_copied: input_bytes + output_bytes,
+            input_packets: ingress_work,
             output_packets,
             ready_events: 0,
             maintenance_work,
@@ -3406,6 +3453,7 @@ pub(crate) fn fuzz_socket_lifecycle(data: &[u8]) {
 fn fuzz_limits() -> Limits {
     Limits {
         bytes_copied: 65_575,
+        input_packets: 32,
         output_packets: 32,
         ready_events: 64,
         maintenance_work: 64,
@@ -3964,6 +4012,7 @@ pub enum StackError {
     InvalidStackConfig,
     InvalidPacket,
     PacketTooLarge,
+    BatchTooLarge,
     OwnershipInvariantViolation,
 }
 
@@ -4056,6 +4105,7 @@ impl Lifecycle {
 #[derive(Clone, Copy, Debug, Default, NifMap)]
 pub struct Counters {
     max_bytes_copied: usize,
+    max_input_packets: usize,
     max_output_packets: usize,
     max_ready_events: usize,
     max_maintenance_work: usize,
@@ -4078,6 +4128,7 @@ pub struct Counters {
 impl Counters {
     fn observe(&mut self, work: Work) {
         self.max_bytes_copied = self.max_bytes_copied.max(work.bytes_copied);
+        self.max_input_packets = self.max_input_packets.max(work.input_packets);
         self.max_output_packets = self.max_output_packets.max(work.output_packets);
         self.max_ready_events = self.max_ready_events.max(work.ready_events);
         self.max_maintenance_work = self.max_maintenance_work.max(work.maintenance_work);
@@ -4193,6 +4244,7 @@ mod tests {
 
     const LIMITS: Limits = Limits {
         bytes_copied: 1_280,
+        input_packets: 1,
         output_packets: 1,
         ready_events: 1,
         maintenance_work: 1,

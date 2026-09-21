@@ -70,10 +70,12 @@ receive do
 end
 ```
 
-Packets arriving from that transport go back into the stack one at a time:
+Packets arriving from that transport go back into the stack individually or in
+a configured bounded batch:
 
 ```elixir
 :ok = SmolNet.ingress(stack, complete_ip_packet)
+{:ok, 2} = SmolNet.ingress(stack, [first_ip_packet, second_ip_packet])
 ```
 
 This boundary carries IP packets, not Ethernet frames. The link owns transport
@@ -131,8 +133,9 @@ IPv4-mapped IPv6 addresses, and fragmented IPv4 ingress are not supported.
 
 ## Troubleshooting
 
-- If ingress fails, supply exactly one complete IPv4 or IPv6 packet within the
-  configured MTU. Do not include an Ethernet header.
+- If ingress fails, supply a complete IPv4 or IPv6 packet within the configured
+  MTU, or a list within the stack's `input_packets` and `bytes_copied` limits.
+  Do not include Ethernet headers.
 - If an operation times out, confirm that the link is forwarding outbound
   packets and returning peer traffic. SmolNet drives protocol timers, but it
   cannot move packets across the external transport.

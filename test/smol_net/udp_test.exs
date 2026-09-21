@@ -3,6 +3,11 @@ defmodule SmolNet.UdpTest do
 
   alias SmolNet.Inet6.Udp
   alias SmolNet.Test.RawIpLink
+  alias SmolNet.Test.Timing
+
+  @wait_5s Timing.liveness(5_000)
+  @wait_6s Timing.liveness(6_000)
+  @idle_20ms Timing.quiescence(20)
 
   @server {0xFD00, 0, 0, 0, 0, 0, 0, 1}
   @client {0xFD00, 0, 0, 0, 0, 0, 0, 2}
@@ -110,23 +115,12 @@ defmodule SmolNet.UdpTest do
 
     :ok = RawIpLink.connect(link, :server, client_stack)
     :ok = RawIpLink.connect(link, :client, server_stack)
+    :ok = RawIpLink.fault(link, :drop)
 
     port = 42_007
-    {:ok, server} = SmolNet.open(:inet6, :dgram, :udp, stack: server_stack)
-    :ok = SmolNet.bind(server, endpoint(@server, port))
     {:ok, client} = SmolNet.open(:inet6, :dgram, :udp, stack: client_stack)
     :ok = SmolNet.bind(client, endpoint(@client, 0))
     destination = endpoint(@server, port)
-
-    collector =
-      Task.async(fn ->
-        for _index <- 1..18 do
-          {:ok, %{data: <<sequence::16, _padding::binary>>, truncated: false}} =
-            SmolNet.recvfrom(server, 0, 5_000)
-
-          sequence
-        end
-      end)
 
     :ok = :sys.suspend(client_stack.stack)
 
@@ -144,10 +138,10 @@ defmodule SmolNet.UdpTest do
                 {:"$smol_socket", identity, :select, ^reference} ->
                   assert identity == SmolNet.Socket.identity(client)
               after
-                5_000 -> flunk("full UDP transmit ring never became writable")
+                @wait_5s -> flunk("full UDP transmit ring never became writable")
               end
 
-              assert :ok = SmolNet.sendto(client, payload, destination, 5_000)
+              assert :ok = SmolNet.sendto(client, payload, destination, @wait_5s)
               {sequence, :retried}
           end
         end)
@@ -159,11 +153,12 @@ defmodule SmolNet.UdpTest do
     end)
 
     :ok = :sys.resume(client_stack.stack)
-    send_results = Enum.map(sends, &Task.await(&1, 6_000))
-    received = Task.await(collector, 6_000)
+    send_results = Enum.map(sends, &Task.await(&1, @wait_6s))
+    transmitted = receive_egress_sequences(:client, 18, @wait_6s)
 
     assert Enum.count(send_results, fn {_sequence, mode} -> mode == :retried end) == 1
-    assert Enum.sort(received) == Enum.to_list(1..18)
+    assert Enum.sort(transmitted) == Enum.to_list(1..18)
+    refute_receive {:test_link_egress, :client, _packet}, @idle_20ms
   end
 
   test "arming an unrelated receive preserves pending UDP egress" do
@@ -545,6 +540,21 @@ defmodule SmolNet.UdpTest do
     Enum.any?(messages, fn
       {:udp, ^socket, _address, _port, _packet} -> true
       _message -> false
+    end)
+  end
+
+  defp receive_egress_sequences(link_ref, count, timeout) do
+    Enum.map(1..count, fn _index ->
+      packet =
+        receive do
+          {:test_link_egress, ^link_ref, packet} -> packet
+        after
+          timeout -> flunk("timed out collecting UDP egress")
+        end
+
+      payload = binary_part(packet, byte_size(packet) - 1_000, 1_000)
+      <<sequence::16, _padding::binary>> = payload
+      sequence
     end)
   end
 
