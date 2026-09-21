@@ -169,22 +169,11 @@ defmodule SmolNet.IPv4UdpTest do
       on_exit(fn -> resume_if_alive(client_stack.stack) end)
       :ok = @link_module.connect(link, :server, client_stack)
       :ok = @link_module.connect(link, :client, server_stack)
+      :ok = @link_module.fault(link, :drop)
 
       port = 43_005
-      {:ok, server} = SmolNet.open(:inet, :dgram, :udp, stack: server_stack)
-      :ok = SmolNet.bind(server, endpoint4(@server4, port))
       {:ok, client} = SmolNet.open(:inet, :dgram, :udp, stack: client_stack)
       :ok = SmolNet.bind(client, endpoint4(@client4, 0))
-
-      collector =
-        Task.async(fn ->
-          for _index <- 1..18 do
-            {:ok, %{data: <<sequence::16, _padding::binary>>, truncated: false}} =
-              SmolNet.recvfrom(server, 0, @wait_5s)
-
-            sequence
-          end
-        end)
 
       :ok = :sys.suspend(client_stack.stack)
 
@@ -218,10 +207,11 @@ defmodule SmolNet.IPv4UdpTest do
 
       :ok = :sys.resume(client_stack.stack)
       send_results = Enum.map(sends, &Task.await(&1, @wait_6s))
-      received = Task.await(collector, @wait_6s)
+      transmitted = receive_egress_sequences(:client, 18, @wait_6s)
 
       assert Enum.count(send_results, fn {_sequence, mode} -> mode == :retried end) == 1
-      assert Enum.sort(received) == Enum.to_list(1..18)
+      assert Enum.sort(transmitted) == Enum.to_list(1..18)
+      refute_receive {:test_link_egress, :client, _packet}, @idle_20ms
     end
 
     test "unrelated IPv4 receive preserves egress via #{inspect(link_module)}" do
@@ -789,6 +779,21 @@ defmodule SmolNet.IPv4UdpTest do
     Enum.any?(messages, fn
       {:udp, ^socket, _address, _port, _packet} -> true
       _message -> false
+    end)
+  end
+
+  defp receive_egress_sequences(link_ref, count, timeout) do
+    Enum.map(1..count, fn _index ->
+      packet =
+        receive do
+          {:test_link_egress, ^link_ref, packet} -> packet
+        after
+          timeout -> flunk("timed out collecting IPv4 UDP egress")
+        end
+
+      payload = binary_part(packet, byte_size(packet) - 1_000, 1_000)
+      <<sequence::16, _padding::binary>> = payload
+      sequence
     end)
   end
 
