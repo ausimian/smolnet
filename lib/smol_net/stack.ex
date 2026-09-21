@@ -924,8 +924,6 @@ defmodule SmolNet.Stack do
 
   defp validate_packet(packet, _mtu) when is_binary(packet), do: {:error, :invalid_packet}
 
-  defp validate_packet(_packet, _mtu), do: {:error, :invalid_packet}
-
   defp validate_ipv6_packet(packet, mtu) do
     case packet do
       <<6::4, _traffic_and_flow::28, payload_length::16, _rest::binary>> ->
