@@ -237,21 +237,27 @@ defmodule SmolNet.NativeTest do
 
     unconstrained = native_stack()
     keys = arm_read_waiters(unconstrained, ready_events)
-    # Arming the waiters spends this process's slice; yield for a fresh one so
-    # the reference call is not itself throttled.
-    :erlang.yield()
-    assert {:ok, _envelope} = Native.test_socket_ready(unconstrained, keys)
+    # Arming the waiters spends this process's slice. Use a fresh process so
+    # the reference call cannot inherit a nearly exhausted reduction slice.
+    assert {:ok, _envelope} =
+             with_fresh_reduction_slice(fn ->
+               Native.test_socket_ready(unconstrained, keys)
+             end)
+
     delivered_unconstrained = await_select_messages()
 
     starved = native_stack()
     keys = arm_read_waiters(starved, ready_events)
-    :erlang.yield()
 
     # The first incremental charge reports the caller's slice as spent, so the
     # call stops after the chunk that charge covers instead of continuing to
     # drain readiness.
     assert {:ok, %{result: :ok}} = Native.test_set_slice_exhaustion(starved, 0)
-    assert {:ok, %{more: true}} = Native.test_socket_ready(starved, keys)
+
+    assert {:ok, %{more: true}} =
+             with_fresh_reduction_slice(fn ->
+               Native.test_socket_ready(starved, keys)
+             end)
 
     delivered_starved = await_select_messages()
     assert delivered_starved > 0
@@ -634,6 +640,12 @@ defmodule SmolNet.NativeTest do
   defp await_select_messages do
     assert_receive {:"$smol_socket", _identity, :select, _reference}, @wait_1s
     drain_select_messages(1)
+  end
+
+  defp with_fresh_reduction_slice(call) do
+    call
+    |> Task.async()
+    |> Task.await(@wait_1s)
   end
 
   defp drain_select_messages(count) do
