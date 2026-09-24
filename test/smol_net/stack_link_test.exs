@@ -669,6 +669,36 @@ defmodule SmolNet.StackLinkTest do
     assert SmolNet.ingress(stack, empty_ipv6_packet()) == {:error, :link_down}
   end
 
+  test "a link monitoring its stack sees it stopped by stop_stack" do
+    {:ok, stack} = SmolNet.start_stack(egress: {self(), :monitored})
+    monitor = SmolNet.monitor(stack)
+
+    assert :ok = SmolNet.stop_stack(stack)
+
+    assert_receive {:DOWN, ^monitor, :process, _object, _reason}
+  end
+
+  # A killed stack runs no terminate callback, so only a monitor can report it.
+  test "a link monitoring its stack sees it crash" do
+    {:ok, stack} = SmolNet.start_stack(egress: {self(), :monitored})
+    monitor = SmolNet.monitor(stack)
+    %{stack: stack_pid} = Ref.pids(stack)
+
+    Process.exit(stack_pid, :kill)
+
+    assert_receive {:DOWN, ^monitor, :process, _object, _reason}
+    assert SmolNet.ingress(stack, empty_ipv6_packet()) == {:error, :closed}
+  end
+
+  test "monitoring a stack that has already stopped reports it at once" do
+    {:ok, stack} = SmolNet.start_stack(egress: {self(), :monitored})
+    :ok = SmolNet.stop_stack(stack)
+
+    monitor = SmolNet.monitor(stack)
+
+    assert_receive {:DOWN, ^monitor, :process, _object, _reason}
+  end
+
   test "validates stack link and IPv6 configuration options" do
     assert SmolNet.start_stack(egress: :bad) == {:error, :invalid_egress}
 
