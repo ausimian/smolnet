@@ -18,8 +18,9 @@ defmodule SmolNet.Loopback do
   The link owns the stack it loops. `start_link/1` accepts the same options as
   `SmolNet.start_stack/1` apart from `:egress`, which the link supplies, and
   returns once the stack is running. Stopping the link stops the stack through
-  the stack's own `:link_down` policy, and stopping the stack with
-  `SmolNet.stop_stack/1` stops the link.
+  the stack's own `:link_down` policy. The link watches its stack with
+  `SmolNet.monitor/1`, so stopping the stack with `SmolNet.stop_stack/1`, or a
+  stack crash, stops the link.
 
   Because the loop is an ordinary link process, packets re-enter through the
   public `SmolNet.ingress/2` and are validated exactly like packets arriving
@@ -103,7 +104,7 @@ defmodule SmolNet.Loopback do
   end
 
   # The stack was stopped from elsewhere, so the link it fed has no purpose.
-  def handle_info({:DOWN, monitor, :process, _bundle, _reason}, %{monitor: monitor} = state) do
+  def handle_info({:DOWN, monitor, :process, _object, _reason}, %{monitor: monitor} = state) do
     {:stop, :normal, state}
   end
 
@@ -112,8 +113,7 @@ defmodule SmolNet.Loopback do
   defp start_looped_stack(options) do
     case SmolNet.start_stack(Keyword.put(options, :egress, {self(), @link_ref})) do
       {:ok, stack} ->
-        monitor = Process.monitor(Map.fetch!(Ref.pids(stack), :bundle))
-        {:ok, %{stack: stack, monitor: monitor}}
+        {:ok, %{stack: stack, monitor: SmolNet.monitor(stack)}}
 
       {:error, reason} ->
         {:stop, reason}
