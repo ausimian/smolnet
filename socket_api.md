@@ -58,6 +58,13 @@ still owns the ingress slot, a feeder can receive `{:error, :busy}` and should
 retry after yielding. The `:link_down` policy may be `:stop`, `:mark_down`, or
 `{:notify, pid}`.
 
+The stack monitors its link, and the link can monitor the stack in return.
+`SmolNet.monitor/1` returns an ordinary monitor reference, and the link receives
+`{:DOWN, monitor, :process, _object, _reason}` when the stack stops, whether
+through `SmolNet.stop_stack/1` or a crash. Match on the reference; the object
+and reason are internal. A link that owns its transport can exit on that
+message and let its supervisor rebuild both.
+
 For examples and tests, `SmolNet.Loopback` supplies a link that feeds every
 emitted packet back into the same stack:
 

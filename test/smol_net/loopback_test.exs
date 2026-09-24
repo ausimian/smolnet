@@ -2,6 +2,7 @@ defmodule SmolNet.LoopbackTest do
   use ExUnit.Case, async: false
 
   alias SmolNet.Loopback
+  alias SmolNet.Stack.Ref
   alias SmolNet.Test.Timing
 
   # Liveness budgets: bounds on how long a healthy run may take to make
@@ -133,6 +134,16 @@ defmodule SmolNet.LoopbackTest do
     monitor = Process.monitor(link)
 
     assert :ok = SmolNet.stop_stack(stack)
+
+    assert_receive {:DOWN, ^monitor, :process, ^link, :normal}, @wait_1s
+  end
+
+  test "a stack crash stops the link that loops it" do
+    {:ok, link, stack} = Loopback.start_link(addresses: @addresses)
+    monitor = Process.monitor(link)
+    %{stack: stack_pid} = Ref.pids(stack)
+
+    Process.exit(stack_pid, :kill)
 
     assert_receive {:DOWN, ^monitor, :process, ^link, :normal}, @wait_1s
   end

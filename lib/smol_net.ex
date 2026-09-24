@@ -6,6 +6,16 @@ defmodule SmolNet do
   Each stack is an independent, supervised native network namespace. Stacks
   exchange complete raw IPv4 or IPv6 packets with a caller-provided link process.
 
+  ## Links
+
+  A link carries a stack's packets over an application-defined transport. It
+  receives outbound batches as `{:smol_stack, link_ref, :egress, packets}` and
+  hands inbound packets back with `ingress/2`. Each side watches the other. The
+  stack monitors its link and applies its `:link_down` policy when the link
+  exits. A link calls `monitor/1` to receive an ordinary `:DOWN` message when
+  its stack stops, whether through `stop_stack/1` or a crash, so it can exit
+  instead of running a transport in front of a stack that is gone.
+
   ## TCP endpoints and errors
 
   Low-level TCP endpoints use explicit `:socket`-style maps:
@@ -63,6 +73,29 @@ defmodule SmolNet do
   @doc "Stops a stack and its complete runtime bundle."
   @spec stop_stack(Stack.Ref.t()) :: :ok | {:error, :closed}
   defdelegate stop_stack(stack), to: SmolNet.StackSupervisor, as: :stop_stack
+
+  @doc """
+  Monitors a stack from the calling process.
+
+  Returns an ordinary monitor reference. When the stack stops for any reason,
+  whether through `stop_stack/1`, a crash, or its own `:link_down` policy, the
+  caller receives `{:DOWN, ref, :process, object, reason}` once the complete
+  runtime bundle has terminated. Match on `ref`: `object` and `reason` describe
+  internal processes and are not part of the contract. A stack that has already
+  stopped produces the message immediately, as `Process.monitor/1` does for a
+  dead process. Remove the monitor with `Process.demonitor/2`.
+
+  A link calls this so that it can exit when its stack stops, letting its
+  supervisor rebuild both:
+
+      monitor = SmolNet.monitor(stack)
+
+      receive do
+        {:DOWN, ^monitor, :process, _object, _reason} -> exit(:stack_down)
+      end
+  """
+  @spec monitor(Stack.Ref.t()) :: reference()
+  defdelegate monitor(stack), to: SmolNet.StackSupervisor
 
   @doc """
   Hands raw IPv4 or IPv6 packets from the stack's link feeder to the stack.

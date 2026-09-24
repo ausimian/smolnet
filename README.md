@@ -82,6 +82,18 @@ This boundary carries IP packets, not Ethernet frames. The link owns transport
 backpressure. When it terminates, the stack follows its configured `:link_down`
 policy. `SmolNet.stop_stack/1` stops the complete temporary supervision bundle.
 
+A link that should not outlive its stack monitors it. `SmolNet.monitor/1`
+returns an ordinary monitor, and the link receives a standard `:DOWN` message
+when the stack stops, whether through `SmolNet.stop_stack/1` or a crash:
+
+```elixir
+monitor = SmolNet.monitor(stack)
+
+receive do
+  {:DOWN, ^monitor, :process, _object, _reason} -> exit(:stack_down)
+end
+```
+
 For a self-contained stack with no external transport, use
 `SmolNet.Loopback`. It feeds every emitted packet back into the same stack:
 

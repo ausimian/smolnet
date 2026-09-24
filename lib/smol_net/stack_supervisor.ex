@@ -71,6 +71,11 @@ defmodule SmolNet.StackSupervisor do
     end
   end
 
+  # The bundle outlives every process inside it, and a stack crash shuts the
+  # bundle down, so its exit is the one event that means the stack is gone.
+  @spec monitor(Ref.t()) :: reference()
+  def monitor(%Ref{bundle: bundle}), do: Process.monitor(bundle)
+
   @doc false
   @spec start_inet_backend(Ref.t(), Supervisor.child_spec()) :: DynamicSupervisor.on_start_child()
   def start_inet_backend(%Ref{inet_backends: supervisor}, child_spec) do
