@@ -8,6 +8,13 @@ and this project adheres to
 
 <!-- %% CHANGELOG_ENTRIES %% -->
 
+## 0.3.0 - 2026-09-24
+
+### Added
+
+- `SmolNet.ingress/2` accepts bounded packet lists, allowing burst-oriented
+  links to cross the BEAM/native boundary and drive the stack once per batch.
+
 ## 0.2.1 - 2026-09-19
 
 ### Fixed
