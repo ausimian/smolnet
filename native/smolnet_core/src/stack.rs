@@ -1769,6 +1769,12 @@ impl NativeStack {
         // work this call did before reaching the readiness loops.
         self.charge_chunk(env, &mut uncharged, true);
 
+        // An envelope that ends without a continuation and carries a poll_at
+        // replaces the BEAM timer, whichever call produced it.
+        if let Some(millis) = effects.poll_at.filter(|_| !effects.more) {
+            self.scheduled_poll_at = Some(Instant::from_millis(millis));
+        }
+
         Envelope {
             result,
             output: effects.output,
@@ -3126,7 +3132,7 @@ impl NativeStack {
 
         // smoltcp closes a socket whose TIME-WAIT has elapsed without emitting
         // a segment, so egress reports no state change for it. That timer is
-        // part of the deadline this stack last scheduled, so once a drive
+        // part of the deadline this stack last published, so once a drive
         // reaches that deadline, sweep closing sockets after egress; otherwise
         // the slot stays held until the much later close deadline.
         let scheduled_deadline_reached = !self.closing_tcp.is_empty()
@@ -3259,13 +3265,12 @@ impl NativeStack {
         let poll_at = if more {
             Some(now.total_millis())
         } else {
-            self.scheduled_poll_at = self
-                .interface
+            self.interface
                 .poll_at(now, &self.sockets)
                 .into_iter()
                 .chain(self.next_close_deadline())
-                .min();
-            self.scheduled_poll_at.map(|instant| instant.total_millis())
+                .min()
+                .map(|instant| instant.total_millis())
         };
 
         self.counters.observe(Work {
