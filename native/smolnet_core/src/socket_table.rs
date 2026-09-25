@@ -200,6 +200,11 @@ impl SocketTable {
             .is_some())
     }
 
+    #[cfg(debug_assertions)]
+    pub fn test_set_max_waiters(&mut self, max_waiters: usize) {
+        self.max_waiters = max_waiters;
+    }
+
     pub fn ensure_waiter_capacity(&self) -> Result<(), SocketError> {
         if self.waiter_count >= self.max_waiters {
             Err(SocketError::SystemLimit)

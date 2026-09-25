@@ -1,7 +1,9 @@
 defmodule SmolNet.TcpStreamTest do
   use ExUnit.Case, async: false
 
+  alias SmolNet.Native
   alias SmolNet.Socket
+  alias SmolNet.Stack.Ref
   alias SmolNet.Test.IPv6TcpPeer
   alias SmolNet.Test.ManualClock
 
@@ -66,7 +68,7 @@ defmodule SmolNet.TcpStreamTest do
   end
 
   test "graceful closing records retain bounded logical socket capacity" do
-    {stack, peer, socket} = connected_socket(limits: %{ready_events: 1})
+    {stack, peer, socket} = connected_socket(limits: %{sockets: 1})
     :ok = IPv6TcpPeer.hold_acks(peer, true)
 
     assert :ok = SmolNet.close(socket)
@@ -77,7 +79,7 @@ defmodule SmolNet.TcpStreamTest do
     assert info.native.result.closing_tcp_socket_count == 1
 
     assert info.native.result.socket_count + info.native.result.closing_tcp_socket_count <=
-             info.native.result.limits.ready_events
+             info.native.result.limits.sockets
   end
 
   test "exact receives accumulate only in the caller across bounded native reads" do
@@ -146,8 +148,12 @@ defmodule SmolNet.TcpStreamTest do
     assert :ok = SmolNet.cancel(socket, write_select)
   end
 
+  @tag :debug_nif
   test "waiter exhaustion never consumes send or receive bytes" do
-    {stack, peer, socket} = connected_socket(limits: %{ready_events: 1}, sndbuf: 4_096)
+    {stack, peer, socket} = connected_socket(sndbuf: 4_096)
+    %{stack: stack_pid} = Ref.pids(stack)
+    %{native: native} = :sys.get_state(stack_pid)
+    assert {:ok, %{result: :ok}} = Native.test_set_waiter_capacity(native, 1)
     assert {:select, read_select} = SmolNet.recv(socket, 1, :nowait)
     assert :ok = IPv6TcpPeer.hold_acks(peer, true)
 

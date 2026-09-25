@@ -309,7 +309,7 @@ defmodule SmolNet.TcpListenerTest do
   end
 
   test "public socket-table saturation drops a promoted child and refills the pool" do
-    {server_stack, client_stack} = linked_stacks(limits: %{ready_events: 1})
+    {server_stack, client_stack} = linked_stacks(limits: %{sockets: 1})
     _listener = listener(server_stack, 1, 40_019)
     client = connect(client_stack, 40_019)
 

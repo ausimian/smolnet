@@ -144,6 +144,11 @@ defmodule SmolNet.Native do
   def test_set_budget_checkpoints(_stack, _checkpoints),
     do: :erlang.nif_error(:nif_not_loaded)
 
+  @spec test_set_waiter_capacity(reference(), non_neg_integer()) ::
+          {:ok, map()} | {:error, atom()}
+  def test_set_waiter_capacity(_stack, _waiters),
+    do: :erlang.nif_error(:nif_not_loaded)
+
   @spec test_set_slice_exhaustion(reference(), non_neg_integer()) ::
           {:ok, map()} | {:error, atom()}
   def test_set_slice_exhaustion(_stack, _charges),

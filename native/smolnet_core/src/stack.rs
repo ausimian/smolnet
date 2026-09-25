@@ -41,7 +41,12 @@ static NEXT_STACK_ID: AtomicU64 = AtomicU64::new(1);
 static CREATED: AtomicUsize = AtomicUsize::new(0);
 static DROPPED: AtomicUsize = AtomicUsize::new(0);
 static ACTIVE: AtomicUsize = AtomicUsize::new(0);
-pub const NATIVE_SOCKET_CAPACITY: usize = 64;
+
+/// The most socket buffer memory one stack holds: 64 sockets with the largest
+/// TCP buffers, which was the most a stack could hold when 64 sockets was a
+/// fixed limit. An unexpected resource drop frees it all in one synchronous
+/// destructor, so a higher `sockets` limit must not raise it (ADR 0014).
+pub const MAX_SOCKET_BUFFER_BYTES: usize = 64 * 2 * tcp_support::MAX_BUFFER_BYTES;
 
 pub struct StackResource {
     inner: Mutex<Option<NativeStack>>,
@@ -147,6 +152,7 @@ pub struct NativeStack {
     ready: ReadyQueue,
     ready_sweep: bool,
     ready_sweep_cursor: Option<ReadyKey>,
+    ready_sweep_resweep: bool,
     ready_sweep_pending: VecDeque<ReadyKey>,
     counters: Counters,
     lifecycle: Lifecycle,
@@ -199,7 +205,8 @@ impl NativeStack {
             interface,
             sockets: SocketSet::new(Vec::new()),
             device,
-            socket_table: SocketTable::new(limits.ready_events, limits.ready_events),
+            // A socket holds at most one waiter in each direction.
+            socket_table: SocketTable::new(limits.sockets, limits.sockets * 2),
             tcp_records: BTreeMap::new(),
             tcp_listeners: BTreeMap::new(),
             tcp_connections: BTreeMap::new(),
@@ -220,6 +227,7 @@ impl NativeStack {
             ready: ReadyQueue::new((limits.ready_events / 2).max(1)),
             ready_sweep: false,
             ready_sweep_cursor: None,
+            ready_sweep_resweep: false,
             ready_sweep_pending: VecDeque::new(),
             counters: Counters::default(),
             lifecycle: Lifecycle::Running,
@@ -330,7 +338,9 @@ impl NativeStack {
                 limits: self.limits,
                 socket_count: self.socket_table.len(),
                 native_socket_count: self.sockets.iter().count(),
-                native_socket_capacity: NATIVE_SOCKET_CAPACITY,
+                native_socket_capacity: self.limits.sockets,
+                socket_buffer_bytes: self.socket_buffer_bytes(),
+                socket_buffer_capacity: MAX_SOCKET_BUFFER_BYTES,
                 tcp_socket_count: self.tcp_records.len(),
                 tcp_listener_count: self.tcp_listeners.len(),
                 udp_socket_count: self.udp_records.len(),
@@ -398,6 +408,14 @@ impl NativeStack {
     #[cfg(debug_assertions)]
     pub fn test_set_budget_checkpoints(&mut self, checkpoints: usize) -> Envelope<Atom> {
         self.next_forced_budget_checkpoints = Some(checkpoints);
+        Envelope::empty(crate::atoms::ok())
+    }
+
+    /// Lowers the waiter cap, which no sequence of public calls can reach:
+    /// each socket holds at most one waiter per direction.
+    #[cfg(debug_assertions)]
+    pub fn test_set_waiter_capacity(&mut self, waiters: usize) -> Envelope<Atom> {
+        self.socket_table.test_set_max_waiters(waiters);
         Envelope::empty(crate::atoms::ok())
     }
 
@@ -481,7 +499,7 @@ impl NativeStack {
 
     #[cfg(debug_assertions)]
     pub fn test_prepare_closing(&mut self, count: usize) -> Result<Envelope<Atom>, SocketError> {
-        if count > self.limits.maintenance_work || count > self.limits.ready_events {
+        if count > self.limits.sockets {
             return Err(SocketError::SystemLimit);
         }
 
@@ -491,6 +509,7 @@ impl NativeStack {
         for _index in 0..count {
             self.ensure_logical_socket_capacity()?;
             self.ensure_native_socket_capacity(1, 0)?;
+            self.ensure_socket_buffer_capacity(2 * tcp_support::DEFAULT_BUFFER_BYTES)?;
             let handle = self.sockets.add(tcp_support::default_socket());
             let identity = match self.socket_table.insert(SocketKind::Tcp, 0) {
                 Ok(identity) => identity,
@@ -539,6 +558,12 @@ impl NativeStack {
         self.ensure_running()?;
         self.ensure_logical_socket_capacity()?;
         self.ensure_native_socket_capacity(1, 0)?;
+
+        if !tcp_support::valid_buffer_bytes(rcvbuf) || !tcp_support::valid_buffer_bytes(sndbuf) {
+            return Err(SocketError::InvalidOptions);
+        }
+
+        self.ensure_socket_buffer_capacity(rcvbuf + sndbuf)?;
 
         let handle = self.sockets.add(tcp_support::socket(rcvbuf, sndbuf)?);
         let identity = match self.socket_table.insert(SocketKind::Tcp, 0) {
@@ -642,6 +667,9 @@ impl NativeStack {
         let listen_endpoint = self.concrete_listener_endpoint(endpoint)?;
         let pool_target = backlog.min(tcp_support::LISTENER_POOL_MAX);
         self.ensure_native_socket_capacity(pool_target.saturating_sub(1), 0)?;
+        self.ensure_socket_buffer_capacity(
+            (pool_target.saturating_sub(1)).saturating_mul(record.rcvbuf + record.sndbuf),
+        )?;
         let mut handles = vec![record.handle];
 
         for _ in 1..pool_target {
@@ -1185,6 +1213,7 @@ impl NativeStack {
         self.ensure_running()?;
         self.ensure_logical_socket_capacity()?;
         self.ensure_native_socket_capacity(1, 0)?;
+        self.ensure_socket_buffer_capacity(udp_support::BUFFER_BYTES)?;
 
         let handle = self.sockets.add(udp_support::socket());
         let identity = match self.socket_table.insert(SocketKind::Udp, 0) {
@@ -1254,6 +1283,7 @@ impl NativeStack {
         let primary_address = addresses.next().expect("non-empty addresses checked");
         let additional_addresses = addresses.collect::<Vec<_>>();
         self.ensure_native_socket_capacity(additional_addresses.len(), 0)?;
+        self.ensure_socket_buffer_capacity(additional_addresses.len() * udp_support::BUFFER_BYTES)?;
         let mut additional_sockets = Vec::with_capacity(additional_addresses.len());
 
         for address in additional_addresses {
@@ -1288,7 +1318,7 @@ impl NativeStack {
                 .map(|socket| self.sockets.add(socket)),
         );
 
-        debug_assert!(self.sockets.iter().count() <= NATIVE_SOCKET_CAPACITY);
+        debug_assert!(self.sockets.iter().count() <= self.limits.sockets);
 
         let record = self.udp_record_mut(identity)?;
         record.handles = handles;
@@ -1712,8 +1742,15 @@ impl NativeStack {
         }
 
         if self.ready.take_overflow() && matches!(self.lifecycle, Lifecycle::Running) {
-            self.ready_sweep = true;
-            self.ready_sweep_cursor = None;
+            // Restarting a sweep that is under way would let overflows that
+            // recur every call rescan the same low IDs and never reach the
+            // rest. Finish the pass, then sweep again from the start.
+            if self.ready_sweep {
+                self.ready_sweep_resweep = true;
+            } else {
+                self.ready_sweep = true;
+                self.ready_sweep_cursor = None;
+            }
         }
 
         let queued = {
@@ -1778,8 +1815,14 @@ impl NativeStack {
             }
 
             readiness_work += scan_cost;
-            self.ready_sweep = !scan.complete;
-            self.ready_sweep_cursor = self.ready_sweep.then_some(scan.cursor).flatten();
+
+            if scan.complete && self.ready_sweep_resweep {
+                self.ready_sweep_resweep = false;
+                self.ready_sweep_cursor = None;
+            } else {
+                self.ready_sweep = !scan.complete;
+                self.ready_sweep_cursor = self.ready_sweep.then_some(scan.cursor).flatten();
+            }
         }
 
         effects.more = effects.more
@@ -1821,6 +1864,7 @@ impl NativeStack {
         self.lifecycle = Lifecycle::ShuttingDown;
         self.ready_sweep = false;
         self.ready_sweep_cursor = None;
+        self.ready_sweep_resweep = false;
         self.ready_sweep_pending.clear();
         self.continue_shutdown(env)
     }
@@ -1849,6 +1893,7 @@ impl NativeStack {
             self.listener_scan_resweep = false;
             self.ready_sweep = false;
             self.ready_sweep_cursor = None;
+            self.ready_sweep_resweep = false;
             self.ready_sweep_pending.clear();
             envelope.more = false;
         }
@@ -2564,6 +2609,11 @@ impl NativeStack {
                 .then(|| {
                     self.ensure_logical_socket_capacity()?;
                     self.ensure_native_socket_capacity(1, 0)?;
+                    // The listener is out of the map while it is refreshed,
+                    // so its pool is counted here with the member it gains.
+                    self.ensure_socket_buffer_capacity(
+                        (listener.pool.len() + 1) * (listener.rcvbuf + listener.sndbuf),
+                    )?;
                     self.socket_table.insert(SocketKind::Tcp, 0)
                 })
                 .transpose();
@@ -2651,10 +2701,34 @@ impl NativeStack {
             .checked_add(self.closing_tcp.len())
             .ok_or(SocketError::SystemLimit)?;
 
-        if logical_socket_count >= self.limits.ready_events {
+        if logical_socket_count >= self.limits.sockets {
             Err(SocketError::SystemLimit)
         } else {
             Ok(())
+        }
+    }
+
+    fn socket_buffer_bytes(&self) -> usize {
+        let tcp = self
+            .tcp_records
+            .values()
+            .map(|record| record.rcvbuf + record.sndbuf);
+        let listeners = self
+            .tcp_listeners
+            .values()
+            .map(|listener| listener.pool.len() * (listener.rcvbuf + listener.sndbuf));
+        let udp = self
+            .udp_records
+            .values()
+            .map(|record| record.handles.len() * udp_support::BUFFER_BYTES);
+
+        tcp.chain(listeners).chain(udp).sum()
+    }
+
+    fn ensure_socket_buffer_capacity(&self, added: usize) -> Result<(), SocketError> {
+        match self.socket_buffer_bytes().checked_add(added) {
+            Some(total) if total <= MAX_SOCKET_BUFFER_BYTES => Ok(()),
+            _ => Err(SocketError::SystemLimit),
         }
     }
 
@@ -2669,7 +2743,7 @@ impl NativeStack {
             .and_then(|count| count.checked_add(added))
             .ok_or(SocketError::SystemLimit)?;
 
-        if resulting_socket_count > NATIVE_SOCKET_CAPACITY {
+        if resulting_socket_count > self.limits.sockets {
             Err(SocketError::SystemLimit)
         } else {
             Ok(())
@@ -3521,6 +3595,7 @@ fn fuzz_limits() -> Limits {
         output_packets: 32,
         ready_events: 64,
         maintenance_work: 64,
+        sockets: 64,
     }
 }
 
@@ -3872,6 +3947,7 @@ fn fuzz_shutdown(stack: &mut NativeStack) {
     stack.lifecycle = Lifecycle::ShuttingDown;
     stack.ready_sweep = false;
     stack.ready_sweep_cursor = None;
+    stack.ready_sweep_resweep = false;
     stack.ready_sweep_pending.clear();
 
     for _call in 0..1_024 {
@@ -4260,6 +4336,8 @@ pub struct Snapshot {
     socket_count: usize,
     native_socket_count: usize,
     native_socket_capacity: usize,
+    socket_buffer_bytes: usize,
+    socket_buffer_capacity: usize,
     tcp_socket_count: usize,
     tcp_listener_count: usize,
     udp_socket_count: usize,
@@ -4323,6 +4401,7 @@ mod tests {
         output_packets: 1,
         ready_events: 1,
         maintenance_work: 1,
+        sockets: 1,
     };
 
     fn config() -> StackConfig {

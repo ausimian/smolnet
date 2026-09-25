@@ -56,9 +56,16 @@ The time budget is backed by deterministic per-call maxima of 65,575 copied
 bytes, 32 input packets, 32 output packets, 128 readiness events, and 128
 maintenance units. These bounds prevent clock or platform anomalies from
 creating unbounded work.
-A separate hard ceiling allows at most 64 native TCP/UDP backing sockets per
-stack, including listener pools and wildcard-UDP expansion across configured
-addresses. `SmolNet.stack_info/1` exposes the call target, work budget,
+The `sockets` limit caps the native TCP/UDP backing sockets per stack,
+including listener pools and wildcard-UDP expansion across configured
+addresses. It defaults to 64 and may be raised to 512, the most at which
+resource destruction still fits the 1 ms target (ADR 0014); the socket table
+admits the same number of entries and twice as many waiters. Socket buffers
+are capped at 128 MiB per stack, what 64 sockets with the largest TCP buffers
+held before the limit was configurable, so a higher limit never raises the
+memory a destructor frees. The budget scenarios run at both maxima, so
+raising either means re-measuring them.
+`SmolNet.stack_info/1` exposes the call target, work budget,
 encoding headroom, deadline-yield count, timeslice-exhaustion count, and
 maximum observed serialized native-call duration before result encoding.
 
@@ -69,7 +76,7 @@ and p99 as evidence without gating on either, because the compute environment
 of a shared runner is outside this project's control. The deterministic
 caller-reduction budget stays enforced everywhere. Each maximum-state scenario
 uses 100 independently prepared samples outside `enforce` mode. Unexpected
-resource destruction remains synchronously bounded by the fixed socket,
+resource destruction remains synchronously bounded by the maximum socket,
 waiter, and packet capacities and is included in the benchmark.
 
 ## Vendored smoltcp

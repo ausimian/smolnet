@@ -252,7 +252,7 @@ defmodule SmolNet.TcpConnectTest do
 
   test "live socket capacity is enforced before unbounded ephemeral scans" do
     {:ok, stack} =
-      SmolNet.start_stack(addresses: [{@client, 64}], limits: %{ready_events: 4})
+      SmolNet.start_stack(addresses: [{@client, 64}], limits: %{sockets: 4})
 
     for _index <- 1..4 do
       assert {:ok, socket} = SmolNet.open(:inet6, :stream, :tcp, stack: stack)
@@ -372,7 +372,7 @@ defmodule SmolNet.TcpConnectTest do
   end
 
   test "many pending sockets stay bounded and separate stacks progress independently" do
-    {blocked_stack, _blocked_peer} = start_peer_stack(:ignore, limits: %{ready_events: 32})
+    {blocked_stack, _blocked_peer} = start_peer_stack(:ignore, limits: %{sockets: 32})
 
     blocked =
       for port <- 10_000..10_031 do
@@ -404,6 +404,30 @@ defmodule SmolNet.TcpConnectTest do
     assert :ok = SmolNet.connect(active, endpoint(@peer, 443), :nowait)
 
     Enum.each(blocked, &SmolNet.close/1)
+  end
+
+  test "a raised socket limit holds a pending connect on every socket" do
+    # More sockets, each with a waiter, than one call's readiness budget.
+    count = 200
+    {stack, _peer} = start_peer_stack(:ignore, limits: %{sockets: count})
+
+    pending =
+      for port <- 1..count do
+        {:ok, socket} = SmolNet.open(:inet6, :stream, :tcp, stack: stack)
+        assert {:select, _select_info} = SmolNet.connect(socket, endpoint(@peer, port), :nowait)
+        socket
+      end
+
+    assert {:error, :system_limit} = SmolNet.open(:inet6, :stream, :tcp, stack: stack)
+
+    {:ok, info} = SmolNet.stack_info(stack)
+    assert info.native.result.limits.ready_events < count
+    assert info.native.result.native_socket_capacity == count
+    assert info.native.result.native_socket_count == count
+    assert info.native.result.socket_count == count
+    assert info.native.result.waiter_count == count
+
+    Enum.each(pending, &SmolNet.close/1)
   end
 
   test "concurrent connects on one stack are serialized and all complete" do

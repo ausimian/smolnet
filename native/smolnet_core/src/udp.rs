@@ -6,6 +6,8 @@ use crate::waiter::SocketIdentity;
 
 pub const PACKET_CAPACITY: usize = 16;
 pub const PAYLOAD_BYTES: usize = 16 * 1024;
+/// Payload bytes a UDP socket allocates across its receive and transmit rings.
+pub const BUFFER_BYTES: usize = 2 * PAYLOAD_BYTES;
 
 #[derive(Clone, Debug)]
 pub struct UdpRecord {
