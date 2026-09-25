@@ -2738,6 +2738,19 @@ impl NativeStack {
             .map(|(deadline, _id)| *deadline)
     }
 
+    fn closing_time_wait_count(&self) -> usize {
+        self.closing_tcp
+            .iter()
+            .filter_map(|id| self.tcp_records.get(id))
+            .filter(|record| {
+                self.sockets
+                    .get::<tcp::Socket<'static>>(record.handle)
+                    .state()
+                    == tcp::State::TimeWait
+            })
+            .count()
+    }
+
     fn request_closing_cleanup(&mut self) {
         if self.closing_tcp.is_empty() {
             return;
@@ -3123,14 +3136,11 @@ impl NativeStack {
         }
 
         // smoltcp closes a socket whose TIME-WAIT has elapsed without emitting
-        // a segment, so egress reports no state change for it. Sweep closing
-        // sockets after egress whenever a socket timer is due, or the slot
-        // stays held until the much later close deadline.
-        let socket_timer_due = !self.closing_tcp.is_empty()
-            && self
-                .interface
-                .poll_at(now, &self.sockets)
-                .is_some_and(|deadline| deadline <= now);
+        // a segment, so egress reports no state change for it. Egress can only
+        // take a socket out of TIME-WAIT, so fewer afterwards means one
+        // expired; without a sweep its slot stays held until the much later
+        // close deadline.
+        let time_wait_before = self.closing_time_wait_count();
 
         let mut maintenance_work = 0usize;
         let mut egress_may_remain = false;
@@ -3199,7 +3209,7 @@ impl NativeStack {
             egress_may_remain = true;
         }
 
-        if socket_timer_due {
+        if time_wait_before > 0 && self.closing_time_wait_count() < time_wait_before {
             self.request_closing_cleanup();
         }
 
