@@ -137,6 +137,7 @@ pub struct NativeStack {
     closing_cleanup_pending: bool,
     closing_cleanup_resweep: bool,
     maintenance_cleanup_turn: bool,
+    scheduled_poll_at: Option<Instant>,
     next_ephemeral_port: u16,
     next_udp_ephemeral_port: u16,
     listener_scan_cursor: Option<ListenerMemberKey>,
@@ -205,6 +206,7 @@ impl NativeStack {
             closing_cleanup_pending: false,
             closing_cleanup_resweep: false,
             maintenance_cleanup_turn: false,
+            scheduled_poll_at: None,
             next_ephemeral_port: tcp_support::EPHEMERAL_PORT_FIRST,
             next_udp_ephemeral_port: tcp_support::EPHEMERAL_PORT_FIRST,
             listener_scan_cursor: None,
@@ -2738,19 +2740,6 @@ impl NativeStack {
             .map(|(deadline, _id)| *deadline)
     }
 
-    fn closing_time_wait_count(&self) -> usize {
-        self.closing_tcp
-            .iter()
-            .filter_map(|id| self.tcp_records.get(id))
-            .filter(|record| {
-                self.sockets
-                    .get::<tcp::Socket<'static>>(record.handle)
-                    .state()
-                    == tcp::State::TimeWait
-            })
-            .count()
-    }
-
     fn request_closing_cleanup(&mut self) {
         if self.closing_tcp.is_empty() {
             return;
@@ -3136,11 +3125,14 @@ impl NativeStack {
         }
 
         // smoltcp closes a socket whose TIME-WAIT has elapsed without emitting
-        // a segment, so egress reports no state change for it. Egress can only
-        // take a socket out of TIME-WAIT, so fewer afterwards means one
-        // expired; without a sweep its slot stays held until the much later
-        // close deadline.
-        let time_wait_before = self.closing_time_wait_count();
+        // a segment, so egress reports no state change for it. That timer is
+        // part of the deadline this stack last scheduled, so once a drive
+        // reaches that deadline, sweep closing sockets after egress; otherwise
+        // the slot stays held until the much later close deadline.
+        let scheduled_deadline_reached = !self.closing_tcp.is_empty()
+            && self
+                .scheduled_poll_at
+                .is_some_and(|deadline| now >= deadline);
 
         let mut maintenance_work = 0usize;
         let mut egress_may_remain = false;
@@ -3209,8 +3201,14 @@ impl NativeStack {
             egress_may_remain = true;
         }
 
-        if time_wait_before > 0 && self.closing_time_wait_count() < time_wait_before {
+        if scheduled_deadline_reached {
             self.request_closing_cleanup();
+
+            // Only a complete egress pass is sure to have dispatched the
+            // expired socket; until one runs, later drives sweep again.
+            if egress_attempted && !egress_may_remain {
+                self.scheduled_poll_at = None;
+            }
         }
 
         let remaining_packets = self.limits.output_packets.saturating_sub(output.len());
@@ -3261,12 +3259,13 @@ impl NativeStack {
         let poll_at = if more {
             Some(now.total_millis())
         } else {
-            self.interface
+            self.scheduled_poll_at = self
+                .interface
                 .poll_at(now, &self.sockets)
                 .into_iter()
                 .chain(self.next_close_deadline())
-                .min()
-                .map(|instant| instant.total_millis())
+                .min();
+            self.scheduled_poll_at.map(|instant| instant.total_millis())
         };
 
         self.counters.observe(Work {
