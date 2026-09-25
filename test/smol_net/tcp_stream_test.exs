@@ -350,6 +350,49 @@ defmodule SmolNet.TcpStreamTest do
     end)
   end
 
+  test "a socket that closes first frees its slot when TIME-WAIT ends" do
+    {:ok, clock} = ManualClock.start()
+    Application.put_env(:smolnet, :clock_module, ManualClock)
+    Application.put_env(:smolnet, :manual_clock, clock)
+    {stack, peer, socket} = connected_socket()
+
+    assert :ok = SmolNet.close(socket)
+
+    assert_eventually(fn ->
+      Enum.any?(IPv6TcpPeer.stats(peer).packets, &flag?(&1.flags, 0x01))
+    end)
+
+    packet_count = length(IPv6TcpPeer.stats(peer).packets)
+    assert :ok = IPv6TcpPeer.finish(peer)
+
+    # The stack acknowledges the peer's FIN and enters TIME-WAIT.
+    assert_eventually(fn ->
+      IPv6TcpPeer.stats(peer).packets
+      |> Enum.drop(packet_count)
+      |> Enum.any?(&(&1.flags == 0x10))
+    end)
+
+    {:ok, info} = SmolNet.stack_info(stack)
+    assert info.native.result.closing_tcp_socket_count == 1
+
+    # TIME-WAIT lasts 10 s, well short of the 30 s close deadline.
+    assert :ok = ManualClock.advance(clock, 10_001)
+
+    for _step <- 1..8 do
+      Process.sleep(10)
+      assert :ok = ManualClock.advance(clock, 0)
+    end
+
+    assert_eventually(fn ->
+      {:ok, info} = SmolNet.stack_info(stack)
+
+      info.native.result.closing_tcp_socket_count == 0 and
+        info.native.result.native_socket_count == 0
+    end)
+
+    refute Enum.any?(IPv6TcpPeer.stats(peer).packets, &flag?(&1.flags, 0x04))
+  end
+
   test "unresponsive graceful close expires with minimum maintenance work" do
     {:ok, clock} = ManualClock.start()
     Application.put_env(:smolnet, :clock_module, ManualClock)

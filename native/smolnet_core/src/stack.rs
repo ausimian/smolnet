@@ -137,6 +137,7 @@ pub struct NativeStack {
     closing_cleanup_pending: bool,
     closing_cleanup_resweep: bool,
     maintenance_cleanup_turn: bool,
+    scheduled_poll_at: Option<Instant>,
     next_ephemeral_port: u16,
     next_udp_ephemeral_port: u16,
     listener_scan_cursor: Option<ListenerMemberKey>,
@@ -205,6 +206,7 @@ impl NativeStack {
             closing_cleanup_pending: false,
             closing_cleanup_resweep: false,
             maintenance_cleanup_turn: false,
+            scheduled_poll_at: None,
             next_ephemeral_port: tcp_support::EPHEMERAL_PORT_FIRST,
             next_udp_ephemeral_port: tcp_support::EPHEMERAL_PORT_FIRST,
             listener_scan_cursor: None,
@@ -1767,6 +1769,12 @@ impl NativeStack {
         // work this call did before reaching the readiness loops.
         self.charge_chunk(env, &mut uncharged, true);
 
+        // An envelope that ends without a continuation and carries a poll_at
+        // replaces the BEAM timer, whichever call produced it.
+        if let Some(millis) = effects.poll_at.filter(|_| !effects.more) {
+            self.scheduled_poll_at = Some(Instant::from_millis(millis));
+        }
+
         Envelope {
             result,
             output: effects.output,
@@ -3122,6 +3130,16 @@ impl NativeStack {
             self.request_closing_cleanup();
         }
 
+        // smoltcp closes a socket whose TIME-WAIT has elapsed without emitting
+        // a segment, so egress reports no state change for it. That timer is
+        // part of the deadline this stack last published, so once a drive
+        // reaches that deadline, sweep closing sockets after egress; otherwise
+        // the slot stays held until the much later close deadline.
+        let scheduled_deadline_reached = !self.closing_tcp.is_empty()
+            && self
+                .scheduled_poll_at
+                .is_some_and(|deadline| now >= deadline);
+
         let mut maintenance_work = 0usize;
         let mut egress_may_remain = false;
         let mut cleanup_more = false;
@@ -3187,6 +3205,16 @@ impl NativeStack {
 
         if !egress_attempted && maintenance_work == self.limits.maintenance_work {
             egress_may_remain = true;
+        }
+
+        if scheduled_deadline_reached {
+            self.request_closing_cleanup();
+
+            // Only a complete egress pass is sure to have dispatched the
+            // expired socket; until one runs, later drives sweep again.
+            if egress_attempted && !egress_may_remain {
+                self.scheduled_poll_at = None;
+            }
         }
 
         let remaining_packets = self.limits.output_packets.saturating_sub(output.len());
