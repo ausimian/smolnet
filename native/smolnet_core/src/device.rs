@@ -353,7 +353,6 @@ mod tests {
             bytes: 100,
         };
         let mut device = BeamDevice::new(1_500, 1, Some(credit));
-        let mut budget = CallBudget::start(None);
         device.begin_call(8);
 
         device
@@ -368,7 +367,7 @@ mod tests {
         assert!(device.transmit(smoltcp::time::Instant::ZERO).is_none());
         assert!(!device.transmit_credit_available());
 
-        assert_eq!(device.take_transmit(8, 1_500, &mut budget).len(), 1);
+        assert_eq!(take(&mut device, 8), 1);
         assert_eq!(
             device.egress_credit(),
             Some(EgressCredit {
@@ -378,11 +377,11 @@ mod tests {
         );
         // The second packet is larger than the remaining byte credit.
         assert!(!device.transmit_ready());
-        assert!(device.take_transmit(8, 1_500, &mut budget).is_empty());
+        assert_eq!(take(&mut device, 8), 0);
 
         assert!(device.grant_egress(0, 20));
         assert!(device.transmit_ready());
-        assert_eq!(device.take_transmit(8, 1_500, &mut budget).len(), 1);
+        assert_eq!(take(&mut device, 8), 1);
         assert_eq!(
             device.egress_credit(),
             Some(EgressCredit {
@@ -400,7 +399,6 @@ mod tests {
             bytes: 0,
         };
         let mut device = BeamDevice::new(1_500, 1, Some(credit));
-        let mut budget = CallBudget::start(None);
         device.begin_call(1);
 
         assert_eq!(device.enqueue_receive_batch(vec![vec![0; 40]]), Ok(()));
@@ -409,10 +407,18 @@ mod tests {
 
         assert_eq!(device.queued_packets(), (0, 1));
         assert!(!device.transmit_ready());
-        assert!(device.take_transmit(1, 1_500, &mut budget).is_empty());
+        assert_eq!(take(&mut device, 1), 0);
 
         assert!(device.grant_egress(1, 40));
-        assert_eq!(device.take_transmit(1, 1_500, &mut budget).len(), 1);
+        assert_eq!(take(&mut device, 1), 1);
+    }
+
+    // A fresh budget per call: the work budget is wall-clock time, and a
+    // preempted test thread would otherwise see it expire mid-test.
+    fn take(device: &mut BeamDevice, packet_limit: usize) -> usize {
+        device
+            .take_transmit(packet_limit, 1_500, &mut CallBudget::start(None))
+            .len()
     }
 
     #[test]

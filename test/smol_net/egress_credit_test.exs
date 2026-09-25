@@ -207,8 +207,8 @@ defmodule SmolNet.EgressCreditTest do
   end
 
   defp udp_payload(<<4::4, ihl::4, _rest::binary>> = packet) do
-    <<_header::binary-size(ihl * 4), _udp_header::binary-size(8), payload::binary>> = packet
-    payload
+    offset = ihl * 4 + 8
+    binary_part(packet, offset, byte_size(packet) - offset)
   end
 
   defp native_counters(stack) do
