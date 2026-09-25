@@ -72,6 +72,30 @@ uses 100 independently prepared samples outside `enforce` mode. Unexpected
 resource destruction remains synchronously bounded by the fixed socket,
 waiter, and packet capacities and is included in the benchmark.
 
+## Vendored smoltcp
+
+`native/vendor/smoltcp` is smoltcp 0.14.0 with a SmolNet patch that adds RFC
+6582 partial-ACK recovery to the TCP sender (ADR 0013). The commit that added
+the directory holds the crates.io package unmodified, so
+`git log -p -- native/vendor/smoltcp` after that commit is the complete set of
+SmolNet changes. Keep any further patch small, covered by tests in the
+vendored crate, and suitable for offering upstream.
+
+`mix precommit` runs the vendored crate's library tests. To run them alone:
+
+```console
+cargo test --manifest-path native/vendor/smoltcp/Cargo.toml --lib --target-dir native/target/vendor
+```
+
+To move to a new smoltcp release, first check whether it already recovers
+from partial ACKs. If it does, delete `native/vendor/smoltcp`, restore the
+registry dependency in `native/smolnet_core/Cargo.toml`, and remove the
+precommit step. Otherwise, replace the directory with the new release's
+crates.io package from `~/.cargo/registry/src`, omitting `.cargo-ok` and
+`Cargo.lock`, and commit that on its own. Then reapply the patch, update the
+pinned version, and run `cargo update -p smoltcp` in both `native/` and
+`native/fuzz/`.
+
 ## Native release assets
 
 SmolNet has two deliberately separate native build paths:

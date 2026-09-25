@@ -10,7 +10,9 @@ fuzzing = []
 
 [dependencies]
 rustler = "=0.38.0"
-smoltcp = { version = "=0.14.0", default-features = false, features = [
+# Vendored with a loss-recovery patch; see docs/adr/0013. A direct path
+# dependency, not a [patch], so Rustler rebuilds the NIF when it changes.
+smoltcp = { path = "../vendor/smoltcp", version = "=0.14.0", default-features = false, features = [
   "std",
   "medium-ip",
   "proto-ipv4",

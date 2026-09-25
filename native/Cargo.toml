@@ -1,6 +1,9 @@
 [workspace]
 resolver = "3"
 members = ["smolnet_core", "smolnet_nif"]
+# The vendored smoltcp is a path dependency of smolnet_core, not a member.
+# Excluding it lets its own test suite run from its manifest. See docs/adr/0013.
+exclude = ["vendor/smoltcp"]
 
 [profile.release]
 opt-level = "z"

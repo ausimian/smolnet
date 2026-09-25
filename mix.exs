@@ -59,6 +59,7 @@ defmodule SmolNet.MixProject do
         "cmd cargo fmt --manifest-path native/fuzz/Cargo.toml --all -- --check",
         "cmd cargo clippy --manifest-path native/Cargo.toml --workspace --all-targets -- -D warnings",
         "cmd cargo test --manifest-path native/Cargo.toml --workspace",
+        "cmd cargo test --manifest-path native/vendor/smoltcp/Cargo.toml --lib --target-dir native/target/vendor",
         "cmd cargo check --manifest-path native/fuzz/Cargo.toml --all-targets --locked",
         "run scripts/nif_budget.exs",
         "run examples/quickstart.exs",
