@@ -596,6 +596,29 @@ defmodule SmolNet.NativeTest do
     assert Native.stack_new(%{limits | sockets: 0}, config, 0) == {:error, :invalid_limits}
   end
 
+  test "socket buffers stay bounded whatever the socket limit" do
+    config = %{mtu: 1_500, addresses: [], routes: []}
+    limits = %{Stack.default_limits() | sockets: 512}
+    {:ok, %{result: resource}} = Native.stack_new(limits, config, 0)
+    largest = 1_048_576
+
+    [first | _rest] =
+      for _index <- 1..64 do
+        assert {:ok, %{result: identity}} = Native.tcp_open(resource, :inet6, largest, largest)
+        identity
+      end
+
+    assert {:ok, %{result: full}} = Native.stack_snapshot(resource)
+    assert full.socket_buffer_bytes == full.socket_buffer_capacity
+    assert full.native_socket_count < full.native_socket_capacity
+    assert Native.tcp_open(resource, :inet6, 1_024, 1_024) == {:error, :system_limit}
+    assert Native.udp_open(resource, :inet6) == {:error, :system_limit}
+    assert Native.tcp_open(resource, :inet6, 2 * largest, 1_024) == {:error, :invalid_options}
+
+    assert {:ok, %{result: :ok}} = Native.tcp_close(resource, first, 0)
+    assert {:ok, %{result: _identity}} = Native.tcp_open(resource, :inet6, largest, largest)
+  end
+
   test "rejected wildcard expansion preserves the original UDP socket" do
     addresses = ipv6_addresses(8)
     config = %{mtu: 1_500, addresses: addresses, routes: []}

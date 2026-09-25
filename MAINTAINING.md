@@ -60,8 +60,11 @@ The `sockets` limit caps the native TCP/UDP backing sockets per stack,
 including listener pools and wildcard-UDP expansion across configured
 addresses. It defaults to 64 and may be raised to 512, the most at which
 resource destruction still fits the 1 ms target (ADR 0014); the socket table
-admits the same number of entries and twice as many waiters. The budget
-scenarios run at that maximum, so raising it means re-measuring them.
+admits the same number of entries and twice as many waiters. Socket buffers
+are capped at 128 MiB per stack, what 64 sockets with the largest TCP buffers
+held before the limit was configurable, so a higher limit never raises the
+memory a destructor frees. The budget scenarios run at both maxima, so
+raising either means re-measuring them.
 `SmolNet.stack_info/1` exposes the call target, work budget,
 encoding headroom, deadline-yield count, timeslice-exhaustion count, and
 maximum observed serialized native-call duration before result encoding.

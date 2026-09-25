@@ -42,6 +42,18 @@ one synchronous call, so it is what the maximum must fit (ADR 0011).
   hook lowers it so tests still cover the refusal path.
 - `ready_events` is now only a per-call work budget. Lowering it no longer
   lowers how many sockets or waiters a stack can hold.
+- A stack's socket buffers total at most 128 MiB, what 64 sockets with the
+  largest TCP buffers (1 MiB each way) could hold under the old fixed limit.
+  An open, a listener's pool expansion or refill, or a wildcard UDP bind that
+  would pass it returns `:system_limit`, and `stack_info/1` reports the total
+  as `socket_buffer_bytes`. Without it, 512 sockets with the largest buffers
+  would hold 1 GiB, and an unexpected resource drop would free all of it in
+  one synchronous destructor. Freeing memory the sockets have written to is
+  proportional to its size, and on Linux `munmap` returns those pages
+  synchronously. The cap keeps that worst case where it already was. The
+  total is recomputed from the socket records when a socket opens, the same
+  way the native socket count is, rather than tracked alongside every
+  allocation.
 - The shutdown continuation guard in `SmolNet.Stack` grows by 16 calls per
   socket, since each socket adds a few structures to drain and up to two aborts
   to deliver.
@@ -59,7 +71,13 @@ waiter and an active write waiter. On an Apple silicon Mac with the debug NIF,
 the slowest scenario was destroying the resource holding 512 UDP sockets and
 1,024 saved waiter terms: p99 353 µs, maximum 505 µs over 100 samples.
 Closing-socket maintenance took at most 171 µs, and the combined output,
-cleanup, and readiness call at most 290 µs.
+cleanup, and readiness call at most 290 µs. Destroying a stack at the buffer
+cap, 64 TCP sockets with 1 MiB buffers each way plus waiters on all 512
+slots, took p99 174 µs, and its orderly shutdown p99 170 µs per call. Those
+buffers were never written to; freeing 1 GiB of written 1 MiB buffers took
+288 µs in a separate macOS measurement, and would take longer on Linux,
+which is why the cap stays at the pre-existing 128 MiB rather than growing
+with the socket limit.
 
 At 1,024 sockets the same destructor took 1.03 ms and the combined call
 1.32 ms, both over the 1 ms normal-scheduler target, which is why the maximum is
@@ -74,7 +92,9 @@ can run more stacks, or keep connections open.
 Each slot holds its buffers from open until the slot is freed: 64 KiB each way
 for a TCP socket by default and up to 1 MiB each way, and 32 KiB for a UDP
 socket. A raised limit is a deliberate memory choice; at default buffer sizes,
-512 TCP sockets hold about 64 MiB.
+512 TCP sockets hold about 64 MiB. The 128 MiB buffer cap means a stack cannot
+have both the most sockets and the largest buffers: 512 sockets must average
+at most 256 KiB of buffer each.
 
 Several per-call smoltcp operations, such as egress polling and ingress socket
 lookup, visit every socket in the stack. They stay under the call deadline at

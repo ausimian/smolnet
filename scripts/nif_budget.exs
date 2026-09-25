@@ -17,6 +17,9 @@ defmodule SmolNet.NifBudget do
   @maximum_addresses 8
   @maximum_wildcard_udp_sockets div(@native_socket_capacity, @maximum_addresses)
   @maximum_waiters 2 * @native_socket_capacity
+  @maximum_tcp_buffer_bytes 1_048_576
+  # Sockets with the largest TCP buffers that fit the per-stack buffer cap.
+  @maximum_tcp_buffer_sockets 64
   @max_wall_nanoseconds 1_000_000
   # Message-heavy NIFs are charged for message delivery as well as the measured
   # native share reported through enif_consume_timeslice/2. Crossing one
@@ -223,6 +226,20 @@ defmodule SmolNet.NifBudget do
     )
 
     scenario(
+      "maximum TCP-buffer shutdown",
+      fn ->
+        {resource, identities} = maximum_tcp_buffer_state()
+        _references = populate_maximum_waiter_state(resource, identities)
+        resource
+      end,
+      &Native.stack_shutdown/1,
+      fn resource, {:ok, envelope} ->
+        continue_native_work(resource, envelope, 0)
+        drain_messages(@native_socket_capacity)
+      end
+    )
+
+    scenario(
       "maximum wildcard-UDP resource destructor",
       fn -> prepare_resource_drop(&maximum_wildcard_udp_state/0) end,
       fn drop -> drop.() end
@@ -231,6 +248,12 @@ defmodule SmolNet.NifBudget do
     scenario(
       "maximum native-allocation resource destructor",
       fn -> prepare_resource_drop(&maximum_single_address_udp_state/0) end,
+      fn drop -> drop.() end
+    )
+
+    scenario(
+      "maximum TCP-buffer resource destructor",
+      fn -> prepare_resource_drop(&maximum_tcp_buffer_state/0) end,
       fn drop -> drop.() end
     )
   end
@@ -441,6 +464,22 @@ defmodule SmolNet.NifBudget do
       end)
 
     assert_native_capacity!(resource)
+    {resource, identities}
+  end
+
+  defp maximum_tcp_buffer_state do
+    resource = new_stack(@maximum_limits, empty_config())
+
+    identities =
+      Enum.map(1..@maximum_tcp_buffer_sockets, fn _index ->
+        {:ok, %{result: identity}} =
+          Native.tcp_open(resource, :inet6, @maximum_tcp_buffer_bytes, @maximum_tcp_buffer_bytes)
+
+        identity
+      end)
+
+    {:ok, %{result: snapshot}} = Native.stack_snapshot(resource)
+    true = snapshot.socket_buffer_bytes == snapshot.socket_buffer_capacity
     {resource, identities}
   end
 

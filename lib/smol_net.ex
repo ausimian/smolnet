@@ -80,10 +80,15 @@ defmodule SmolNet do
   buffers from open until the slot is freed: a TCP socket's receive and send
   buffers (64 KiB each by default, up to 1 MiB each) and 32 KiB for a UDP
   socket. At the default buffer sizes, 64 TCP sockets hold about 8 MiB and
-  512 hold about 64 MiB. `stack_info/1` reports the slots in use as
-  `native.result.native_socket_count`, the limit as
-  `native.result.native_socket_capacity`, and the closed TCP sockets still
-  holding one as `native.result.closing_tcp_socket_count`.
+  512 hold about 64 MiB. Whatever the limit, a stack's socket buffers total at
+  most 128 MiB, what 64 TCP sockets with the largest buffers hold; an open
+  that would pass that also returns `{:error, :system_limit}`, so 512
+  sockets need buffers averaging at most 256 KiB. `stack_info/1` reports the
+  slots in use as `native.result.native_socket_count`, the limit as
+  `native.result.native_socket_capacity`, the closed TCP sockets still
+  holding one as `native.result.closing_tcp_socket_count`, and buffer bytes
+  against their cap as `native.result.socket_buffer_bytes` and
+  `native.result.socket_buffer_capacity`.
 
   `:egress_credit` limits how much egress the link must accept. It defaults to
   `:infinity`, which sends every batch as soon as it is ready. A

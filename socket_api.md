@@ -286,8 +286,8 @@ The `sockets` limit caps the native backing sockets per stack, including
 listener pools, wildcard UDP expansion, and TCP sockets still in TIME-WAIT. It
 defaults to 64 and may be raised to 512 with
 `SmolNet.start_stack(limits: %{sockets: n})`; each slot holds its socket's
-buffers until it is freed. An open beyond the limit returns
-`{:error, :system_limit}`. `SmolNet.stack_info/1` reports live usage, buffer
+buffers until it is freed, and a stack's socket buffers total at most
+128 MiB. An open beyond either limit returns `{:error, :system_limit}`. `SmolNet.stack_info/1` reports live usage, buffer
 capacities, queue metrics, and work-budget measurements.
 
 Public calls return `:ok`, `{:ok, value}`, `{:select, continuation}`, or

@@ -17,7 +17,10 @@
   in TIME-WAIT. A stack whose sockets close first sustains about `n / 10` new
   connections per second. Each slot keeps its socket's buffers until it is
   freed, 128 KiB for a TCP socket at the default buffer sizes, so 512 TCP
-  sockets can hold about 64 MiB.
+  sockets can hold about 64 MiB. Whatever the limit, a stack's socket
+  buffers total at most 128 MiB, as much as 64 sockets with the largest TCP
+  buffers held before; an open past that returns `{:error, :system_limit}`.
+  `SmolNet.stack_info/1` reports the total as `socket_buffer_bytes`.
 
 ### Fixed
 
