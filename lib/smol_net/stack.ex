@@ -26,6 +26,7 @@ defmodule SmolNet.Stack do
   @tcp_default_buffer_bytes 65_536
   @tcp_min_buffer_bytes 1_024
   @tcp_max_buffer_bytes 1_048_576
+  @max_egress_credit 0xFFFF_FFFF
 
   @type limits :: %{
           bytes_copied: pos_integer(),
@@ -66,6 +67,28 @@ defmodule SmolNet.Stack do
     GenServer.call(stack, {:ingress, ingress_token, packet}, :infinity)
   catch
     :exit, _reason -> {:error, :closed}
+  end
+
+  @doc false
+  @spec grant_egress(Ref.t(), non_neg_integer(), non_neg_integer()) ::
+          :ok | {:error, :invalid_egress_credit | :egress_credit_disabled | :closed}
+  def grant_egress(%Ref{stack: stack}, packets, bytes) do
+    if valid_egress_credit?(packets, bytes) do
+      GenServer.call(stack, {:grant_egress, packets, bytes})
+    else
+      {:error, :invalid_egress_credit}
+    end
+  catch
+    :exit, _reason -> {:error, :closed}
+  end
+
+  def grant_egress(_stack, _packets, _bytes), do: {:error, :invalid_egress_credit}
+
+  @doc false
+  @spec valid_egress_credit?(term(), term()) :: boolean()
+  def valid_egress_credit?(packets, bytes) do
+    is_integer(packets) and packets in 0..@max_egress_credit and is_integer(bytes) and
+      bytes in 0..@max_egress_credit
   end
 
   @doc false
@@ -499,6 +522,15 @@ defmodule SmolNet.Stack do
 
   def handle_call({:ingress, _invalid_token, _packet}, _from, state) do
     {:reply, {:error, :invalid_ingress}, state}
+  end
+
+  def handle_call({:grant_egress, _packets, _bytes}, _from, %{shutdown_requested: true} = state) do
+    {:reply, {:error, :closed}, state}
+  end
+
+  def handle_call({:grant_egress, packets, bytes}, _from, state) do
+    state.native_module.stack_grant_egress(state.native, packets, bytes, state.clock.now())
+    |> reply_native(state)
   end
 
   def handle_call(:native_snapshot, _from, state) do

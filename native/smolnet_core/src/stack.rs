@@ -19,7 +19,7 @@ use smoltcp::wire::{
 
 use crate::budget::{CALL_TARGET, CHARGE_CHUNK, CallBudget, ENCODING_HEADROOM, WORK_BUDGET};
 use crate::decode_bounded_list;
-use crate::device::{BeamDevice, OutputPacket};
+use crate::device::{BeamDevice, EgressCredit, OutputPacket};
 use crate::limits::{Limits, Work};
 #[cfg(debug_assertions)]
 use crate::socket_table::InstallResult;
@@ -168,7 +168,11 @@ impl NativeStack {
             .map(RouteConfig::to_cidr)
             .collect();
 
-        let mut device = BeamDevice::new(stack_config.mtu, limits.input_packets);
+        let mut device = BeamDevice::new(
+            stack_config.mtu,
+            limits.input_packets,
+            stack_config.egress_credit,
+        );
         let mut interface_config = Config::new(HardwareAddress::Ip);
         interface_config.random_seed = NEXT_STACK_ID.fetch_add(1, Ordering::Relaxed);
         let id = interface_config.random_seed;
@@ -363,6 +367,7 @@ impl NativeStack {
                 readiness: self.ready.counters(),
                 receive_packets,
                 transmit_packets,
+                egress_credit: self.device.egress_credit(),
                 mtu: self.mtu,
                 ip_address_count: self.interface.ip_addrs().len(),
                 lifecycle: self.lifecycle.as_atom(),
@@ -1654,6 +1659,28 @@ impl NativeStack {
             Lifecycle::ShuttingDown => self.continue_shutdown(env),
             Lifecycle::Shutdown => Envelope::empty(crate::atoms::ok()),
         }
+    }
+
+    /// Adds egress credit from the link and drives any egress it releases.
+    pub fn grant_egress_call(
+        &mut self,
+        env: Env<'_>,
+        packets: usize,
+        bytes: usize,
+        now: Instant,
+    ) -> Result<Envelope<Atom>, StackError> {
+        if !matches!(self.lifecycle, Lifecycle::Running) {
+            return Err(StackError::Closed);
+        }
+
+        if !self.device.grant_egress(packets, bytes) {
+            return Err(StackError::EgressCreditDisabled);
+        }
+
+        let effects = self
+            .drive(now, None)
+            .expect("egress grant without ingress cannot fail");
+        Ok(self.finish_call(env, crate::atoms::ok(), effects, Vec::new()))
     }
 
     pub fn finish_call<T>(
@@ -3178,6 +3205,7 @@ impl NativeStack {
 
         while maintenance_work < self.limits.maintenance_work
             && self.device.queued_packets().1 < self.limits.output_packets
+            && self.device.transmit_credit_available()
         {
             if !self.within_budget() {
                 deadline_work_deferred = true;
@@ -3252,9 +3280,13 @@ impl NativeStack {
         self.maintenance_cleanup_turn = !cleanup_ran && self.closing_cleanup_pending;
         self.listener_maintenance_turn = !listener_ran && self.listener_scan_pending;
         let output_packets = output.len();
-        let more = self.device.has_receive()
-            || self.device.has_transmit()
-            || egress_may_remain
+        // Egress that waits for credit is not a continuation: it cannot make
+        // progress until the link grants more, and the grant drives the stack.
+        let egress_open = self.device.transmit_credit_available();
+        let transmit_ready = self.device.transmit_ready();
+        let more = transmit_ready
+            || (self.device.has_receive() && self.device.can_receive())
+            || (egress_may_remain && egress_open)
             || cleanup_more
             || self.closing_cleanup_pending
             || listener_more
@@ -3267,6 +3299,9 @@ impl NativeStack {
         } else {
             self.interface
                 .poll_at(now, &self.sockets)
+                // A socket with data to send asks to be polled immediately,
+                // which without credit would spin until the next grant.
+                .filter(|instant| egress_open || *instant > now)
                 .into_iter()
                 .chain(self.next_close_deadline())
                 .min()
@@ -3394,6 +3429,7 @@ pub(crate) fn fuzz_config_and_endpoints(data: &[u8]) {
             prefix_length,
             gateway: route_gateway,
         }],
+        egress_credit: None,
     };
     let _stack_result = NativeStack::new(limits, config, Instant::ZERO);
 
@@ -3514,6 +3550,7 @@ fn fuzz_stack_config() -> StackConfig {
                 gateway: vec![0xfd, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2],
             },
         ],
+        egress_credit: None,
     }
 }
 
@@ -3858,14 +3895,22 @@ pub struct StackConfig {
     mtu: usize,
     addresses: Vec<AddressConfig>,
     routes: Vec<RouteConfig>,
+    egress_credit: Option<EgressCredit>,
 }
 
 impl<'a> Decoder<'a> for StackConfig {
     fn decode(term: Term<'a>) -> NifResult<Self> {
+        // Absent or nil leaves egress unlimited.
+        let egress_credit = match term.map_get(crate::atoms::egress_credit()) {
+            Ok(value) => value.decode()?,
+            Err(_) => None,
+        };
+
         Ok(Self {
             mtu: term.map_get(crate::atoms::mtu())?.decode()?,
             addresses: decode_bounded_list(term.map_get(crate::atoms::addresses())?, 8)?,
             routes: decode_bounded_list(term.map_get(crate::atoms::routes())?, 4)?,
+            egress_credit,
         })
     }
 }
@@ -4042,6 +4087,7 @@ pub enum StackError {
     PacketTooLarge,
     BatchTooLarge,
     OwnershipInvariantViolation,
+    EgressCreditDisabled,
 }
 
 pub struct Effects {
@@ -4238,6 +4284,7 @@ pub struct Snapshot {
     readiness: ReadinessCounters,
     receive_packets: usize,
     transmit_packets: usize,
+    egress_credit: Option<EgressCredit>,
     mtu: usize,
     ip_address_count: usize,
     lifecycle: Atom,
@@ -4283,6 +4330,7 @@ mod tests {
             mtu: 1_280,
             addresses: Vec::new(),
             routes: Vec::new(),
+            egress_credit: None,
         }
     }
 

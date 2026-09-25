@@ -16,6 +16,11 @@ defmodule SmolNet do
   its stack stops, whether through `stop_stack/1` or a crash, so it can exit
   instead of running a transport in front of a stack that is gone.
 
+  A link cannot refuse a batch once the stack has sent it. A link with a
+  bounded queue can instead start its stack with `:egress_credit` and grant
+  more with `grant_egress/3` as it forwards packets. The stack then never sends
+  more than the link has granted, and holds the rest back in its sockets.
+
   ## TCP endpoints and errors
 
   Low-level TCP endpoints use explicit `:socket`-style maps:
@@ -63,6 +68,12 @@ defmodule SmolNet do
   `:ready_events`, and `:maintenance_work`; unspecified values retain their
   safe defaults. `:input_packets` defaults to one and may be raised to 32 for
   bounded batched ingress.
+
+  `:egress_credit` limits how much egress the link must accept. It defaults to
+  `:infinity`, which sends every batch as soon as it is ready. A
+  `{packets, bytes}` tuple of non-negative integers, each at most
+  `0xFFFF_FFFF`, is the credit the stack starts with; see `grant_egress/3`.
+  An invalid value is rejected with `:invalid_egress_credit`.
 
   `SmolNet.Loopback.start_link/1` starts a stack whose egress is a link back
   into itself, returns both references, and needs no external transport.
@@ -112,6 +123,40 @@ defmodule SmolNet do
   @spec ingress(Stack.Ref.t(), [binary()]) ::
           {:ok, non_neg_integer()} | {:error, atom()}
   defdelegate ingress(stack, packet), to: Stack
+
+  @doc """
+  Grants a stack started with `:egress_credit` more egress.
+
+  Credit counts both packets and bytes, and grants add up. The stack hands the
+  link a packet only while the credit left covers it in both, and every batch
+  it sends uses credit up. When credit runs out the stack holds egress back
+  rather than dropping it: TCP data stays in the socket's send buffer and UDP
+  datagrams in the socket's transmit ring, so senders see the backpressure
+  they would see from a slow peer, and nothing is lost. A grant sends whatever
+  it releases straight away.
+
+  A link typically grants back what it has forwarded:
+
+      def handle_info({:smol_stack, :my_link, :egress, packets}, state) do
+        Enum.each(packets, &transmit(state, &1))
+        :ok = SmolNet.grant_egress(state.stack, length(packets), IO.iodata_length(packets))
+        {:noreply, state}
+      end
+
+  A stack waiting for credit does no work until the next grant, so timers that
+  need to send, such as TCP retransmissions, also wait for it. Replies to
+  ingress may still queue inside the stack while it waits, up to its
+  `:output_packets` limit; once that queue is full, ingress waits for credit
+  too.
+
+  `packets` and `bytes` are non-negative integers, each at most `0xFFFF_FFFF`.
+  Returns `{:error, :egress_credit_disabled}` for a stack started without
+  `:egress_credit`. `stack_info/1` reports the credit left as
+  `native.result.egress_credit`.
+  """
+  @spec grant_egress(Stack.Ref.t(), non_neg_integer(), non_neg_integer()) ::
+          :ok | {:error, :invalid_egress_credit | :egress_credit_disabled | :closed}
+  defdelegate grant_egress(stack, packets, bytes), to: Stack
 
   @doc "Returns ingress, link, timer, and native stack metrics."
   @spec stack_info(Stack.Ref.t()) :: {:ok, map()} | {:error, :closed}

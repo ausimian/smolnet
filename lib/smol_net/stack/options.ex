@@ -11,12 +11,13 @@ defmodule SmolNet.Stack.Options do
     ready_events: 128,
     maintenance_work: 128
   }
-  @allowed [:egress, :mtu, :addresses, :routes, :limits, :link_down]
+  @allowed [:egress, :egress_credit, :mtu, :addresses, :routes, :limits, :link_down]
 
   @spec parse(keyword()) :: {:ok, map()} | {:error, atom()}
   def parse(options) when is_list(options) do
     with :ok <- validate_keyword(options),
          {:ok, egress} <- egress(Keyword.get(options, :egress)),
+         {:ok, egress_credit} <- egress_credit(Keyword.get(options, :egress_credit, :infinity)),
          {:ok, mtu} <- mtu(Keyword.get(options, :mtu, @default_mtu)),
          {:ok, addresses} <- addresses(Keyword.get(options, :addresses, [])),
          {:ok, routes} <- routes(Keyword.get(options, :routes, [])),
@@ -30,7 +31,8 @@ defmodule SmolNet.Stack.Options do
          native_config: %{
            mtu: mtu,
            addresses: addresses,
-           routes: routes
+           routes: routes,
+           egress_credit: egress_credit
          }
        }}
     end
@@ -40,7 +42,7 @@ defmodule SmolNet.Stack.Options do
 
   @spec default_native_config() :: map()
   def default_native_config do
-    %{mtu: @default_mtu, addresses: [], routes: []}
+    %{mtu: @default_mtu, addresses: [], routes: [], egress_credit: nil}
   end
 
   defp validate_keyword(options) do
@@ -60,6 +62,18 @@ defmodule SmolNet.Stack.Options do
   defp egress(nil), do: {:ok, nil}
   defp egress({pid, link_ref}) when is_pid(pid), do: {:ok, {pid, link_ref}}
   defp egress(_egress), do: {:error, :invalid_egress}
+
+  defp egress_credit(:infinity), do: {:ok, nil}
+
+  defp egress_credit({packets, bytes}) do
+    if Stack.valid_egress_credit?(packets, bytes) do
+      {:ok, %{packets: packets, bytes: bytes}}
+    else
+      {:error, :invalid_egress_credit}
+    end
+  end
+
+  defp egress_credit(_credit), do: {:error, :invalid_egress_credit}
 
   defp mtu(value) when is_integer(value) and value in 1_280..65_575, do: {:ok, value}
   defp mtu(_value), do: {:error, :invalid_mtu}

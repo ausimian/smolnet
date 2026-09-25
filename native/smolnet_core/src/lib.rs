@@ -81,6 +81,8 @@ mod atoms {
         end_of_stream,
         already_sent,
         not_found,
+        egress_credit,
+        egress_credit_disabled,
         smol_socket = "$smol_socket"
     }
 }
@@ -161,6 +163,25 @@ fn stack_poll<'a>(env: Env<'a>, resource: ResourceArc<StackResource>, now_millis
         resource
             .with_stack(|stack| stack.poll_call(env, now))
             .map_err(|_| atoms::ownership_invariant_violation())
+    });
+
+    encode_envelope_result(env, result)
+}
+
+#[rustler::nif]
+fn stack_grant_egress<'a>(
+    env: Env<'a>,
+    resource: ResourceArc<StackResource>,
+    packets: usize,
+    bytes: usize,
+    now_millis: i64,
+) -> Term<'a> {
+    let result = catch_operation(|| {
+        let now = time::instant_from_millis(now_millis).map_err(|_| atoms::time_overflow())?;
+        resource
+            .with_stack(|stack| stack.grant_egress_call(env, packets, bytes, now))
+            .map_err(|_| atoms::ownership_invariant_violation())?
+            .map_err(stack_error_atom)
     });
 
     encode_envelope_result(env, result)
@@ -964,6 +985,7 @@ fn stack_error_atom(error: StackError) -> Atom {
         StackError::PacketTooLarge => atoms::packet_too_large(),
         StackError::BatchTooLarge => atoms::batch_too_large(),
         StackError::OwnershipInvariantViolation => atoms::ownership_invariant_violation(),
+        StackError::EgressCreditDisabled => atoms::egress_credit_disabled(),
     }
 }
 
