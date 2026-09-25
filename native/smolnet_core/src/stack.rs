@@ -3122,6 +3122,16 @@ impl NativeStack {
             self.request_closing_cleanup();
         }
 
+        // smoltcp closes a socket whose TIME-WAIT has elapsed without emitting
+        // a segment, so egress reports no state change for it. Sweep closing
+        // sockets after egress whenever a socket timer is due, or the slot
+        // stays held until the much later close deadline.
+        let socket_timer_due = !self.closing_tcp.is_empty()
+            && self
+                .interface
+                .poll_at(now, &self.sockets)
+                .is_some_and(|deadline| deadline <= now);
+
         let mut maintenance_work = 0usize;
         let mut egress_may_remain = false;
         let mut cleanup_more = false;
@@ -3187,6 +3197,10 @@ impl NativeStack {
 
         if !egress_attempted && maintenance_work == self.limits.maintenance_work {
             egress_may_remain = true;
+        }
+
+        if socket_timer_due {
+            self.request_closing_cleanup();
         }
 
         let remaining_packets = self.limits.output_packets.saturating_sub(output.len());
