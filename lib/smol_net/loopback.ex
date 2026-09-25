@@ -28,6 +28,9 @@ defmodule SmolNet.Loopback do
   packet offered while the stack is already busy with another feeder, is
   dropped as a real link would drop it.
 
+  Given `:egress_credit`, the link grants back each batch once it has fed it
+  in, as a link with a bounded queue would; see `SmolNet.grant_egress/3`.
+
   ## Reaching a loopback address
 
   A loopback link carries packets; it does not invent addresses. A stack
@@ -95,12 +98,14 @@ defmodule SmolNet.Loopback do
 
   @impl true
   def handle_info({:smol_stack, @link_ref, :egress, packets}, state) do
-    Enum.reduce_while(packets, {:noreply, state}, fn packet, _result ->
+    packets
+    |> Enum.reduce_while({:noreply, state}, fn packet, _result ->
       case SmolNet.ingress(state.stack, packet) do
         {:error, :closed} -> {:halt, {:stop, :normal, state}}
         _accepted_or_dropped -> {:cont, {:noreply, state}}
       end
     end)
+    |> grant_forwarded(packets)
   end
 
   # The stack was stopped from elsewhere, so the link it fed has no purpose.
@@ -110,10 +115,24 @@ defmodule SmolNet.Loopback do
 
   def handle_info(_message, state), do: {:noreply, state}
 
+  defp grant_forwarded({:noreply, %{egress_credit?: true} = state} = result, packets) do
+    _granted_or_closed =
+      SmolNet.grant_egress(state.stack, length(packets), IO.iodata_length(packets))
+
+    result
+  end
+
+  defp grant_forwarded(result, _packets), do: result
+
   defp start_looped_stack(options) do
     case SmolNet.start_stack(Keyword.put(options, :egress, {self(), @link_ref})) do
       {:ok, stack} ->
-        {:ok, %{stack: stack, monitor: SmolNet.monitor(stack)}}
+        {:ok,
+         %{
+           stack: stack,
+           monitor: SmolNet.monitor(stack),
+           egress_credit?: Keyword.get(options, :egress_credit, :infinity) != :infinity
+         }}
 
       {:error, reason} ->
         {:stop, reason}

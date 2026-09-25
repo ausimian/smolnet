@@ -58,6 +58,22 @@ still owns the ingress slot, a feeder can receive `{:error, :busy}` and should
 retry after yielding. The `:link_down` policy may be `:stop`, `:mark_down`, or
 `{:notify, pid}`.
 
+A link cannot refuse an egress batch once it arrives. A link with a bounded
+queue should start its stack with egress credit and grant it back as it
+forwards packets:
+
+```elixir
+{:ok, stack} = SmolNet.start_stack(egress: {self(), :tunnel}, egress_credit: {128, 256 * 1024})
+
+# after forwarding a batch
+:ok = SmolNet.grant_egress(stack, length(packets), IO.iodata_length(packets))
+```
+
+The stack then sends only what the credit covers, in both packets and bytes,
+and holds the rest in its sockets: TCP data stays in the send buffer and UDP
+datagrams in the transmit ring, so senders see ordinary backpressure and
+nothing the link accepted has to be dropped.
+
 The stack monitors its link, and the link can monitor the stack in return.
 `SmolNet.monitor/1` returns an ordinary monitor reference, and the link receives
 `{:DOWN, monitor, :process, _object, _reason}` when the stack stops, whether

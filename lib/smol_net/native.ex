@@ -31,6 +31,11 @@ defmodule SmolNet.Native do
   @spec stack_poll(reference(), integer()) :: {:ok, map()} | {:error, atom()}
   def stack_poll(_stack, _now), do: :erlang.nif_error(:nif_not_loaded)
 
+  @spec stack_grant_egress(reference(), non_neg_integer(), non_neg_integer(), integer()) ::
+          {:ok, map()} | {:error, atom()}
+  def stack_grant_egress(_stack, _packets, _bytes, _now),
+    do: :erlang.nif_error(:nif_not_loaded)
+
   @spec stack_shutdown(reference()) :: {:ok, map()} | {:error, atom()}
   def stack_shutdown(_stack), do: :erlang.nif_error(:nif_not_loaded)
 
