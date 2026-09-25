@@ -35,6 +35,28 @@ defmodule SmolNet.TcpStreamTest do
     assert native.counters.max_bytes_copied <= native.limits.bytes_copied
   end
 
+  test "the advertised receive window follows the socket receive buffer" do
+    {_stack, peer, _socket} = connected_socket(rcvbuf: 32_768)
+
+    # The peer's SYN-ACK carries no window scale option, so the window field
+    # is unscaled and an empty buffer is advertised in full.
+    handshake_ack =
+      IPv6TcpPeer.stats(peer).packets
+      |> Enum.find(&(&1.flags == 0x10 and &1.payload == ""))
+
+    assert %{window: 32_768} = handshake_ack
+  end
+
+  test "a peer filling the whole advertised window loses no segments" do
+    {_stack, peer, socket} = connected_socket(rcvbuf: 32_768)
+    payload = :crypto.strong_rand_bytes(32_768)
+
+    # The test peer never retransmits, so any segment the stack failed to take
+    # would leave the stream short.
+    assert :ok = IPv6TcpPeer.send_data(peer, payload)
+    assert {:ok, ^payload} = SmolNet.recv(socket, byte_size(payload), 2_000)
+  end
+
   test "large synchronous sends retry bounded native chunks in order" do
     {_stack, peer, socket} = connected_socket()
     payload = :binary.copy(<<0, 1, 2, 3, 4, 5, 6, 7>>, 2_500)

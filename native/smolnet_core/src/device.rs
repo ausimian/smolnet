@@ -217,10 +217,11 @@ impl Device for BeamDevice {
         let mut capabilities = DeviceCapabilities::default();
         capabilities.medium = Medium::Ip;
         capabilities.max_transmission_unit = self.mtu;
-        // smoltcp uses this capability to clamp the advertised TCP receive
-        // window. Ingress batching is an ABI boundary optimization, not a TCP
-        // flow-control setting, so preserve the established one-segment value.
-        capabilities.max_burst_size = Some(1);
+        // smoltcp clamps every advertised TCP window to max_burst_size segments,
+        // for devices whose fixed receive rings silently drop a full window.
+        // Ingress here is serial and reports backpressure to the link, so the
+        // per-socket receive buffer is the flow-control limit. Leave it unset.
+        capabilities.max_burst_size = None;
         capabilities
     }
 }
@@ -239,7 +240,7 @@ mod tests {
 
         assert_eq!(capabilities.medium, Medium::Ip);
         assert_eq!(capabilities.max_transmission_unit, 1_500);
-        assert_eq!(capabilities.max_burst_size, Some(1));
+        assert_eq!(capabilities.max_burst_size, None);
     }
 
     #[test]

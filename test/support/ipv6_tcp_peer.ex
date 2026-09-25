@@ -271,7 +271,7 @@ defmodule SmolNet.Test.IPv6TcpPeer do
            destination::binary-size(16), tcp::binary-size(payload_length)>>
        ) do
     <<source_port::16, destination_port::16, sequence::32, acknowledgement::32, data_offset::4,
-      _reserved::4, flags, _rest::binary>> = tcp
+      _reserved::4, flags, window::16, _rest::binary>> = tcp
 
     header_length = data_offset * 4
 
@@ -284,6 +284,7 @@ defmodule SmolNet.Test.IPv6TcpPeer do
       acknowledgement: acknowledgement,
       data_offset: data_offset,
       flags: flags,
+      window: window,
       payload: binary_part(tcp, header_length, byte_size(tcp) - header_length)
     }
   end
