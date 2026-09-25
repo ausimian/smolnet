@@ -9,7 +9,8 @@ defmodule SmolNet.Stack.Options do
     input_packets: 32,
     output_packets: 32,
     ready_events: 128,
-    maintenance_work: 128
+    maintenance_work: 128,
+    sockets: 512
   }
   @allowed [:egress, :egress_credit, :mtu, :addresses, :routes, :limits, :link_down]
 

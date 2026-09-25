@@ -21,6 +21,9 @@ defmodule SmolNetTest do
 
     assert SmolNet.start_stack(limits: %{input_packets: 0}) == {:error, :invalid_limits}
     assert SmolNet.start_stack(limits: %{input_packets: 33}) == {:error, :invalid_limits}
+    assert SmolNet.start_stack(limits: %{sockets: 0}) == {:error, :invalid_limits}
+    assert SmolNet.start_stack(limits: %{sockets: 513}) == {:error, :invalid_limits}
+    assert SmolNet.start_stack(limits: %{sockets: 64.0}) == {:error, :invalid_limits}
 
     assert SmolNet.start_stack(limits: :invalid) == {:error, :invalid_limits}
     assert SmolNet.start_stack(:invalid) == {:error, :invalid_options}

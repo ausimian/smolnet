@@ -111,7 +111,11 @@ defmodule SmolNet.NativeTest do
     address = [0xFD | List.duplicate(0, 14)] ++ [1]
 
     resource =
-      native_stack(%{mtu: 1_500, addresses: [%{address: address, prefix_length: 64}], routes: []})
+      native_stack(Stack.default_limits(), %{
+        mtu: 1_500,
+        addresses: [%{address: address, prefix_length: 64}],
+        routes: []
+      })
 
     {:ok, %{result: listener}} = Native.tcp_open(resource, :inet6)
 
@@ -138,7 +142,7 @@ defmodule SmolNet.NativeTest do
 
   @tag :debug_nif
   test "readiness and shutdown make bounded progress across forced continuations" do
-    resource = native_stack()
+    resource = native_stack(ready_event_sockets())
 
     identities_and_references =
       Enum.map(1..Stack.default_limits().ready_events, fn internal_handle ->
@@ -235,7 +239,7 @@ defmodule SmolNet.NativeTest do
   test "a caller whose reduction slice is spent receives a shorter native slice" do
     ready_events = Stack.default_limits().ready_events
 
-    unconstrained = native_stack()
+    unconstrained = native_stack(ready_event_sockets())
     keys = arm_read_waiters(unconstrained, ready_events)
     # Arming the waiters spends this process's slice. Use a fresh process so
     # the reference call cannot inherit a nearly exhausted reduction slice.
@@ -246,7 +250,7 @@ defmodule SmolNet.NativeTest do
 
     delivered_unconstrained = await_select_messages()
 
-    starved = native_stack()
+    starved = native_stack(ready_event_sockets())
     keys = arm_read_waiters(starved, ready_events)
 
     # The first incremental charge reports the caller's slice as spent, so the
@@ -546,6 +550,29 @@ defmodule SmolNet.NativeTest do
     assert Native.udp_open(resource, :inet6) == {:error, :system_limit}
   end
 
+  test "the socket limit sets a stack's native capacity" do
+    config = %{mtu: 1_500, addresses: ipv6_addresses(1), routes: []}
+    limits = %{Stack.default_limits() | sockets: 3}
+    {:ok, %{result: resource}} = Native.stack_new(limits, config, 0)
+
+    for _index <- 1..3 do
+      assert {:ok, %{result: _identity}} = Native.udp_open(resource, :inet6)
+    end
+
+    assert {:ok, %{result: snapshot}} = Native.stack_snapshot(resource)
+    assert snapshot.limits.sockets == 3
+    assert snapshot.native_socket_capacity == 3
+    assert snapshot.native_socket_count == 3
+    assert Native.udp_open(resource, :inet6) == {:error, :system_limit}
+    assert Native.tcp_open(resource, :inet6) == {:error, :system_limit}
+
+    assert {:ok, _envelope} =
+             Native.stack_new(%{limits | sockets: 512}, config, 0)
+
+    assert Native.stack_new(%{limits | sockets: 513}, config, 0) == {:error, :invalid_limits}
+    assert Native.stack_new(%{limits | sockets: 0}, config, 0) == {:error, :invalid_limits}
+  end
+
   test "rejected wildcard expansion preserves the original UDP socket" do
     addresses = ipv6_addresses(8)
     config = %{mtu: 1_500, addresses: addresses, routes: []}
@@ -610,11 +637,19 @@ defmodule SmolNet.NativeTest do
     snapshot
   end
 
-  defp native_stack(config \\ %{mtu: 1_500, addresses: [], routes: []}) do
-    {:ok, %{result: resource}} =
-      Native.stack_new(Stack.default_limits(), config, 0)
-
+  defp native_stack(
+         limits \\ Stack.default_limits(),
+         config \\ %{mtu: 1_500, addresses: [], routes: []}
+       ) do
+    {:ok, %{result: resource}} = Native.stack_new(limits, config, 0)
     resource
+  end
+
+  # Room for one synthetic socket per readiness event, so a single call can
+  # have a full readiness budget of waiters to deliver.
+  defp ready_event_sockets do
+    limits = Stack.default_limits()
+    %{limits | sockets: limits.ready_events}
   end
 
   defp arm_read_waiters(resource, count) do

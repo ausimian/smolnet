@@ -7,6 +7,7 @@ pub struct Limits {
     pub output_packets: usize,
     pub ready_events: usize,
     pub maintenance_work: usize,
+    pub sockets: usize,
 }
 
 impl Limits {
@@ -15,6 +16,7 @@ impl Limits {
     pub const MAX_OUTPUT_PACKETS: usize = 32;
     pub const MAX_READY_EVENTS: usize = 128;
     pub const MAX_MAINTENANCE_WORK: usize = 128;
+    pub const MAX_SOCKETS: usize = 512;
 
     pub fn valid(self) -> bool {
         (1..=Self::MAX_BYTES_COPIED).contains(&self.bytes_copied)
@@ -22,6 +24,7 @@ impl Limits {
             && (1..=Self::MAX_OUTPUT_PACKETS).contains(&self.output_packets)
             && (1..=Self::MAX_READY_EVENTS).contains(&self.ready_events)
             && (1..=Self::MAX_MAINTENANCE_WORK).contains(&self.maintenance_work)
+            && (1..=Self::MAX_SOCKETS).contains(&self.sockets)
     }
 
     #[cfg(debug_assertions)]
@@ -57,6 +60,7 @@ mod tests {
         output_packets: 2,
         ready_events: 3,
         maintenance_work: 4,
+        sockets: 5,
     };
 
     #[test]
@@ -126,6 +130,22 @@ mod tests {
         assert!(
             !Limits {
                 ready_events: 129,
+                ..LIMITS
+            }
+            .valid()
+        );
+
+        assert!(
+            !Limits {
+                sockets: 0,
+                ..LIMITS
+            }
+            .valid()
+        );
+
+        assert!(
+            !Limits {
+                sockets: Limits::MAX_SOCKETS + 1,
                 ..LIMITS
             }
             .valid()

@@ -282,9 +282,13 @@ handle immediately; a TCP closing record can remain temporarily to drive FIN
 and retransmission.
 
 A stack has bounded socket, packet, waiter, readiness, and maintenance state.
-The native socket limit is 64 backing sockets per stack, including listener
-pools and wildcard UDP expansion. `SmolNet.stack_info/1` reports live usage,
-buffer capacities, queue metrics, and work-budget measurements.
+The `sockets` limit caps the native backing sockets per stack, including
+listener pools, wildcard UDP expansion, and TCP sockets still in TIME-WAIT. It
+defaults to 64 and may be raised to 512 with
+`SmolNet.start_stack(limits: %{sockets: n})`; each slot holds its socket's
+buffers until it is freed. An open beyond the limit returns
+`{:error, :system_limit}`. `SmolNet.stack_info/1` reports live usage, buffer
+capacities, queue metrics, and work-budget measurements.
 
 Public calls return `:ok`, `{:ok, value}`, `{:select, continuation}`, or
 `{:error, reason}`. Stable errors distinguish validation, lifecycle, and

@@ -2,7 +2,8 @@
 
 ## Status
 
-Accepted for Phase 3.
+Accepted for Phase 3. ADR 0014 supersedes the socket-entry and waiter caps:
+both now follow the stack's `sockets` limit rather than `:ready_events`.
 
 ## Context
 

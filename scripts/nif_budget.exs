@@ -1,20 +1,22 @@
 defmodule SmolNet.NifBudget do
   alias SmolNet.Native
 
+  @native_socket_capacity 512
   @maximum_limits %{
     bytes_copied: 65_575,
     input_packets: 32,
     output_packets: 32,
     ready_events: 128,
-    maintenance_work: 128
+    maintenance_work: 128,
+    sockets: @native_socket_capacity
   }
   @maximum_mtu 65_575
   @maximum_batch_packets 32
   @maximum_batch_packet_bytes 2_048
   @maximum_batch_bytes @maximum_batch_packets * @maximum_batch_packet_bytes
-  @native_socket_capacity 64
   @maximum_addresses 8
   @maximum_wildcard_udp_sockets div(@native_socket_capacity, @maximum_addresses)
+  @maximum_waiters 2 * @native_socket_capacity
   @max_wall_nanoseconds 1_000_000
   # Message-heavy NIFs are charged for message delivery as well as the measured
   # native share reported through enif_consume_timeslice/2. Crossing one
@@ -116,8 +118,12 @@ defmodule SmolNet.NifBudget do
       "combined maximum work",
       fn ->
         resource = new_stack(@maximum_limits, empty_config())
-        {:ok, _envelope} = Native.test_prepare_closing(resource, @native_socket_capacity)
-        {keys, _references} = arm_waiters(resource, @native_socket_capacity, [:read, :write])
+        # One ready key per waiter, and a combined call wakes at most one
+        # readiness budget of keys; closing sockets fill the rest of the limit.
+        waiter_sockets = div(@maximum_limits.ready_events, 2)
+        closing_sockets = @native_socket_capacity - waiter_sockets
+        {:ok, _envelope} = Native.test_prepare_closing(resource, closing_sockets)
+        {keys, _references} = arm_waiters(resource, waiter_sockets, [:read, :write])
         {resource, keys}
       end,
       fn {resource, keys} -> Native.test_combined_maximum_work(resource, keys, 30_000) end,
@@ -131,13 +137,13 @@ defmodule SmolNet.NifBudget do
       "maximum waiter shutdown",
       fn ->
         resource = new_stack(@maximum_limits, empty_config())
-        {_keys, _references} = arm_waiters(resource)
+        {_keys, _references} = arm_waiters(resource, @native_socket_capacity, [:read, :write])
         resource
       end,
       &Native.stack_shutdown/1,
       fn resource, {:ok, envelope} ->
         continue_native_work(resource, envelope, 0)
-        drain_messages(@maximum_limits.ready_events)
+        drain_messages(@maximum_waiters)
       end
     )
 
@@ -198,7 +204,7 @@ defmodule SmolNet.NifBudget do
       &Native.stack_shutdown/1,
       fn resource, {:ok, envelope} ->
         continue_native_work(resource, envelope, 0)
-        drain_messages(@maximum_limits.ready_events)
+        drain_messages(@native_socket_capacity)
       end
     )
 
@@ -212,7 +218,7 @@ defmodule SmolNet.NifBudget do
       &Native.stack_shutdown/1,
       fn resource, {:ok, envelope} ->
         continue_native_work(resource, envelope, 0)
-        drain_messages(@maximum_limits.ready_events)
+        drain_messages(@native_socket_capacity)
       end
     )
 
@@ -441,7 +447,7 @@ defmodule SmolNet.NifBudget do
   defp populate_maximum_waiter_state(resource, native_identities) do
     synthetic_identities =
       Enum.map(
-        1..(@maximum_limits.ready_events - length(native_identities)),
+        Enum.to_list(1..(@native_socket_capacity - length(native_identities))//1),
         fn internal_handle ->
           {:ok, %{result: identity}} = Native.test_socket_open(resource, internal_handle)
           identity
@@ -450,12 +456,19 @@ defmodule SmolNet.NifBudget do
 
     identities = native_identities ++ synthetic_identities
     {ready_keys, sent_references} = arm_identity_waiters(resource, identities, :read)
-    {:ok, envelope} = Native.test_socket_ready(resource, Enum.reverse(ready_keys))
-    continue_native_work(resource, envelope, 0)
-    drain_messages(@maximum_limits.ready_events)
+
+    ready_keys
+    |> Enum.reverse()
+    |> Enum.chunk_every(@maximum_limits.ready_events)
+    |> Enum.each(fn keys ->
+      {:ok, envelope} = Native.test_socket_ready(resource, keys)
+      continue_native_work(resource, envelope, 0)
+    end)
+
+    drain_messages(@native_socket_capacity)
     {_active_keys, active_references} = arm_identity_waiters(resource, identities, :write)
     {:ok, %{result: snapshot}} = Native.stack_snapshot(resource)
-    expected_waiters = @maximum_limits.ready_events
+    expected_waiters = @native_socket_capacity
     ^expected_waiters = snapshot.waiter_count
     ^expected_waiters = snapshot.write_waiter_count
     ^expected_waiters = snapshot.sent_waiter_count

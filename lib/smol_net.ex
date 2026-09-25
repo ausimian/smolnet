@@ -69,6 +69,22 @@ defmodule SmolNet do
   safe defaults. `:input_packets` defaults to one and may be raised to 32 for
   bounded batched ingress.
 
+  `:sockets` in the same map is the most sockets the stack holds at once. It
+  defaults to 64 and may be raised to 512. It counts native backing sockets:
+  one per TCP or UDP socket, one per member of a TCP listener's accept pool
+  (up to 4), and one per configured address for a UDP socket bound to a
+  wildcard address. A TCP socket that closes first keeps its slot until
+  TIME-WAIT ends, about 10 s after the close, so a stack whose sockets close
+  first sustains about `sockets / 10` new connections per second. An open
+  beyond the limit returns `{:error, :system_limit}`. Each slot holds its
+  buffers from open until the slot is freed: a TCP socket's receive and send
+  buffers (64 KiB each by default, up to 1 MiB each) and 32 KiB for a UDP
+  socket. At the default buffer sizes, 64 TCP sockets hold about 8 MiB and
+  512 hold about 64 MiB. `stack_info/1` reports the slots in use as
+  `native.result.native_socket_count`, the limit as
+  `native.result.native_socket_capacity`, and the closed TCP sockets still
+  holding one as `native.result.closing_tcp_socket_count`.
+
   `:egress_credit` limits how much egress the link must accept. It defaults to
   `:infinity`, which sends every batch as soon as it is ready. A
   `{packets, bytes}` tuple of non-negative integers, each at most

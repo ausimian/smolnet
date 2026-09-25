@@ -41,7 +41,6 @@ static NEXT_STACK_ID: AtomicU64 = AtomicU64::new(1);
 static CREATED: AtomicUsize = AtomicUsize::new(0);
 static DROPPED: AtomicUsize = AtomicUsize::new(0);
 static ACTIVE: AtomicUsize = AtomicUsize::new(0);
-pub const NATIVE_SOCKET_CAPACITY: usize = 64;
 
 pub struct StackResource {
     inner: Mutex<Option<NativeStack>>,
@@ -199,7 +198,8 @@ impl NativeStack {
             interface,
             sockets: SocketSet::new(Vec::new()),
             device,
-            socket_table: SocketTable::new(limits.ready_events, limits.ready_events),
+            // A socket holds at most one waiter in each direction.
+            socket_table: SocketTable::new(limits.sockets, limits.sockets * 2),
             tcp_records: BTreeMap::new(),
             tcp_listeners: BTreeMap::new(),
             tcp_connections: BTreeMap::new(),
@@ -330,7 +330,7 @@ impl NativeStack {
                 limits: self.limits,
                 socket_count: self.socket_table.len(),
                 native_socket_count: self.sockets.iter().count(),
-                native_socket_capacity: NATIVE_SOCKET_CAPACITY,
+                native_socket_capacity: self.limits.sockets,
                 tcp_socket_count: self.tcp_records.len(),
                 tcp_listener_count: self.tcp_listeners.len(),
                 udp_socket_count: self.udp_records.len(),
@@ -398,6 +398,14 @@ impl NativeStack {
     #[cfg(debug_assertions)]
     pub fn test_set_budget_checkpoints(&mut self, checkpoints: usize) -> Envelope<Atom> {
         self.next_forced_budget_checkpoints = Some(checkpoints);
+        Envelope::empty(crate::atoms::ok())
+    }
+
+    /// Lowers the waiter cap, which no sequence of public calls can reach:
+    /// each socket holds at most one waiter per direction.
+    #[cfg(debug_assertions)]
+    pub fn test_set_waiter_capacity(&mut self, waiters: usize) -> Envelope<Atom> {
+        self.socket_table.test_set_max_waiters(waiters);
         Envelope::empty(crate::atoms::ok())
     }
 
@@ -481,7 +489,7 @@ impl NativeStack {
 
     #[cfg(debug_assertions)]
     pub fn test_prepare_closing(&mut self, count: usize) -> Result<Envelope<Atom>, SocketError> {
-        if count > self.limits.maintenance_work || count > self.limits.ready_events {
+        if count > self.limits.sockets {
             return Err(SocketError::SystemLimit);
         }
 
@@ -1288,7 +1296,7 @@ impl NativeStack {
                 .map(|socket| self.sockets.add(socket)),
         );
 
-        debug_assert!(self.sockets.iter().count() <= NATIVE_SOCKET_CAPACITY);
+        debug_assert!(self.sockets.iter().count() <= self.limits.sockets);
 
         let record = self.udp_record_mut(identity)?;
         record.handles = handles;
@@ -2651,7 +2659,7 @@ impl NativeStack {
             .checked_add(self.closing_tcp.len())
             .ok_or(SocketError::SystemLimit)?;
 
-        if logical_socket_count >= self.limits.ready_events {
+        if logical_socket_count >= self.limits.sockets {
             Err(SocketError::SystemLimit)
         } else {
             Ok(())
@@ -2669,7 +2677,7 @@ impl NativeStack {
             .and_then(|count| count.checked_add(added))
             .ok_or(SocketError::SystemLimit)?;
 
-        if resulting_socket_count > NATIVE_SOCKET_CAPACITY {
+        if resulting_socket_count > self.limits.sockets {
             Err(SocketError::SystemLimit)
         } else {
             Ok(())
@@ -3521,6 +3529,7 @@ fn fuzz_limits() -> Limits {
         output_packets: 32,
         ready_events: 64,
         maintenance_work: 64,
+        sockets: 64,
     }
 }
 
@@ -4323,6 +4332,7 @@ mod tests {
         output_packets: 1,
         ready_events: 1,
         maintenance_work: 1,
+        sockets: 1,
     };
 
     fn config() -> StackConfig {

@@ -226,7 +226,7 @@ defmodule SmolNet.SocketReadinessTest do
   end
 
   test "live socket entries are bounded and close releases capacity" do
-    {:ok, stack} = SmolNet.start_stack(limits: %{ready_events: 2})
+    {:ok, stack} = SmolNet.start_stack(limits: %{sockets: 2})
     first = Readiness.open(stack, 1)
     _second = Readiness.open(stack, 2)
 
@@ -237,7 +237,7 @@ defmodule SmolNet.SocketReadinessTest do
 
     {:ok, info} = SmolNet.stack_info(stack)
     assert info.native.result.socket_count == 2
-    assert info.native.result.socket_count <= info.native.result.limits.ready_events
+    assert info.native.result.socket_count <= info.native.result.limits.sockets
   end
 
   test "recycled internal handles cannot revive an old logical socket" do

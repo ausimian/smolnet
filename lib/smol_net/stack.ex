@@ -16,13 +16,17 @@ defmodule SmolNet.Stack do
     input_packets: 1,
     output_packets: 32,
     ready_events: 128,
-    maintenance_work: 128
+    maintenance_work: 128,
+    sockets: 64
   }
 
   # Valid bounded state converges well below this guard. The guard counts NIF
   # invocations rather than work units because a runtime deadline can expire
-  # before a cleanup unit; its purpose is to bound a non-convergent fault.
+  # before a cleanup unit; its purpose is to bound a non-convergent fault. Each
+  # socket adds a few structures to drain and up to two aborts to deliver, so
+  # the guard grows with the stack's socket limit.
   @shutdown_continuation_limit 1_024
+  @shutdown_continuations_per_socket 16
   @tcp_default_buffer_bytes 65_536
   @tcp_min_buffer_bytes 1_024
   @tcp_max_buffer_bytes 1_048_576
@@ -33,7 +37,8 @@ defmodule SmolNet.Stack do
           input_packets: pos_integer(),
           output_packets: pos_integer(),
           ready_events: pos_integer(),
-          maintenance_work: pos_integer()
+          maintenance_work: pos_integer(),
+          sockets: pos_integer()
         }
 
   @spec start_link(keyword()) :: GenServer.on_start()
@@ -1176,11 +1181,15 @@ defmodule SmolNet.Stack do
   defp drain_native_shutdown(state) do
     case state.native_module.stack_shutdown(state.native) do
       {:ok, envelope} ->
-        continue_native_shutdown(state, envelope, @shutdown_continuation_limit)
+        continue_native_shutdown(state, envelope, shutdown_continuation_limit(state.limits))
 
       {:error, reason} ->
         {:error, reason}
     end
+  end
+
+  defp shutdown_continuation_limit(limits) do
+    @shutdown_continuation_limit + @shutdown_continuations_per_socket * limits.sockets
   end
 
   defp continue_native_shutdown(_state, %{more: false}, _remaining), do: :ok
