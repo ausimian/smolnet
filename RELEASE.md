@@ -22,15 +22,6 @@
   buffers held before; an open past that returns `{:error, :system_limit}`.
   `SmolNet.stack_info/1` reports the total as `socket_buffer_bytes`.
 
-### Fixed
-
-- A stack under sustained readiness load could leave a blocked operation on a
-  socket opened later than most others waiting indefinitely. When more
-  sockets became ready in one call than the stack could queue, each overflow
-  restarted the scan for ready sockets from the beginning, so a scan that
-  overflowed on every call never reached the later sockets. A raised
-  `sockets` limit made this easier to hit.
-
 ### Changed
 
 - The `ready_events` limit no longer caps how many sockets and blocked
@@ -39,3 +30,12 @@
   `:nowait` sends, receives, accepts and connects, fail with `:system_limit`.
   It now bounds only how many readiness events one native call delivers, and
   `sockets` governs capacity.
+
+### Fixed
+
+- A stack under sustained readiness load could leave a blocked operation on a
+  socket opened later than most others waiting indefinitely. When more
+  sockets became ready in one call than the stack could queue, each overflow
+  restarted the scan for ready sockets from the beginning, so a scan that
+  overflowed on every call never reached the later sockets. A raised
+  `sockets` limit made this easier to hit.
