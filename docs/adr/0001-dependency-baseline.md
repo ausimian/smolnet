@@ -17,7 +17,8 @@ Accepted for the first release candidate.
   `socket-udp`. Automatic ICMP echo replies provide the packet-path integration
   probe without exposing an ICMP socket API. The `async` feature supplies
   one-shot socket waker registration; it does not introduce a runtime, task
-  executor, or native polling thread.
+  executor, or native polling thread. smoltcp is now vendored with a TCP
+  loss-recovery patch; see ADR 0013.
 - Credo, Dialyxir, ExDoc, ExCoveralls, and Publisho provide local quality,
   documentation, coverage, and eventual release tooling.
 
