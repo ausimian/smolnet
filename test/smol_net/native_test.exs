@@ -280,6 +280,29 @@ defmodule SmolNet.NativeTest do
   end
 
   @tag :debug_nif
+  test "recurring readiness overflow does not restart a sweep under way" do
+    # Two queue slots and two sweep entries per call, so a socket far from
+    # the start is reached only if each overflow keeps the sweep's place.
+    limits = %{Stack.default_limits() | ready_events: 4, sockets: 8}
+    resource = native_stack(limits)
+    [first, second, third | _middle] = keys = arm_read_waiters(resource, 8)
+    last = List.last(keys)
+    %{identity: %{id: id, generation: generation}} = last
+
+    # The third wake overflows the queue, so only a sweep can deliver it.
+    assert {:ok, %{more: true}} = Native.test_socket_ready(resource, [first, second, last])
+
+    # Each round overflows again: two wakes fill the queue and the third
+    # overflows once the previous round has cleared its flag.
+    Enum.each(1..4, fn _round ->
+      assert {:ok, _envelope} = Native.test_socket_ready(resource, [first, second, third])
+    end)
+
+    assert_receive {:"$smol_socket", {^id, ^generation}, :select, _reference}
+    assert {:ok, %{more: false}} = poll_until_complete(resource)
+  end
+
+  @tag :debug_nif
   test "returns immediately when the defensive mutex is already held" do
     {:ok, ref} = SmolNet.start_stack()
     %{stack: stack} = Ref.pids(ref)

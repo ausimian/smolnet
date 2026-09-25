@@ -19,6 +19,15 @@
   freed, 128 KiB for a TCP socket at the default buffer sizes, so 512 TCP
   sockets can hold about 64 MiB.
 
+### Fixed
+
+- A stack under sustained readiness load could leave a blocked operation on a
+  socket opened later than most others waiting indefinitely. When more
+  sockets became ready in one call than the stack could queue, each overflow
+  restarted the scan for ready sockets from the beginning, so a scan that
+  overflowed on every call never reached the later sockets. A raised
+  `sockets` limit made this easier to hit.
+
 ### Changed
 
 - The `ready_events` limit no longer caps how many sockets and blocked

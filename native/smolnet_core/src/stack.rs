@@ -146,6 +146,7 @@ pub struct NativeStack {
     ready: ReadyQueue,
     ready_sweep: bool,
     ready_sweep_cursor: Option<ReadyKey>,
+    ready_sweep_resweep: bool,
     ready_sweep_pending: VecDeque<ReadyKey>,
     counters: Counters,
     lifecycle: Lifecycle,
@@ -220,6 +221,7 @@ impl NativeStack {
             ready: ReadyQueue::new((limits.ready_events / 2).max(1)),
             ready_sweep: false,
             ready_sweep_cursor: None,
+            ready_sweep_resweep: false,
             ready_sweep_pending: VecDeque::new(),
             counters: Counters::default(),
             lifecycle: Lifecycle::Running,
@@ -1720,8 +1722,15 @@ impl NativeStack {
         }
 
         if self.ready.take_overflow() && matches!(self.lifecycle, Lifecycle::Running) {
-            self.ready_sweep = true;
-            self.ready_sweep_cursor = None;
+            // Restarting a sweep that is under way would let overflows that
+            // recur every call rescan the same low IDs and never reach the
+            // rest. Finish the pass, then sweep again from the start.
+            if self.ready_sweep {
+                self.ready_sweep_resweep = true;
+            } else {
+                self.ready_sweep = true;
+                self.ready_sweep_cursor = None;
+            }
         }
 
         let queued = {
@@ -1786,8 +1795,14 @@ impl NativeStack {
             }
 
             readiness_work += scan_cost;
-            self.ready_sweep = !scan.complete;
-            self.ready_sweep_cursor = self.ready_sweep.then_some(scan.cursor).flatten();
+
+            if scan.complete && self.ready_sweep_resweep {
+                self.ready_sweep_resweep = false;
+                self.ready_sweep_cursor = None;
+            } else {
+                self.ready_sweep = !scan.complete;
+                self.ready_sweep_cursor = self.ready_sweep.then_some(scan.cursor).flatten();
+            }
         }
 
         effects.more = effects.more
@@ -1829,6 +1844,7 @@ impl NativeStack {
         self.lifecycle = Lifecycle::ShuttingDown;
         self.ready_sweep = false;
         self.ready_sweep_cursor = None;
+        self.ready_sweep_resweep = false;
         self.ready_sweep_pending.clear();
         self.continue_shutdown(env)
     }
@@ -1857,6 +1873,7 @@ impl NativeStack {
             self.listener_scan_resweep = false;
             self.ready_sweep = false;
             self.ready_sweep_cursor = None;
+            self.ready_sweep_resweep = false;
             self.ready_sweep_pending.clear();
             envelope.more = false;
         }
@@ -3881,6 +3898,7 @@ fn fuzz_shutdown(stack: &mut NativeStack) {
     stack.lifecycle = Lifecycle::ShuttingDown;
     stack.ready_sweep = false;
     stack.ready_sweep_cursor = None;
+    stack.ready_sweep_resweep = false;
     stack.ready_sweep_pending.clear();
 
     for _call in 0..1_024 {
