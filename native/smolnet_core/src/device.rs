@@ -106,12 +106,16 @@ impl BeamDevice {
         self.transmit_limit = transmit_limit;
     }
 
-    pub fn enqueue_receive_batch(&mut self, packets: Vec<Vec<u8>>) -> Result<(), ()> {
-        let Some(queued) = self.receive.len().checked_add(packets.len()) else {
-            return Err(());
-        };
+    /// Whether `packets` more received packets fit the receive queue.
+    pub fn receive_fits(&self, packets: usize) -> bool {
+        self.receive
+            .len()
+            .checked_add(packets)
+            .is_some_and(|queued| queued <= self.receive_limit)
+    }
 
-        if queued > self.receive_limit {
+    pub fn enqueue_receive_batch(&mut self, packets: Vec<Vec<u8>>) -> Result<(), ()> {
+        if !self.receive_fits(packets.len()) {
             return Err(());
         }
 
@@ -303,11 +307,76 @@ impl Device for BeamDevice {
     }
 }
 
+/// Presents one received packet to smoltcp in place, with the device's
+/// transmit queue for its reply.
+///
+/// A batch's packets are borrowed from the caller's binaries while the call
+/// processes them; only a packet still unprocessed when the call stops is
+/// copied into the receive queue, which outlives the call.
+pub struct ReceiveOne<'d, 'p> {
+    device: &'d mut BeamDevice,
+    packet: Option<&'p [u8]>,
+}
+
+impl<'d, 'p> ReceiveOne<'d, 'p> {
+    pub fn new(device: &'d mut BeamDevice, packet: &'p [u8]) -> Self {
+        Self {
+            device,
+            packet: Some(packet),
+        }
+    }
+
+    /// Whether smoltcp took the packet.
+    pub fn received(&self) -> bool {
+        self.packet.is_none()
+    }
+}
+
+pub struct SliceRxToken<'p>(&'p [u8]);
+
+impl RxToken for SliceRxToken<'_> {
+    fn consume<R, F>(self, operation: F) -> R
+    where
+        F: FnOnce(&[u8]) -> R,
+    {
+        operation(self.0)
+    }
+}
+
+impl<'p> Device for ReceiveOne<'_, 'p> {
+    type RxToken<'a>
+        = SliceRxToken<'p>
+    where
+        Self: 'a;
+    type TxToken<'a>
+        = BeamTxToken<'a>
+    where
+        Self: 'a;
+
+    fn receive(&mut self, _timestamp: Instant) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
+        // As for a queued packet, the reply may use the whole transmit queue.
+        if !self.device.can_receive() {
+            return None;
+        }
+
+        let packet = self.packet.take()?;
+        Some((SliceRxToken(packet), self.device.tx_token()))
+    }
+
+    fn transmit(&mut self, timestamp: Instant) -> Option<Self::TxToken<'_>> {
+        self.device.transmit(timestamp)
+    }
+
+    fn capabilities(&self) -> DeviceCapabilities {
+        self.device.capabilities()
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use smoltcp::phy::{Device, Medium, TxToken};
+    use smoltcp::phy::{Device, Medium, RxToken, TxToken};
 
-    use super::{BeamDevice, EgressCredit};
+    use super::{BeamDevice, EgressCredit, ReceiveOne};
     use crate::budget::CallBudget;
 
     #[test]
@@ -411,6 +480,27 @@ mod tests {
 
         assert!(device.grant_egress(1, 40));
         assert_eq!(take(&mut device, 1), 1);
+    }
+
+    #[test]
+    fn receive_one_offers_its_packet_once_while_a_reply_fits() {
+        let mut device = BeamDevice::new(1_500, 1, None);
+        device.begin_call(1);
+        let packet = [0x60u8; 40];
+
+        let mut one = ReceiveOne::new(&mut device, &packet);
+        let (rx, tx) = one.receive(smoltcp::time::Instant::ZERO).unwrap();
+        assert_eq!(rx.consume(|received| received.to_vec()), packet);
+        tx.consume(40, |_| ());
+        assert!(one.received());
+        assert!(one.receive(smoltcp::time::Instant::ZERO).is_none());
+
+        // The reply filled the transmit queue, so the next packet is refused
+        // and stays with the caller.
+        let mut refused = ReceiveOne::new(&mut device, &packet);
+        assert!(refused.receive(smoltcp::time::Instant::ZERO).is_none());
+        assert!(!refused.received());
+        assert_eq!(device.queued_packets(), (0, 1));
     }
 
     // A fresh budget per call: the work budget is wall-clock time, and a

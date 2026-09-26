@@ -19,7 +19,7 @@ use smoltcp::wire::{
 
 use crate::budget::{CALL_TARGET, CHARGE_CHUNK, CallBudget, ENCODING_HEADROOM, WORK_BUDGET};
 use crate::decode_bounded_list;
-use crate::device::{BeamDevice, EgressCredit, OutputPacket};
+use crate::device::{BeamDevice, EgressCredit, OutputPacket, ReceiveOne};
 use crate::limits::{Limits, Work};
 #[cfg(debug_assertions)]
 use crate::socket_table::InstallResult;
@@ -1672,15 +1672,12 @@ impl NativeStack {
                 .ok_or(StackError::BatchTooLarge)?;
         }
 
-        let owned_packets = packets
-            .iter()
-            .map(|packet| packet.to_vec())
-            .collect::<Vec<_>>();
-        self.device
-            .enqueue_receive_batch(owned_packets)
-            .map_err(|_| StackError::OwnershipInvariantViolation)?;
+        if !self.device.receive_fits(packets.len()) {
+            return Err(StackError::OwnershipInvariantViolation);
+        }
+
         self.counters.ingress_packets += packets.len();
-        self.drive(now, Some(copied_bytes))
+        self.drive_batch(now, packets, Some(copied_bytes))
     }
 
     pub fn poll(&mut self, now: Instant) -> Effects {
@@ -3183,6 +3180,19 @@ impl NativeStack {
     }
 
     fn drive(&mut self, now: Instant, copied_bytes: Option<usize>) -> Result<Effects, StackError> {
+        self.drive_batch(now, &[], copied_bytes)
+    }
+
+    /// Drives the stack, offering smoltcp any packets held from an earlier
+    /// call and then `batch`, which it reads in place. Packets of `batch`
+    /// still unprocessed when ingress stops are copied into the receive queue
+    /// for a continuation.
+    fn drive_batch(
+        &mut self,
+        now: Instant,
+        batch: &[&[u8]],
+        copied_bytes: Option<usize>,
+    ) -> Result<Effects, StackError> {
         self.device.begin_call(self.limits.output_packets);
         let input_bytes = copied_bytes.unwrap_or(0);
         let output_byte_limit = self.limits.bytes_copied.saturating_sub(input_bytes);
@@ -3195,9 +3205,10 @@ impl NativeStack {
 
         let mut deadline_work_deferred = false;
         let mut ingress_work = 0usize;
+        let mut batch_taken = 0usize;
 
         while ingress_work < self.limits.input_packets
-            && self.device.has_receive()
+            && (self.device.has_receive() || batch_taken < batch.len())
             && self.device.can_receive()
         {
             if !self.within_budget() {
@@ -3205,26 +3216,42 @@ impl NativeStack {
                 break;
             }
 
-            let packet = self
-                .device
-                .take_receive()
-                .expect("receive queue was checked as non-empty");
-            self.retarget_wildcard_listener(&packet);
-            let reset = self.inbound_reset(&packet);
-            self.device.return_receive(packet);
-            let queued_before = self.device.queued_packets().0;
+            // Packets held from an earlier call go first.
+            let held = self.device.take_receive();
+            let packet = match &held {
+                Some(packet) => packet.as_slice(),
+                None => batch[batch_taken],
+            };
+            self.retarget_wildcard_listener(packet);
+            let reset = self.inbound_reset(packet);
+            let mut device = ReceiveOne::new(&mut self.device, packet);
             let _ = self
                 .interface
-                .poll_ingress_single(now, &mut self.device, &mut self.sockets);
+                .poll_ingress_single(now, &mut device, &mut self.sockets);
 
-            if self.device.queued_packets().0 == queued_before {
+            if !device.received() {
+                if let Some(packet) = held {
+                    self.device.return_receive(packet);
+                }
                 break;
             }
 
+            if held.is_none() {
+                batch_taken += 1;
+            }
             ingress_work += 1;
             self.record_inbound_reset(reset);
             self.request_closing_cleanup();
             self.request_listener_scan();
+        }
+
+        // Only the packets this call leaves unprocessed outlive it, so only
+        // they are copied.
+        let unprocessed = &batch[batch_taken..];
+        if !unprocessed.is_empty() {
+            self.device
+                .enqueue_receive_batch(unprocessed.iter().map(|packet| packet.to_vec()).collect())
+                .map_err(|_| StackError::OwnershipInvariantViolation)?;
         }
 
         if self.within_budget() {

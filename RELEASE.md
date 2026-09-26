@@ -10,6 +10,12 @@
   that is already queued returns about three times faster, and bulk
   transfers that read large chunks, with `recv(0)` or in active mode, run
   about 20% faster on a loopback link.
+- A stack reads the packets handed to `SmolNet.ingress/2` in place instead
+  of copying each one first. Only packets it has not processed when its
+  work budget for the call runs out are copied, to be processed on the
+  next call. Batched ingress costs about 40 ns less per 1,280-byte packet,
+  a third less for a batch of 32, and bulk TCP fed in batches runs a few
+  percent faster on a loopback link.
 
 ### Fixed
 
