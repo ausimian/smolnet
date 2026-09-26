@@ -67,7 +67,10 @@ defmodule SmolNet do
   containing any of `:bytes_copied`, `:input_packets`, `:output_packets`,
   `:ready_events`, and `:maintenance_work`; unspecified values retain their
   safe defaults. `:input_packets` defaults to one and may be raised to 32 for
-  bounded batched ingress.
+  bounded batched ingress. `:bytes_copied` bounds, separately, the bytes one
+  native call copies for its operation (a send, a receive, or an ingress
+  batch) and the bytes of the packets it hands the link, so a send of the
+  whole limit still emits its first segments in the same call.
 
   `:sockets` in the same map is the most sockets the stack holds at once. It
   defaults to 64 and may be raised to 512. It counts native backing sockets:

@@ -55,7 +55,11 @@ opportunity.
 The time budget is backed by deterministic per-call maxima of 65,575 copied
 bytes, 32 input packets, 32 output packets, 128 readiness events, and 128
 maintenance units. These bounds prevent clock or platform anomalies from
-creating unbounded work.
+creating unbounded work. The byte maximum applies separately to what a call's
+operation copies (a send, a receive, or an ingress batch) and to the packets
+it hands the link (ADR 0015), so a 64 KiB send still hands off its first
+burst in the same call. The maximum TCP send scenario measures a call at
+both.
 The `sockets` limit caps the native TCP/UDP backing sockets per stack,
 including listener pools and wildcard-UDP expansion across configured
 addresses. It defaults to 64 and may be raised to 512, the most at which

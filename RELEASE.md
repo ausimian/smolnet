@@ -23,6 +23,16 @@
 - A received UDP datagram is copied to the socket owner in one block
   instead of byte by byte. `recvfrom` of an 8 KiB datagram returns about
   three times faster, and of a 1,200-byte datagram about 30% faster.
+- A send that uses a stack's whole `bytes_copied` limit, such as a 64 KiB
+  `:gen_tcp.send/2` at the default limit, now hands its link the first
+  segments in the same native call. Before, they waited for the stack to
+  poll itself, which cost one more native call and stack round trip per
+  send. On an idle connection over a loopback link the first segment of a
+  64 KiB send at MTU 9,000 now leaves about 10% sooner; bulk throughput is
+  unchanged. A full-size ingress batch or receive also hands off its
+  output at once. `bytes_copied` now bounds what a call copies and the
+  packets it hands the link separately, and `max_bytes_copied` in
+  `SmolNet.stack_info/1` reports the larger of the two.
 
 ### Fixed
 

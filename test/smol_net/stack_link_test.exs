@@ -203,10 +203,10 @@ defmodule SmolNet.StackLinkTest do
     assert info.ingress.rejected == 5
   end
 
-  test "continues bounded output before processing the next admitted ingress" do
+  test "a full-budget ingress emits its reply in the same native call" do
     {:ok, stack} =
       SmolNet.start_stack(
-        egress: {self(), :byte_bound},
+        egress: {self(), :full_budget},
         mtu: 1_280,
         addresses: [{@address_a, 64}],
         limits: %{bytes_copied: 1_280}
@@ -217,17 +217,54 @@ defmodule SmolNet.StackLinkTest do
     assert :ok = SmolNet.ingress(stack, packet)
     assert :ok = SmolNet.ingress(stack, packet)
 
-    assert_receive {:smol_stack, :byte_bound, :egress, [first_response]}
-    assert_receive {:smol_stack, :byte_bound, :egress, [second_response]}
+    assert_receive {:smol_stack, :full_budget, :egress, [first_response]}
+    assert_receive {:smol_stack, :full_budget, :egress, [second_response]}
     assert byte_size(first_response) == 1_280
     assert byte_size(second_response) == 1_280
 
+    # Input and output each have a whole bytes_copied budget, so each reply
+    # left in its ingress call rather than a continuation poll, and the
+    # counter reports the larger direction rather than their sum.
     assert_eventually(fn ->
       {:ok, info} = SmolNet.stack_info(stack)
+      counters = info.native.result.counters
 
-      info.native.result.counters.max_bytes_copied == 1_280 and
-        info.native.result.counters.poll_calls >= 2 and info.processed_ingress == 2 and
+      counters.max_bytes_copied == 1_280 and counters.poll_calls == 0 and
+        counters.native_calls == 2 and info.processed_ingress == 2 and
         info.failed_ingress == 0
+    end)
+  end
+
+  test "continues output past its byte budget before processing the next admitted ingress" do
+    {:ok, stack} =
+      SmolNet.start_stack(
+        egress: {self(), :byte_bound},
+        mtu: 1_280,
+        addresses: [{@address_a, 64}],
+        limits: %{bytes_copied: 1_280, input_packets: 2}
+      )
+
+    # A datagram to a closed port draws an ICMP error 48 bytes larger, so the
+    # two errors of this batch overrun the 1,280-byte output budget.
+    closed_port = udp6_packet(@address_b, @address_a, 9, :binary.copy(<<0>>, 552))
+    assert byte_size(closed_port) == 600
+    echo = echo_request(@address_b, @address_a, "after")
+    assert {:ok, 2} = SmolNet.ingress(stack, [closed_port, closed_port])
+    assert :ok = SmolNet.ingress(stack, echo)
+
+    assert_receive {:smol_stack, :byte_bound, :egress, [first_error]}
+    assert_receive {:smol_stack, :byte_bound, :egress, [second_error]}
+    assert_receive {:smol_stack, :byte_bound, :egress, [reply]}
+    assert byte_size(first_error) == 648
+    assert byte_size(second_error) == 648
+    assert byte_size(reply) == byte_size(echo)
+
+    assert_eventually(fn ->
+      {:ok, info} = SmolNet.stack_info(stack)
+      counters = info.native.result.counters
+
+      counters.max_bytes_copied == 1_200 and counters.poll_calls >= 1 and
+        info.processed_ingress == 3 and info.failed_ingress == 0
     end)
   end
 
