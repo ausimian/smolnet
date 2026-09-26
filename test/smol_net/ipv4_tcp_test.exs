@@ -246,6 +246,13 @@ defmodule SmolNet.IPv4TcpTest do
     non_initial_fragment = ipv4_packet(@client4, @server4, <<>>, 1)
     assert {:error, :invalid_packet} = SmolNet.ingress(stack, non_initial_fragment)
 
+    with_options = ipv4_packet(@client4, @server4, <<>>, 0, <<1, 1, 1, 0>>)
+    assert :ok = SmolNet.ingress(stack, with_options)
+    <<fixed_header::binary-size(20), _nop, option_tail::binary>> = with_options
+
+    assert {:error, :invalid_packet} =
+             SmolNet.ingress(stack, <<fixed_header::binary, 2, option_tail::binary>>)
+
     oversized = ipv4_packet(@client4, @server4, :binary.copy(<<0>>, 1_261))
     assert {:error, :packet_too_large} = SmolNet.ingress(stack, oversized)
 
@@ -353,12 +360,13 @@ defmodule SmolNet.IPv4TcpTest do
   defp endpoint4(address, port), do: %{family: :inet, addr: address, port: port}
   defp endpoint6(address, port), do: %{family: :inet6, addr: address, port: port}
 
-  defp ipv4_packet(source, destination, payload, flags_fragment \\ 0) do
-    total_length = 20 + byte_size(payload)
+  defp ipv4_packet(source, destination, payload, flags_fragment \\ 0, options \\ <<>>) do
+    header_words = 5 + div(byte_size(options), 4)
+    total_length = header_words * 4 + byte_size(payload)
 
     header =
-      <<0x45, 0, total_length::16, 0::16, flags_fragment::16, 64, 59, 0::16,
-        tuple_bytes(source)::binary, tuple_bytes(destination)::binary>>
+      <<4::4, header_words::4, 0, total_length::16, 0::16, flags_fragment::16, 64, 59, 0::16,
+        tuple_bytes(source)::binary, tuple_bytes(destination)::binary, options::binary>>
 
     checksum = checksum(header)
     <<prefix::binary-size(10), _checksum::16, suffix::binary>> = header

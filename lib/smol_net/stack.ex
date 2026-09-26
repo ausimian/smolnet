@@ -992,14 +992,24 @@ defmodule SmolNet.Stack do
 
   defp valid_ipv4_checksum?(header) do
     header
-    |> :binary.bin_to_list()
-    |> Enum.chunk_every(2)
-    |> Enum.reduce(0, fn [high, low], sum -> sum + high * 256 + low end)
+    |> ipv4_header_sum()
     |> fold_checksum()
     |> bnot()
     |> band(0xFFFF)
     |> Kernel.==(0)
   end
+
+  # Every ingress IPv4 packet passes through here, so the fixed header's ten
+  # 16-bit words are summed in one match; options follow a word at a time.
+  defp ipv4_header_sum(
+         <<w0::16, w1::16, w2::16, w3::16, w4::16, w5::16, w6::16, w7::16, w8::16, w9::16,
+           options::binary>>
+       ) do
+    sum_words(options, w0 + w1 + w2 + w3 + w4 + w5 + w6 + w7 + w8 + w9)
+  end
+
+  defp sum_words(<<word::16, rest::binary>>, sum), do: sum_words(rest, sum + word)
+  defp sum_words(<<>>, sum), do: sum
 
   defp fold_checksum(sum) when sum > 0xFFFF,
     do: fold_checksum(band(sum, 0xFFFF) + div(sum, 0x10000))
