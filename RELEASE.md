@@ -20,6 +20,9 @@
   writing it, instead of the whole packet; every later byte is always
   written. Sending a 9,000-byte UDP datagram takes about 4% less native
   time; at smaller packet sizes the saving is too small to measure.
+- A received UDP datagram is copied to the socket owner in one block
+  instead of byte by byte. `recvfrom` of an 8 KiB datagram returns about
+  three times faster, and of a 1,200-byte datagram about 30% faster.
 
 ### Fixed
 

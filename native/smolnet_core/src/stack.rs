@@ -1508,9 +1508,9 @@ impl NativeStack {
                                     length.min(payload.len())
                                 };
                                 let truncated = copied < payload.len();
-                                let binary: Term<'a> =
-                                    NewBinary::from_iter(env, payload.iter().copied().take(copied))
-                                        .into();
+                                let mut binary = NewBinary::new(env, copied);
+                                binary.as_mut_slice().copy_from_slice(&payload[..copied]);
+                                let binary: Term<'a> = binary.into();
                                 let source =
                                     EncodedEndpoint::new(metadata.endpoint, local.scope_id);
                                 let destination = EncodedEndpoint::new(
