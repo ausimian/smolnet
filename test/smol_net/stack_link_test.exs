@@ -562,6 +562,35 @@ defmodule SmolNet.StackLinkTest do
     assert_receive {:native_stack_poll, ^stack_pid, 10}
   end
 
+  test "a call that leaves the poll deadline unchanged keeps the armed timer" do
+    {:ok, clock} = ManualClock.start()
+    Application.put_env(:smolnet, :clock_module, ManualClock)
+    Application.put_env(:smolnet, :manual_clock, clock)
+    configure_native_double(empty_effects(poll_at: 10), poll_at: 10)
+
+    {:ok, stack} = SmolNet.start_stack(egress: {self(), :kept_timer})
+    %{stack: stack_pid} = Ref.pids(stack)
+    {:ok, armed} = SmolNet.stack_info(stack)
+    assert armed.poll_at == 10
+    [timer] = manual_timers(clock)
+
+    :ok = ManualClock.advance(clock, 4)
+    packet = empty_ipv6_packet()
+    assert :ok = SmolNet.ingress(stack, packet)
+    assert_receive {:native_stack_ingress, ^stack_pid, ^packet}
+
+    {:ok, kept} = SmolNet.stack_info(stack)
+    assert kept.poll_at == 10
+    assert kept.timer_generation == armed.timer_generation
+    assert manual_timers(clock) == [timer]
+
+    :ok = ManualClock.advance(clock, 5)
+    refute_receive {:native_stack_poll, _, _}, 50
+
+    :ok = ManualClock.advance(clock, 1)
+    assert_receive {:native_stack_poll, ^stack_pid, 10}
+  end
+
   test "non-driving socket calls preserve an in-progress native continuation" do
     configure_native_double(:wait)
     Application.put_env(:smolnet, :native_poll_result, :wait)
@@ -831,6 +860,8 @@ defmodule SmolNet.StackLinkTest do
        more: Keyword.get(options, :more, false)
      }}
   end
+
+  defp manual_timers(clock), do: Agent.get(clock, &Map.keys(&1.timers))
 
   defp message_queue_length(pid) do
     {:message_queue_len, length} = Process.info(pid, :message_queue_len)

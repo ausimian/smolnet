@@ -33,6 +33,11 @@
   output at once. `bytes_copied` now bounds what a call copies and the
   packets it hands the link separately, and `max_bytes_copied` in
   `SmolNet.stack_info/1` reports the larger of the two.
+- A stack keeps its poll timer when a call leaves the poll deadline where
+  it was, instead of cancelling the timer and starting a new one. A stack
+  call that does not move the deadline returns about 20% sooner, and a
+  bulk TCP transfer over a loopback link starts and cancels about a quarter
+  fewer timers. Throughput and send latency are unchanged.
 
 ### Fixed
 
