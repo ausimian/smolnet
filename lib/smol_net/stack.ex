@@ -1110,6 +1110,13 @@ defmodule SmolNet.Stack do
     Map.update!(state, :dropped_egress, &(&1 + length(packets)))
   end
 
+  # The native stack returns its poll deadline after every call, and it is
+  # often the deadline already armed. That timer then stays: it fires when a
+  # new one would, and its message still carries the current generation. The
+  # `more: true` branch of apply_effects/3 always passes nil, so a
+  # continuation still cancels the timer and moves to a new generation.
+  defp replace_timer(%{timer: %{deadline: poll_at}} = state, poll_at), do: state
+
   defp replace_timer(state, poll_at) do
     if state.timer do
       _cancel_result = state.clock.cancel_timer(state.timer.ref)
