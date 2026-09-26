@@ -8,6 +8,16 @@ use rustler::{Env, NifMap, Term};
 use smoltcp::phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken};
 use smoltcp::time::Instant;
 
+/// Leading bytes of an egress frame that are zeroed before smoltcp writes it.
+///
+/// smoltcp writes every byte of the frames this device emits except the
+/// unused word of an ICMPv4 or ICMPv6 error header, which ends at byte 48
+/// behind an IPv6 header. Past the headers, every byte is a copied payload or
+/// TCP option padding that smoltcp fills itself, so one cache line covers each
+/// hole without clearing the whole frame.
+#[cfg(all(not(test), not(feature = "fuzzing")))]
+const ZEROED_PREFIX: usize = 64;
+
 pub struct OutputPacket {
     #[cfg(all(not(test), not(feature = "fuzzing")))]
     inner: OwnedBinary,
@@ -16,11 +26,28 @@ pub struct OutputPacket {
 }
 
 impl OutputPacket {
+    /// A zero-filled packet for the debug-build synthetic workloads.
+    #[cfg(debug_assertions)]
     pub fn zeroed(size: usize) -> Self {
         #[cfg(all(not(test), not(feature = "fuzzing")))]
         let inner = {
             let mut binary = OwnedBinary::new(size).expect("bounded transmit packet allocation");
             binary.as_mut_slice().fill(0);
+            binary
+        };
+        #[cfg(any(test, feature = "fuzzing"))]
+        let inner = vec![0; size];
+
+        Self { inner }
+    }
+
+    /// A frame for smoltcp to write. `OwnedBinary::new` does not initialise
+    /// memory, so only the bytes smoltcp may skip are zeroed first.
+    pub fn for_transmit(size: usize) -> Self {
+        #[cfg(all(not(test), not(feature = "fuzzing")))]
+        let inner = {
+            let mut binary = OwnedBinary::new(size).expect("bounded transmit packet allocation");
+            binary.as_mut_slice()[..size.min(ZEROED_PREFIX)].fill(0);
             binary
         };
         #[cfg(any(test, feature = "fuzzing"))]
@@ -256,7 +283,7 @@ impl TxToken for BeamTxToken<'_> {
     where
         F: FnOnce(&mut [u8]) -> R,
     {
-        let mut packet = OutputPacket::zeroed(length);
+        let mut packet = OutputPacket::for_transmit(length);
         let result = operation(packet.as_mut_slice());
         *self.bytes += packet.len();
         self.queue.push_back(packet);

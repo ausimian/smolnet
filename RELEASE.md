@@ -16,6 +16,10 @@
   next call. Batched ingress costs about 40 ns less per 1,280-byte packet,
   a third less for a batch of 32, and bulk TCP fed in batches runs a few
   percent faster on a loopback link.
+- A stack clears only the first 64 bytes of each outgoing packet before
+  writing it, instead of the whole packet; every later byte is always
+  written. Sending a 9,000-byte UDP datagram takes about 4% less native
+  time; at smaller packet sizes the saving is too small to measure.
 
 ### Fixed
 
