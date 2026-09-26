@@ -10,3 +10,12 @@
   that is already queued returns about three times faster, and bulk
   transfers that read large chunks, with `recv(0)` or in active mode, run
   about 20% faster on a loopback link.
+
+### Fixed
+
+- A `:gen_tcp` socket in active mode could fail to deliver the last bytes
+  it received, so the owner waited forever for the end of a transfer. It
+  happened when the socket read those bytes at the end of a batch of reads
+  and no more data followed. The same could happen after
+  `:gen_tcp.controlling_process/2` moved the socket to a new owner as such
+  a batch ended.
