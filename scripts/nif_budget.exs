@@ -18,6 +18,9 @@ defmodule SmolNet.NifBudget do
   @maximum_wildcard_udp_sockets div(@native_socket_capacity, @maximum_addresses)
   @maximum_waiters 2 * @native_socket_capacity
   @maximum_tcp_buffer_bytes 1_048_576
+  # Thirty-two TCP frames of this size are the largest output that fits one
+  # call's byte budget, so a maximum send can hand off both output maxima.
+  @maximum_send_mtu div(@maximum_limits.bytes_copied, @maximum_limits.output_packets)
   # Sockets with the largest TCP buffers that fit the per-stack buffer cap.
   @maximum_tcp_buffer_sockets 64
   @max_wall_nanoseconds 1_000_000
@@ -72,6 +75,24 @@ defmodule SmolNet.NifBudget do
         result
       end,
       fn resource, {:ok, envelope} -> continue_native_work(resource, envelope, 0) end
+    )
+
+    maximum_send = :binary.copy(<<0>>, @maximum_limits.bytes_copied)
+
+    scenario(
+      "maximum TCP send with its output burst",
+      &connected_tcp_sender/0,
+      fn {sender, identity} ->
+        Native.tcp_send(sender, identity, maximum_send, self(), make_ref(), 0)
+      end,
+      fn {sender, _identity}, {:ok, %{result: :ok, output: output} = envelope} ->
+        # Input and output have separate byte budgets, so unless the deadline
+        # cut it short, the call that copied a whole budget of input also
+        # handed off a whole burst.
+        {:ok, %{result: %{counters: counters}}} = Native.stack_snapshot(sender)
+        true = counters.deadline_yields > 0 or length(output) == @maximum_limits.output_packets
+        continue_native_work(sender, envelope, 0)
+      end
     )
 
     scenario(
@@ -544,6 +565,51 @@ defmodule SmolNet.NifBudget do
   end
 
   defp maximum_ipv6_address(suffix), do: [0xFD | List.duplicate(0, 14)] ++ [suffix]
+
+  # A sender whose TCP connection to a second stack is established, with
+  # buffers and a peer window larger than one maximum send.
+  defp connected_tcp_sender do
+    sender = new_stack(@maximum_limits, tcp_send_config(1))
+    receiver = new_stack(@maximum_limits, tcp_send_config(2))
+    endpoint = %{address: maximum_ipv6_address(2), port: 39_997, scope_id: 0}
+
+    {:ok, %{result: listener}} =
+      Native.tcp_open(receiver, :inet6, @maximum_tcp_buffer_bytes, @maximum_tcp_buffer_bytes)
+
+    {:ok, %{result: :ok}} = Native.tcp_bind(receiver, listener, endpoint)
+    {:ok, %{result: :ok}} = Native.tcp_listen(receiver, listener, 1, 0)
+
+    {:ok, %{result: identity}} =
+      Native.tcp_open(sender, :inet6, @maximum_tcp_buffer_bytes, @maximum_tcp_buffer_bytes)
+
+    reference = make_ref()
+    {:ok, envelope} = Native.tcp_connect(sender, identity, endpoint, self(), reference, 0)
+    exchange_packets(sender, receiver, envelope.output)
+
+    receive do
+      {:"$smol_socket", _identity, :select, ^reference} -> :ok
+    after
+      5_000 -> raise "timed out establishing the maximum-send connection"
+    end
+
+    {:ok, %{result: :ok}} = Native.tcp_connect(sender, identity, endpoint, self(), make_ref(), 0)
+    {sender, identity}
+  end
+
+  defp tcp_send_config(suffix) do
+    %{
+      mtu: @maximum_send_mtu,
+      addresses: [%{address: maximum_ipv6_address(suffix), prefix_length: 64}],
+      routes: []
+    }
+  end
+
+  defp exchange_packets(_from, _to, []), do: :ok
+
+  defp exchange_packets(from, to, packets) do
+    {:ok, envelope} = Native.stack_ingress_batch(to, packets, 0)
+    exchange_packets(to, from, envelope.output)
+  end
 
   defp assert_native_capacity!(resource) do
     {:ok, %{result: snapshot}} = Native.stack_snapshot(resource)

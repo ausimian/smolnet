@@ -158,12 +158,15 @@ defmodule SmolNet.IPv4UdpTest do
       {:ok, server_stack} =
         SmolNet.start_stack(egress: {link, :server}, addresses: [{@server4, 24}])
 
+      # Credit for one datagram: the rest wait in the socket's transmit ring
+      # until the test grants more.
       {:ok, client_stack} =
         SmolNet.start_stack(
           egress: {link, :client},
+          egress_credit: {1, 1_280},
           mtu: 1_280,
           addresses: [{@client4, 24}],
-          limits: %{bytes_copied: 1_280, output_packets: 1}
+          limits: %{output_packets: 1}
         )
 
       on_exit(fn -> resume_if_alive(client_stack.stack) end)
@@ -206,6 +209,8 @@ defmodule SmolNet.IPv4UdpTest do
       end)
 
       :ok = :sys.resume(client_stack.stack)
+      # Queued behind the 18 sends, so it arrives once the ring is full.
+      :ok = SmolNet.grant_egress(client_stack, 17, 17 * 1_280)
       send_results = Enum.map(sends, &Task.await(&1, @wait_6s))
       transmitted = receive_egress_sequences(:client, 18, @wait_6s)
 

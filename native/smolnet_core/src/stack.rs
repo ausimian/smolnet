@@ -3195,7 +3195,11 @@ impl NativeStack {
     ) -> Result<Effects, StackError> {
         self.device.begin_call(self.limits.output_packets);
         let input_bytes = copied_bytes.unwrap_or(0);
-        let output_byte_limit = self.limits.bytes_copied.saturating_sub(input_bytes);
+        // Input and output have separate `bytes_copied` budgets, so a call
+        // that copies a full budget of input, such as a 64 KiB send, still
+        // hands its link the burst that call's egress pass builds rather than
+        // leaving it to a continuation.
+        let output_byte_limit = self.limits.bytes_copied;
         let mut output = self.device.take_transmit(
             self.limits.output_packets,
             output_byte_limit,
@@ -3419,7 +3423,7 @@ impl NativeStack {
         };
 
         self.counters.observe(Work {
-            bytes_copied: input_bytes + output_bytes,
+            bytes_copied: input_bytes.max(output_bytes),
             input_packets: ingress_work,
             output_packets,
             ready_events: 0,
