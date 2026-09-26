@@ -9,6 +9,8 @@ defmodule SmolNet.StackLinkTest do
 
   @address_a {0xFD00, 0, 0, 0, 0, 0, 0, 1}
   @address_b {0xFD00, 0, 0, 0, 0, 0, 0, 2}
+  @ipv4_a {192, 0, 2, 1}
+  @ipv4_b {192, 0, 2, 2}
 
   setup do
     previous_env =
@@ -66,6 +68,44 @@ defmodule SmolNet.StackLinkTest do
       {:ok, info} = SmolNet.stack_info(stack)
       info.processed_ingress == 1 and info.native.result.counters.emitted_packets == 1
     end)
+  end
+
+  test "ICMP errors zero the unused word of their header" do
+    {:ok, stack} =
+      SmolNet.start_stack(
+        egress: {self(), :icmp_errors},
+        mtu: 1_280,
+        addresses: [{@address_a, 64}, {@ipv4_a, 24}]
+      )
+
+    # smoltcp does not write this word, and egress frames are not zeroed past
+    # their headers. Each error is sent just after echo replies of the same
+    # size are released, so an unzeroed word would likely reuse their 0xFF
+    # identifier and sequence number bytes.
+    cases = [
+      {echo_request(@address_b, @address_a, :binary.copy(<<0xFF>>, 148), 0xFFFF, 0xFFFF),
+       udp6_packet(@address_b, @address_a, 9, :binary.copy(<<0>>, 100)), 40, <<1, 4>>},
+      {echo4_request(@ipv4_b, @ipv4_a, :binary.copy(<<0xFF>>, 128)),
+       udp4_packet(@ipv4_b, @ipv4_a, 9, :binary.copy(<<0>>, 100)), 20, <<3, 3>>}
+    ]
+
+    for _round <- 1..8, {echo, closed_port, icmp_offset, type_and_code} <- cases do
+      for _echo <- 1..16 do
+        assert :ok = SmolNet.ingress(stack, echo)
+        assert_receive {:smol_stack, :icmp_errors, :egress, [reply]}
+        assert byte_size(reply) == byte_size(echo)
+      end
+
+      :erlang.garbage_collect(stack.stack)
+      :erlang.garbage_collect()
+
+      assert :ok = SmolNet.ingress(stack, closed_port)
+      assert_receive {:smol_stack, :icmp_errors, :egress, [error]}
+      assert byte_size(error) == byte_size(echo)
+
+      assert <<^type_and_code::binary-size(2), _checksum::16, 0::32>> =
+               binary_part(error, icmp_offset, 8)
+    end
   end
 
   test "accepts a bounded ingress batch and drives every packet in one native call" do
@@ -760,20 +800,78 @@ defmodule SmolNet.StackLinkTest do
     length
   end
 
-  defp echo_request(source, destination, payload) do
+  defp echo_request(source, destination, payload, identifier \\ 17, sequence \\ 23) do
     source = ipv6_binary(source)
     destination = ipv6_binary(destination)
-    echo_without_checksum = <<128, 0, 0::16, 17::16, 23::16, payload::binary>>
+    echo_without_checksum = <<128, 0, 0::16, identifier::16, sequence::16, payload::binary>>
 
     pseudo_header =
       <<source::binary, destination::binary, byte_size(echo_without_checksum)::32, 0::24, 58>>
 
     checksum = internet_checksum(pseudo_header <> echo_without_checksum)
-    echo = <<128, 0, checksum::16, 17::16, 23::16, payload::binary>>
+    echo = <<128, 0, checksum::16, identifier::16, sequence::16, payload::binary>>
 
     <<6::4, 0::28, byte_size(echo)::16, 58, 64, source::binary, destination::binary,
       echo::binary>>
   end
+
+  defp udp6_packet(source, destination, port, payload) do
+    source = ipv6_binary(source)
+    destination = ipv6_binary(destination)
+    length = 8 + byte_size(payload)
+    pseudo_header = <<source::binary, destination::binary, length::32, 0::24, 17>>
+    checksum = udp_checksum(pseudo_header, port, length, payload)
+
+    <<6::4, 0::28, length::16, 17, 64, source::binary, destination::binary, 40_000::16, port::16,
+      length::16, checksum::16, payload::binary>>
+  end
+
+  defp udp4_packet(source, destination, port, payload) do
+    length = 8 + byte_size(payload)
+
+    pseudo_header =
+      <<ipv4_binary(source)::binary, ipv4_binary(destination)::binary, 0, 17, length::16>>
+
+    checksum = udp_checksum(pseudo_header, port, length, payload)
+
+    ipv4_packet(
+      source,
+      destination,
+      17,
+      <<40_000::16, port::16, length::16, checksum::16, payload::binary>>
+    )
+  end
+
+  defp udp_checksum(pseudo_header, port, length, payload) do
+    case internet_checksum(
+           <<pseudo_header::binary, 40_000::16, port::16, length::16, 0::16, payload::binary>>
+         ) do
+      0 -> 0xFFFF
+      checksum -> checksum
+    end
+  end
+
+  defp echo4_request(source, destination, payload) do
+    checksum = internet_checksum(<<8, 0, 0::16, 0xFFFF::16, 0xFFFF::16, payload::binary>>)
+
+    ipv4_packet(
+      source,
+      destination,
+      1,
+      <<8, 0, checksum::16, 0xFFFF::16, 0xFFFF::16, payload::binary>>
+    )
+  end
+
+  defp ipv4_packet(source, destination, protocol, payload) do
+    header =
+      <<4::4, 5::4, 0, 20 + byte_size(payload)::16, 0::16, 0b010::3, 0::13, 64, protocol, 0::16,
+        ipv4_binary(source)::binary, ipv4_binary(destination)::binary>>
+
+    <<prefix::binary-size(10), 0::16, suffix::binary>> = header
+    <<prefix::binary, internet_checksum(header)::16, suffix::binary, payload::binary>>
+  end
+
+  defp ipv4_binary(address), do: address |> Tuple.to_list() |> :erlang.list_to_binary()
 
   defp empty_ipv6_packet(flow_label \\ 0) do
     <<6::4, 0::8, flow_label::20, 0::16, 59, 64, 0::256>>
