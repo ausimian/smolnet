@@ -494,6 +494,46 @@ defmodule SmolNet.NativeTest do
     assert completed.receive_packets == 0
   end
 
+  test "a batch packet held past the deadline is delivered intact and in order" do
+    address = [0xFD | List.duplicate(0, 14)] ++ [1]
+    limits = %{Stack.default_limits() | input_packets: 2}
+    config = %{mtu: 1_280, addresses: [%{address: address, prefix_length: 64}], routes: []}
+    {:ok, %{result: resource}} = Native.stack_new(limits, config, 0)
+    {:ok, %{result: sender}} = Native.udp_open(resource, :inet6)
+    {:ok, %{result: receiver}} = Native.udp_open(resource, :inet6)
+    source = %{address: address, port: 40_000, scope_id: 0}
+    destination = %{address: address, port: 40_001, scope_id: 0}
+    assert {:ok, %{result: :ok}} = Native.udp_bind(resource, sender, source)
+    assert {:ok, %{result: :ok}} = Native.udp_bind(resource, receiver, destination)
+    payloads = ["first", "second", "third"]
+
+    # The stack hands datagrams to its own address to the link, so its output
+    # is input to feed back.
+    [first, second, third] =
+      Enum.map(payloads, fn payload ->
+        assert {:ok, %{output: [packet]}} =
+                 Native.udp_sendto(resource, sender, destination, payload, self(), make_ref(), 0)
+
+        packet
+      end)
+
+    # The deadline stops the batch after its first packet, so the second is
+    # copied and held; the next call offers it before its own packet.
+    assert {:ok, %{result: :ok}} = Native.test_set_budget_checkpoints(resource, 1)
+
+    assert {:ok, %{result: 2, more: true}} =
+             Native.stack_ingress_batch(resource, [first, second], 0)
+
+    assert {:ok, %{result: %{receive_packets: 1}}} = Native.stack_snapshot(resource)
+    assert {:ok, %{result: 1, more: false}} = Native.stack_ingress_batch(resource, [third], 0)
+    assert {:ok, %{result: %{receive_packets: 0}}} = Native.stack_snapshot(resource)
+
+    for payload <- payloads do
+      assert {:ok, %{result: {:ok, _source, _destination, ^payload, false}}} =
+               Native.udp_recvfrom(resource, receiver, 100, self(), make_ref(), 0)
+    end
+  end
+
   test "native configuration rejects multicast and broadcast addresses without panicking" do
     multicast = [0xFF, 2] ++ List.duplicate(0, 14)
 
