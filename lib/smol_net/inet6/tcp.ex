@@ -987,7 +987,7 @@ defmodule SmolNet.Inet6.Tcp do
        do: {:keep, data}
 
   defp drive_read(data, chunks, deliveries) when chunks <= 0 or deliveries <= 0 do
-    if read_reference(data.read) do
+    if awaiting_socket?(data) do
       {:keep, data}
     else
       {:keep, schedule_read_continuation(data)}
@@ -1245,12 +1245,14 @@ defmodule SmolNet.Inet6.Tcp do
 
   defp schedule_active_read(data) do
     data = ensure_active_read(data)
-
-    case data.read do
-      %{select: {:select_info, _operation, _reference}} -> data
-      _read -> schedule_read_continuation(data)
-    end
+    if awaiting_socket?(data), do: data, else: schedule_read_continuation(data)
   end
+
+  # An armed read waiter fires when the socket gains data or reaches EOF, so it is the
+  # read's continuation only while nothing is buffered. Bytes a partial read already
+  # copied out come back alongside its select; left for that waiter, they would wait for
+  # the peer to send more, which at the end of a stream it never does.
+  defp awaiting_socket?(data), do: read_reference(data.read) != nil and data.read_buffer == <<>>
 
   defp schedule_read_continuation(%{read_scheduled: true} = data), do: data
 

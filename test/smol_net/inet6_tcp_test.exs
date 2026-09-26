@@ -215,6 +215,43 @@ defmodule SmolNet.Inet6TcpTest do
     assert Process.alive?(adapter)
   end
 
+  test "active delivery hands over the bytes read by a batch's last fetch" do
+    # One MTU-sized copy per native read: queuing n copies before going active makes the
+    # adapter's n-th fetch drain the socket. When that fetch also ends a read batch, its
+    # bytes come back with a waiter that fires only on new data, and none follows. The
+    # sweep covers every batch length up to 40 without naming the adapter's.
+    {stack, peer} = stack_and_peer(:accept, mtu: 1_280, limits: %{bytes_copied: 1_280})
+    {:ok, socket} = :gen_tcp.connect(@peer, 443, client_options(stack), 1_000)
+
+    for copies <- 1..40 do
+      payload = :binary.copy(<<copies>>, copies * 1_280)
+      assert :ok = IPv6TcpPeer.send_data(peer, payload)
+      assert :ok = :inet.setopts(socket, active: true)
+      assert receive_bytes(socket, byte_size(payload), []) == payload
+      assert :ok = :inet.setopts(socket, active: false)
+    end
+  end
+
+  test "controlling_process hands over the bytes read by a batch's last fetch" do
+    # As above, with ownership moving as the batch ends: the continuation the batch
+    # schedules is spent while the transfer holds reads back, so resuming must schedule
+    # another rather than leave the buffered bytes to the waiter.
+    parent = self()
+
+    for copies <- 1..40 do
+      {stack, peer} = stack_and_peer(:accept, mtu: 1_280, limits: %{bytes_copied: 1_280})
+      {:ok, socket} = :gen_tcp.connect(@peer, 443, client_options(stack), 1_000)
+      new_owner = spawn(fn -> forward_to_test(parent) end)
+      payload = :binary.copy(<<copies>>, copies * 1_280)
+
+      assert :ok = IPv6TcpPeer.send_data(peer, payload)
+      assert :ok = :inet.setopts(socket, active: true)
+      assert :ok = :gen_tcp.controlling_process(socket, new_owner)
+      assert receive_bytes(socket, byte_size(payload), [], :new_owner) == payload
+      send(new_owner, :stop)
+    end
+  end
+
   test "controlling_process atomically forwards queued data and redirects later data" do
     {stack, peer} = stack_and_peer()
 
@@ -446,11 +483,13 @@ defmodule SmolNet.Inet6TcpTest do
     assert_eventually(fn -> match?({:error, :closed}, :gen_tcp.recv(closed, 0, 0)) end)
   end
 
-  defp stack_and_peer(mode \\ :accept) do
+  defp stack_and_peer(mode \\ :accept, stack_options \\ []) do
     {:ok, peer} = IPv6TcpPeer.start_link(self(), mode)
 
     {:ok, stack} =
-      SmolNet.start_stack(egress: {peer, :tcp_client}, addresses: [{@client, 64}])
+      SmolNet.start_stack(
+        [egress: {peer, :tcp_client}, addresses: [{@client, 64}]] ++ stack_options
+      )
 
     :ok = IPv6TcpPeer.attach(peer, stack)
     {stack, peer}
@@ -510,6 +549,23 @@ defmodule SmolNet.Inet6TcpTest do
       {:tcp, ^socket, packet} -> receive_packets(socket, remaining - 1, [packet | packets])
     after
       1_000 -> flunk("did not receive all active packets")
+    end
+  end
+
+  defp receive_bytes(socket, remaining, received, via \\ :owner)
+
+  defp receive_bytes(_socket, remaining, received, _via) when remaining <= 0,
+    do: IO.iodata_to_binary(received)
+
+  defp receive_bytes(socket, remaining, received, via) do
+    receive do
+      {:tcp, ^socket, data} when via == :owner ->
+        receive_bytes(socket, remaining - byte_size(data), [received, data], via)
+
+      {:new_owner, {:tcp, ^socket, data}} when via == :new_owner ->
+        receive_bytes(socket, remaining - byte_size(data), [received, data], via)
+    after
+      1_000 -> flunk("#{remaining} bytes were never delivered")
     end
   end
 
