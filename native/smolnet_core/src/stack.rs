@@ -4,8 +4,8 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Mutex, TryLockError};
 
 use rustler::{
-    Atom, Decoder, Encoder, Env, LocalPid, NewBinary, NifMap, NifResult, Reference, Resource,
-    ResourceArc, Term,
+    Atom, Binary, Decoder, Encoder, Env, LocalPid, NewBinary, NifMap, NifResult, Reference,
+    Resource, ResourceArc, Term,
 };
 use smoltcp::iface::{Config, Interface, PollResult, Route, SocketHandle, SocketSet};
 use smoltcp::socket::tcp::{self, ConnectError, ListenError};
@@ -1046,14 +1046,25 @@ impl NativeStack {
         let (data, receive_open, immediately_readable) = {
             let socket = self.sockets.get_mut::<tcp::Socket<'static>>(record.handle);
             let read_length = requested.min(socket.recv_queue());
-            let mut data = vec![0; read_length];
-
-            if read_length > 0 {
-                let received = socket
-                    .recv_slice(&mut data)
-                    .map_err(|_| SocketError::Closed)?;
-                data.truncate(received);
-            }
+            // The ring is copied straight into the result binary, the one copy a
+            // receive cannot avoid. `read_length` never exceeds the queue, so a short
+            // read is not expected; if one happens, the result is a sub-binary.
+            let mut binary = NewBinary::new(env, read_length);
+            let received = if read_length > 0 {
+                socket
+                    .recv_slice(binary.as_mut_slice())
+                    .map_err(|_| SocketError::Closed)?
+            } else {
+                0
+            };
+            let binary: Binary<'a> = binary.into();
+            let data = if received < read_length {
+                binary
+                    .make_subbinary(0, received)
+                    .expect("received bytes fit the receive allocation")
+            } else {
+                binary
+            };
 
             (data, socket.may_recv(), socket.can_recv())
         };
@@ -1065,8 +1076,7 @@ impl NativeStack {
         };
 
         let result = if complete {
-            let binary: Term<'a> = NewBinary::from_iter(env, data.into_iter()).into();
-            (crate::atoms::ok(), binary).encode(env)
+            (crate::atoms::ok(), data).encode(env)
         } else if !receive_open {
             return Err(SocketError::EndOfStream);
         } else {
@@ -1084,8 +1094,7 @@ impl NativeStack {
             if data.is_empty() {
                 (crate::atoms::select(), Operation::Recv, reference).encode(env)
             } else {
-                let binary: Term<'a> = NewBinary::from_iter(env, data.into_iter()).into();
-                (crate::atoms::select(), Operation::Recv, reference, binary).encode(env)
+                (crate::atoms::select(), Operation::Recv, reference, data).encode(env)
             }
         };
         let effects = self
