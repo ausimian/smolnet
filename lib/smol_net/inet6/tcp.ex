@@ -1078,11 +1078,16 @@ defmodule SmolNet.Inet6.Tcp do
 
   defp append_read_data(data, binary) do
     if byte_size(binary) + byte_size(data.read_buffer) <= read_capacity(data) do
-      {:ok, %{data | read_buffer: data.read_buffer <> binary}}
+      {:ok, %{data | read_buffer: append_binary(data.read_buffer, binary)}}
     else
       {:error, :emsgsize}
     end
   end
+
+  # The buffer is usually empty (raw chunk reads, active delivery), and appending to
+  # `<<>>` would still copy the chunk into a new binary. Take the chunk as it is.
+  defp append_binary(<<>>, binary), do: binary
+  defp append_binary(buffer, binary), do: buffer <> binary
 
   defp deliver_read_packet(
          %{read: %{kind: :passive} = read} = data,
