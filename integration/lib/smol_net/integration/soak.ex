@@ -60,6 +60,9 @@ defmodule SmolNet.Integration.Soak do
   device is missing, say), which is not a finding about SmolNet. `main/3`
   exits 0, 1 or 2 respectively.
 
+  A workload may also `record/3` results, measurements that are not
+  judged, for the verdict.
+
   Artifacts go to the output directory: `verdict.json`, `metrics.csv` and
   `run.log` always, and on failure `failures/*.txt` (one per failure, with
   its diagnostics), `stack_info.txt` (taken at the first failure) and the
@@ -226,6 +229,19 @@ defmodule SmolNet.Integration.Soak do
   @spec count(Context.t(), atom(), integer()) :: integer()
   def count(context, name, amount \\ 1) do
     :ets.update_counter(context.table, {:counter, name}, amount, {{:counter, name}, 0})
+  end
+
+  @doc """
+  Records `value` as the run's result `name`, replacing any earlier one.
+
+  Results are measurements rather than oracles, such as throughput next to
+  the kernel baseline, and appear under `results` in `verdict.json`, so
+  `value` must be JSON: maps, lists, strings, numbers, booleans, atoms.
+  """
+  @spec record(Context.t(), atom(), term()) :: :ok
+  def record(context, name, value) do
+    :ets.insert(context.table, {{:result, name}, value})
+    :ok
   end
 
   @doc "Records an observation that is not a failure, in the log and the verdict."
@@ -525,6 +541,7 @@ defmodule SmolNet.Integration.Soak do
       failures: failures,
       counters: counters(context.table),
       notes: notes(context.table),
+      results: results(context.table),
       out_dir: options.out_dir
     }
 
@@ -577,6 +594,12 @@ defmodule SmolNet.Integration.Soak do
     table
     |> :ets.match_object({{:counter, :_}, :_})
     |> Map.new(fn {{:counter, name}, value} -> {name, value} end)
+  end
+
+  defp results(table) do
+    table
+    |> :ets.match_object({{:result, :_}, :_})
+    |> Map.new(fn {{:result, name}, value} -> {name, value} end)
   end
 
   defp notes(table) do

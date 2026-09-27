@@ -122,6 +122,21 @@ defmodule SmolNet.Integration.SoakTest do
     assert dir |> Path.join("metrics.csv") |> File.read!() =~ ~r/,widgets\n/
   end
 
+  test "a workload's results reach the verdict, the last of each name", %{tmp_dir: dir} do
+    workload = fn context ->
+      Soak.record(context, :speed, %{mbit_s: 1.5})
+      Soak.record(context, :speed, %{mbit_s: 2.5})
+    end
+
+    assert {:pass, verdict} =
+             run(~w(--baseline --duration 0 --out #{dir}), [name: "results"], workload)
+
+    assert verdict.results == %{speed: %{mbit_s: 2.5}}
+
+    assert %{"results" => %{"speed" => %{"mbit_s" => 2.5}}} =
+             dir |> Path.join("verdict.json") |> File.read!() |> JSON.decode!()
+  end
+
   test "a counter may not shadow a built-in metrics column", %{tmp_dir: dir} do
     config = [name: "shadow", counters: [:rounds, :process_count]]
 
