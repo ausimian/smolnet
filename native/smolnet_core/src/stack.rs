@@ -3349,12 +3349,17 @@ impl NativeStack {
             egress_may_remain = true;
         }
 
-        if scheduled_deadline_reached {
+        // Only egress can have closed the expired socket, so a drive that ran
+        // none, for want of credit or budget, leaves the sweep to the next one
+        // that does. Requesting it anyway would restart the sweep on every
+        // drive, and each restart asks for a continuation that, waiting for
+        // credit, never ends.
+        if scheduled_deadline_reached && egress_attempted {
             self.request_closing_cleanup();
 
             // Only a complete egress pass is sure to have dispatched the
             // expired socket; until one runs, later drives sweep again.
-            if egress_attempted && !egress_may_remain {
+            if !egress_may_remain {
                 self.scheduled_poll_at = None;
             }
         }

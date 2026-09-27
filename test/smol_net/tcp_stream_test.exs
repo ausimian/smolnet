@@ -6,6 +6,7 @@ defmodule SmolNet.TcpStreamTest do
   alias SmolNet.Stack.Ref
   alias SmolNet.Test.IPv6TcpPeer
   alias SmolNet.Test.ManualClock
+  alias SmolNet.Test.Timing
 
   import Bitwise
 
@@ -474,6 +475,49 @@ defmodule SmolNet.TcpStreamTest do
     assert :ok = SmolNet.cancel(busy_socket, busy_select)
   end
 
+  test "a close deadline that expires without egress credit does not spin the stack" do
+    {:ok, clock} = ManualClock.start()
+    Application.put_env(:smolnet, :clock_module, ManualClock)
+    Application.put_env(:smolnet, :manual_clock, clock)
+
+    # The peer never grants credit back: the SYN, the handshake ACK and the
+    # FIN use all of it.
+    {stack, peer, socket} = connected_socket(egress_credit: {3, 3 * 1_500})
+    assert :ok = IPv6TcpPeer.hold_acks(peer, true)
+    assert :ok = SmolNet.close(socket)
+
+    assert_eventually(fn ->
+      Enum.any?(IPv6TcpPeer.stats(peer).packets, &flag?(&1.flags, 0x01))
+    end)
+
+    assert %{packets: 0} = egress_credit(stack)
+
+    # The close deadline aborts the socket, whose RST must wait for credit.
+    # Until then the stack has nothing it can do, so it stops polling.
+    assert :ok = ManualClock.advance(clock, 30_001)
+    Process.sleep(Timing.quiescence(50))
+    idle = poll_calls(stack)
+    Process.sleep(Timing.quiescence(50))
+    assert poll_calls(stack) == idle
+
+    {:ok, info} = SmolNet.stack_info(stack)
+    assert info.native.result.closing_tcp_socket_count == 1
+
+    # The grant sends the RST and frees the slot.
+    assert :ok = SmolNet.grant_egress(stack, 1, 1_500)
+
+    assert_eventually(fn ->
+      Enum.any?(IPv6TcpPeer.stats(peer).packets, &flag?(&1.flags, 0x04))
+    end)
+
+    assert_eventually(fn ->
+      {:ok, info} = SmolNet.stack_info(stack)
+
+      info.native.result.closing_tcp_socket_count == 0 and
+        info.native.result.native_socket_count == 0
+    end)
+  end
+
   test "a blocked large send cannot monopolize another stack" do
     {blocked_stack, blocked_peer, blocked_socket} = connected_socket(sndbuf: 4_096)
     assert :ok = IPv6TcpPeer.hold_acks(blocked_peer, true)
@@ -575,6 +619,18 @@ defmodule SmolNet.TcpStreamTest do
   end
 
   defp endpoint(address, port), do: %{family: :inet6, addr: address, port: port}
+
+  defp egress_credit(stack) do
+    {:ok, %{native: %{result: %{egress_credit: credit}}}} = SmolNet.stack_info(stack)
+    credit
+  end
+
+  defp poll_calls(stack) do
+    {:ok, %{native: %{result: %{counters: %{poll_calls: poll_calls}}}}} =
+      SmolNet.stack_info(stack)
+
+    poll_calls
+  end
 
   defp assert_select(%Socket{id: id, generation: generation}, {:select_info, _op, reference}) do
     assert_receive {:"$smol_socket", {^id, ^generation}, :select, ^reference}, 1_000
