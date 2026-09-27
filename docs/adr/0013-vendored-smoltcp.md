@@ -85,7 +85,8 @@ round trip instead of costing a 1 s timeout per burst. Losses that leave no
 later segment to produce duplicate ACKs, such as the tail of a transfer, still
 wait for the minimum RTO, 1 s when this was written and 200 ms since #103. Many holes in one window over a long RTT still
 recover more slowly than SACK-based recovery would, since smoltcp's sender
-does not use SACK.
+does not use SACK. (#119 later added SACK-based recovery; see "Later
+patches".)
 
 SmolNet now owns a fork of smoltcp's TCP sender. Upgrading smoltcp means
 re-vendoring the new release and reapplying or dropping the patch, as
@@ -150,6 +151,35 @@ Hex packages are unaffected: they ship only precompiled NIFs and omit
   upstream start. `mix precommit` now runs the library tests with
   `socket-tcp-cubic` enabled, so that CUBIC's own tests run: two new ones
   cover the window for three MSS values and the no-raise cases.
+- #119: upstream's sender ignored SACK blocks when choosing what to resend,
+  so the patch above repaired one hole per round trip, and a window that
+  lost many segments took many round trips or a timeout to recover. The
+  sender now keeps RFC 6675's scoreboard, in
+  `src/socket/tcp/scoreboard.rs`: the ranges above the cumulative ACK that
+  the remote has SACKed, up to 32 of them, forgetting the lowest when full.
+  During fast recovery with a SACK-capable peer, `pipe` (the octets not
+  SACKed and not deemed lost, plus those resent) stands in for the flight
+  size against the congestion window, and every time the window has room
+  the sender resends the next hole that RFC 6675's `IsLost` deems lost, or
+  sends new data, or, with no new data left, resends the next hole anyway
+  (`NextSeg` rules 1 to 3). So several holes are resent in one round trip.
+  Recovery starts on the third duplicate ACK, or earlier once `IsLost`
+  holds for the first unacknowledged octet; `recover` is still the recovery
+  point, and ends it as before. A duplicate ACK no longer inflates the
+  congestion window during SACK recovery, because `pipe` already leaves out
+  what it SACKed; CUBIC's reduction on entry is otherwise unchanged. A
+  partial ACK resends the segment it points at only if SACK recovery has
+  not resent it already, and a fast retransmission stops short of SACKed
+  data. The scoreboard drops ranges as the cumulative ACK passes them, and
+  is cleared by a retransmission timeout, whose go-back-N resend repeats
+  SACKed data anyway, and when the socket resets. An ACK that SACKs a range
+  below one reported earlier now counts as a duplicate too, which the #103
+  patch's high-water mark missed (#115). Without SACK, recovery is the
+  NewReno patch above. Seven scoreboard unit tests, and seven socket tests
+  that fail without the change, cover merging and trimming, `IsLost`,
+  three holes resent at once, new data sent while `pipe` is below CUBIC's
+  window, the #115 case, a partial ACK that must not resend, rule 3, a
+  fast retransmission beside SACKed data, and the reset on a timeout.
 
 ## Later configuration
 
