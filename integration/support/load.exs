@@ -10,7 +10,7 @@
 
 # Mix prunes the code path to the project's declared applications; the
 # harness also uses these.
-Enum.each([:crypto, :ex_unit], &Mix.ensure_application!/1)
+Enum.each([:crypto, :public_key, :ssl, :ex_unit], &Mix.ensure_application!/1)
 
 unless Code.ensure_loaded?(SmolNet.Integration.Soak) do
   files =

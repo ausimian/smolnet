@@ -15,6 +15,14 @@
 # advertisements on interfaces with accept_ra=1, so those are switched to
 # accept_ra=2 until teardown.
 #
+# nftables forwards a packet only if every forward hook accepts it, so the
+# host's own firewall can drop what setup.sh's table accepts. Docker does:
+# it sets iptables' FORWARD policy to DROP. Where iptables' FORWARD chain
+# (or ip6tables') could drop, setup.sh accepts the device's traffic first
+# in Docker's DOCKER-USER chain, its place for user rules, or else first in
+# FORWARD. Any other forward chain that could drop, such as another
+# nftables table's, it cannot open safely, so it refuses to run.
+#
 # Every change is recorded in /run/smolnet-integration-<device>.state, and
 # integration/teardown.sh undoes exactly those, after a partial setup too.
 
@@ -49,6 +57,65 @@ if ip link show dev "$device" >/dev/null 2>&1; then
   echo "$device exists and was not created by setup.sh; set SMOLNET_TUN to another name" >&2
   exit 1
 fi
+
+# Whether iptables command $1 has a FORWARD chain that could drop: a policy
+# other than ACCEPT, or any rule. A command that is missing, or has no
+# backend, cannot drop anything.
+xt_blocks() {
+  command -v "$1" >/dev/null 2>&1 || return 1
+  rules=$("$1" -w -S FORWARD 2>/dev/null) || return 1
+  [ "$(printf '%s\n' "$rules" | grep -v '^-P FORWARD ACCEPT$')" != "" ]
+}
+
+# Accepts the device's traffic first in DOCKER-USER, or else in FORWARD,
+# with iptables command $1. Each rule is recorded before it is inserted, so
+# that teardown.sh deletes exactly it.
+open_xt() {
+  if "$1" -w -S DOCKER-USER >/dev/null 2>&1; then chain=DOCKER-USER; else chain=FORWARD; fi
+  mark="-m comment --comment smolnet-integration-$device"
+  insert_xt "$1" "$chain" -o "$device" -m conntrack --ctstate RELATED,ESTABLISHED $mark -j ACCEPT
+  insert_xt "$1" "$chain" -i "$device" $mark -j ACCEPT
+  echo "$1: accepting $device's traffic first in $chain"
+}
+
+insert_xt() {
+  command=$1
+  chain=$2
+  shift 2
+  echo "xt_rule $command $chain $*" >>"$state"
+  "$command" -w -I "$chain" 1 "$@"
+}
+
+# Lists the nftables forward chains, outside setup.sh's own table and the
+# tables in $1 ("family name;" each), whose policy is drop or that hold a
+# drop or reject rule.
+forward_blockers() {
+  nft list ruleset 2>/dev/null | awk -v own="inet $table" -v opened="$1" '
+    $1 == "table" { table = $2 " " $3; skip = (table == own || index(opened, " " table ";")) }
+    $1 == "chain" { chain = $2; forward = 0; found = 0 }
+    /hook forward/ { forward = !skip }
+    forward && !found && (/policy drop/ || / (drop|reject)( |;|$)/) {
+      print "nft table " table ", chain " chain; found = 1
+    }
+  '
+}
+
+# Lists legacy iptables FORWARD chains that could drop when iptables itself
+# is the nftables backend, so that the chains setup.sh opens are not the
+# ones that drop. Reading /proc loads nothing.
+legacy_blockers() {
+  for command in iptables ip6tables; do
+    case $command in
+      iptables) names=/proc/net/ip_tables_names ;;
+      ip6tables) names=/proc/net/ip6_tables_names ;;
+    esac
+
+    if "$command" -V 2>/dev/null | grep -q nf_tables && grep -qx filter "$names" 2>/dev/null &&
+      xt_blocks "$command-legacy"; then
+      echo "$command-legacy's FORWARD chain (setup.sh opens only $command's)"
+    fi
+  done
+}
 
 trap 'echo "setup.sh failed; integration/teardown.sh undoes what it did" >&2' EXIT
 
@@ -92,6 +159,38 @@ if [ "$nat" -eq 1 ]; then
     echo "nft table inet $table exists and was not created by setup.sh" >&2
     exit 1
   fi
+
+  # iptables and ip6tables, whichever backend they use, are opened below;
+  # when that backend is nftables, their tables are ip filter and ip6
+  # filter, which the check that follows leaves to them.
+  opened=""
+  for command in iptables ip6tables; do
+    if xt_blocks "$command"; then
+      if "$command" -V 2>/dev/null | grep -q nf_tables; then
+        case $command in
+          iptables) opened="$opened ip filter;" ;;
+          ip6tables) opened="$opened ip6 filter;" ;;
+        esac
+      fi
+    fi
+  done
+
+  blocking=$(
+    forward_blockers "$opened"
+    legacy_blockers
+  )
+  if [ -n "$blocking" ]; then
+    echo "another firewall can drop what $device forwards, and setup.sh cannot open it:" >&2
+    printf '%s\n' "$blocking" | sed 's/^/  /' >&2
+    echo "accept iifname $device, and oifname $device when established, in each of them first" >&2
+    exit 1
+  fi
+
+  for command in iptables ip6tables; do
+    if xt_blocks "$command"; then
+      open_xt "$command"
+    fi
+  done
 
   # One transaction: the table is created whole or not at all, and recorded
   # once it exists.
