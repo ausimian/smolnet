@@ -14,6 +14,10 @@ defmodule SmolNet.NativeTest do
   # concluding that the host will not leave one pair undisturbed.
   @slice_samples 20
 
+  # Forced budget checkpoints enough for any one call here to end on its own
+  # work limits, never on the wall clock. See `without_deadline/1`.
+  @no_deadline_checkpoints 1_000_000
+
   setup do
     on_exit(fn -> stop_all_stacks() end)
   end
@@ -503,7 +507,9 @@ defmodule SmolNet.NativeTest do
     [first, second, third] =
       Enum.map(payloads, fn payload ->
         assert {:ok, %{output: [packet]}} =
-                 Native.udp_sendto(resource, sender, destination, payload, self(), make_ref(), 0)
+                 resource
+                 |> without_deadline()
+                 |> Native.udp_sendto(sender, destination, payload, self(), make_ref(), 0)
 
         packet
       end)
@@ -516,7 +522,12 @@ defmodule SmolNet.NativeTest do
              Native.stack_ingress_batch(resource, [first, second], 0)
 
     assert {:ok, %{result: %{receive_packets: 1}}} = Native.stack_snapshot(resource)
-    assert {:ok, %{result: 1, more: false}} = Native.stack_ingress_batch(resource, [third], 0)
+
+    assert {:ok, %{result: 1, more: false}} =
+             resource
+             |> without_deadline()
+             |> Native.stack_ingress_batch([third], 0)
+
     assert {:ok, %{result: %{receive_packets: 0}}} = Native.stack_snapshot(resource)
 
     for payload <- payloads do
@@ -747,6 +758,17 @@ defmodule SmolNet.NativeTest do
 
       %{identity: identity, direction: :read}
     end)
+  end
+
+  # Lifts the wall-clock deadline from the resource's next call. A preempted
+  # runner can spend the whole work budget before the call does the work a
+  # test expects of it in one call, and the call then returns `more: true`
+  # with that work retained for a continuation.
+  defp without_deadline(resource) do
+    assert {:ok, %{result: :ok}} =
+             Native.test_set_budget_checkpoints(resource, @no_deadline_checkpoints)
+
+    resource
   end
 
   defp sample_slices(attempt \\ 1) do
