@@ -156,6 +156,8 @@ plan() {
       # Long enough for a reboot's path to return and be detected.
       run idle idle 3m '' both --quiet 30s --idle-max 1m --trickle-max 10s \
         --outage-max 20s --nat-timeout 20s
+      # A cycle of every fault and policy takes about a minute.
+      run chaos chaos 3m '' both --keep-going
       ;;
     *) die "no runs are planned for the event '${EVENT_NAME:-}'" ;;
   esac
