@@ -51,6 +51,13 @@
   and IPv6, with and without the hop's ICMP errors and MSS clamping, and
   reports each case as adapting, stalling or failing, next to what is
   expected, with captures from both sides of the hop.
+- An idle-connection integration script, `sudo mix run integration/idle.exs`,
+  that holds up to 240 TCP and TLS connections open for the whole run, idle
+  for seconds to hours between echoes, trickling single bytes, bursting after
+  long idles and stalling on a closed receive window, while a share of them
+  lose their peer silently through nftables. It records how soon SmolNet
+  fails each connection to a vanished peer, or that it does not, and fails
+  the run if the stack polls while every connection is idle.
 
 ### Changed
 

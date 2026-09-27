@@ -40,6 +40,13 @@ if ip link show dev "$ifb" 2>/dev/null | grep -q '^ *alias smolnet-integration$'
   restore ip link del dev "$ifb"
 fi
 
+# The table SmolNet.Integration.Blackhole leaves when a run is interrupted,
+# known by its name.
+blackhole=smolnet_blackhole_$(printf '%s' "$device" | tr -c 'A-Za-z0-9_' '_')
+if command -v nft >/dev/null 2>&1 && nft list table inet "$blackhole" >/dev/null 2>&1; then
+  restore nft delete table inet "$blackhole"
+fi
+
 # Forwarding goes back first, while the rules that isolate it still stand.
 while read -r key value; do
   case $key in
