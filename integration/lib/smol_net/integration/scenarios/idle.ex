@@ -96,6 +96,8 @@ defmodule SmolNet.Integration.Scenarios.Idle do
   @zero_window_bytes 32_768
   @max_echo_bytes 4_096
   @detect_slack 30_000
+  # How long a peer waits for more data before it collects its garbage.
+  @collect_after 5_000
   # Closing a connection to a vanished peer takes SmolNet's 30 s close
   # deadline, and then TIME-WAIT.
   @release_timeout 90_000
@@ -566,20 +568,29 @@ defmodule SmolNet.Integration.Scenarios.Idle do
     at = now() + wait.(state)
 
     if at < last_at do
-      sleep_until(at)
+      collect_and_wait(fn -> sleep_until(at) end)
 
       case act.(state) do
         {:ok, state} -> cycle(state, wait, act)
         :error -> state.row
       end
     else
-      sleep_until(last_at)
+      collect_and_wait(fn -> sleep_until(last_at) end)
 
       case act.(state) do
         {:ok, state} -> Map.put(state.row, :outcome, :ok)
         :error -> state.row
       end
     end
+  end
+
+  # Releases what the last exchange left on the process's heap, such as a
+  # burst's payload, before a long wait: an idle process never collects
+  # garbage on its own, and would hold it until the run ends, which
+  # metrics.csv would show as binary memory rising.
+  defp collect_and_wait(wait) do
+    :erlang.garbage_collect()
+    wait.()
   end
 
   defp idle(state), do: log_uniform(state.settings.idle)
@@ -845,7 +856,7 @@ defmodule SmolNet.Integration.Scenarios.Idle do
     echo_loop(peer)
   end
 
-  defp echo_loop(%{socket: socket} = peer) do
+  defp echo_loop(%{socket: socket} = peer, wait \\ @collect_after) do
     receive do
       {tag, ^socket, data} when tag in [:tcp, :ssl] ->
         case send_data(peer, data) do
@@ -868,6 +879,9 @@ defmodule SmolNet.Integration.Scenarios.Idle do
 
       :stop ->
         close(peer.transport, socket)
+    after
+      wait ->
+        collect_and_wait(fn -> echo_loop(peer, :infinity) end)
     end
   end
 
