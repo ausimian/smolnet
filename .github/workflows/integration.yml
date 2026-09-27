@@ -1,0 +1,224 @@
+name: Integration
+
+# The real-network integration scenarios under integration/. They need root,
+# a TUN device and, some of them, the internet, so they never run in ci.yml;
+# GitHub's Linux runners have passwordless sudo and internet access. See
+# integration/README.md for dispatching a run and reading its results.
+#
+# integration/ci/plan.sh turns the event into a matrix of runs:
+#
+#   schedule           nightly, 10 minutes each of smoke, TLS to a local
+#                      target and TLS to speed.cloudflare.com; weekly, 4 h
+#                      soaks of both TLS targets and 1 h of smoke. A hosted
+#                      job may take 6 h, so the long soak is 4 h, not 6 h.
+#   workflow_dispatch  one run, from the inputs. It never files issues.
+#   pull_request       a minute or two of each kind, netem included, when
+#                      the harness or this workflow changes, so that a
+#                      change to either is proven before it merges.
+#
+# integration/ci/run.sh runs each one as root with the release NIF and
+# judges it: pass, fault (SmolNet failed), network (the path failed, which
+# the kernel baseline shows) or environment (exit 2, such as an unreachable
+# target). Only a fault fails its job, and only a scheduled fault is filed,
+# by the report job, on the scenario's open integration:<scenario> issue.
+
+on:
+  schedule:
+    # Keep these in step with NIGHTLY and WEEKLY in integration/ci/plan.sh.
+    - cron: "17 3 * * *"
+    - cron: "43 4 * * 0"
+  workflow_dispatch:
+    inputs:
+      scenario:
+        description: The scenario, integration/<scenario>.exs
+        type: choice
+        options: [tls, smoke]
+        default: tls
+      duration:
+        description: How long to run, such as 90s, 10m or 1h30m; at most 5h
+        type: string
+        default: 10m
+      netem:
+        # SmolNet.Integration.Soak.Netem.profiles/0
+        description: A netem profile to impair the TUN device with
+        type: choice
+        options: [none, bufferbloat, corrupt, delay, duplicate, high-bdp, loss-burst, reorder]
+        default: none
+      family:
+        description: The address families to run over
+        type: choice
+        options: [both, inet, inet6]
+        default: both
+      extra_args:
+        description: More options for the script, as plain words, such as --target local --concurrency 8
+        type: string
+        default: ""
+  pull_request:
+    paths:
+      - .github/workflows/integration.yml
+      - integration/**
+
+permissions:
+  contents: read
+
+# A pull request's newer push supersedes its older runs; every other run is
+# its own group.
+concurrency:
+  group: integration-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  plan:
+    name: plan
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      # Inputs reach the script only through the environment, and are
+      # validated there.
+      - id: plan
+        run: integration/ci/plan.sh
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          SCHEDULE: ${{ github.event.schedule }}
+          INPUT_SCENARIO: ${{ inputs.scenario }}
+          INPUT_DURATION: ${{ inputs.duration }}
+          INPUT_NETEM: ${{ inputs.netem }}
+          INPUT_FAMILY: ${{ inputs.family }}
+          INPUT_EXTRA_ARGS: ${{ inputs.extra_args }}
+
+  run:
+    name: ${{ matrix.id }}
+    needs: plan
+    runs-on: ubuntu-24.04
+    timeout-minutes: ${{ matrix.timeout }}
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
+
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - uses: erlef/setup-beam@54075bcc5e249e4758d363f27d099f55d843f124 # v1
+        id: beam
+        with:
+          elixir-version: "1.19.5"
+          otp-version: "28.3"
+
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          toolchain: 1.94.0
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          workspaces: native -> target
+
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: deps
+          key: >-
+            integration-${{ runner.os }}-1.19.5-28.3-
+            ${{ hashFiles('mix.lock', 'native/Cargo.lock') }}
+
+      # See ci.yml's compatibility job for why smolnet itself is excluded.
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            _build/*/lib
+            !_build/*/lib/smolnet
+            !_build/*/lib/smolnet/**
+          key: mix-build-${{ runner.os }}-${{ runner.arch }}-elixir-${{ steps.beam.outputs.elixir-version }}-otp-${{ steps.beam.outputs.otp-version }}-${{ hashFiles('mix.lock', 'mix.exs') }}
+
+      - run: mix local.hex --force
+      - run: mix local.rebar --force
+      - run: mix deps.get
+      # The release NIF: a measurement over the debug one reads about 2.5
+      # times slow.
+      - run: mix compile --warnings-as-errors
+        env:
+          MIX_ENV: prod
+
+      - name: Set up the TUN device
+        run: |
+          missing=""
+          command -v nft >/dev/null || missing="$missing nftables"
+          command -v tcpdump >/dev/null || missing="$missing tcpdump"
+          # netem and ifb, for a profile, ship in the kernel's extra modules.
+          if [ -n "$NETEM" ] && ! modprobe -n -a sch_netem ifb 2>/dev/null; then
+            missing="$missing linux-modules-extra-$(uname -r)"
+          fi
+          if [ -n "$missing" ]; then
+            sudo apt-get update
+            # shellcheck disable=SC2086 # the package names are words
+            sudo apt-get install -y $missing
+          fi
+          sudo integration/setup.sh
+        env:
+          NETEM: ${{ matrix.netem }}
+
+      - name: Run ${{ matrix.id }}
+        run: integration/ci/run.sh
+        env:
+          RUN: ${{ toJSON(matrix) }}
+
+      - name: Tear down the TUN device
+        if: always()
+        run: sudo integration/teardown.sh
+
+      # verdict.json, metrics.csv, run.log, console.log and outcome.json
+      # always, and failures/ and stack_info.txt when there are any.
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: always()
+        with:
+          name: results-${{ matrix.id }}
+          path: |
+            integration/runs/
+            !integration/runs/**/pcap/
+          if-no-files-found: ignore
+          retention-days: 30
+          overwrite: true
+
+      # A failed run keeps the last of its capture, up to 1 GB; a passing
+      # run deletes it.
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: always()
+        with:
+          name: pcap-${{ matrix.id }}
+          path: integration/runs/*/pcap/
+          if-no-files-found: ignore
+          retention-days: 7
+          overwrite: true
+
+      - name: Fail on a SmolNet failure
+        run: jq -e '.outcome != "fault"' "integration/runs/$ID/outcome.json"
+        env:
+          ID: ${{ matrix.id }}
+
+  # Files the SmolNet failures of a scheduled run. Manual and pull request
+  # runs only report, in their job summaries.
+  report:
+    name: report
+    needs: [plan, run]
+    if: always() && github.event_name == 'schedule' && needs.plan.result == 'success'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      issues: write
+
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: results-*
+          path: outcomes
+
+      - run: integration/ci/report.sh outcomes
+        env:
+          GH_TOKEN: ${{ github.token }}
+          MATRIX: ${{ needs.plan.outputs.matrix }}
