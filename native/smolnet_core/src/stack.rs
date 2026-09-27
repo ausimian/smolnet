@@ -690,22 +690,26 @@ impl NativeStack {
             }
         }
 
-        self.remove_tcp_record(record);
-        self.tcp_listeners.insert(
-            identity.id,
-            ListenerRecord::new(
-                identity,
-                endpoint,
-                listen_endpoint,
-                local,
-                backlog,
-                handles,
-                TcpBufferSizes {
-                    rcvbuf: record.rcvbuf,
-                    sndbuf: record.sndbuf,
-                },
-            ),
+        let nodelay = !self
+            .sockets
+            .get::<tcp::Socket<'static>>(record.handle)
+            .nagle_enabled();
+        let mut listener = ListenerRecord::new(
+            identity,
+            endpoint,
+            listen_endpoint,
+            local,
+            backlog,
+            handles,
+            TcpBufferSizes {
+                rcvbuf: record.rcvbuf,
+                sndbuf: record.sndbuf,
+            },
         );
+        listener.nodelay = nodelay;
+
+        self.remove_tcp_record(record);
+        self.tcp_listeners.insert(identity.id, listener);
         self.request_listener_scan();
 
         let effects = self
@@ -752,8 +756,15 @@ impl NativeStack {
             .and_then(|listener| listener.accepted.pop_front());
 
         let result = if let Some(child) = accepted {
-            let family = self.tcp_record(child)?.family;
-            (crate::atoms::ok(), child, family).encode(env)
+            let record = *self.tcp_record(child)?;
+            let nodelay = self
+                .tcp_listeners
+                .get(&identity.id)
+                .is_some_and(|listener| listener.nodelay);
+            self.sockets
+                .get_mut::<tcp::Socket<'static>>(record.handle)
+                .set_nagle_enabled(!nodelay);
+            (crate::atoms::ok(), child, record.family).encode(env)
         } else {
             self.arm_listener_waiter(env, identity, pid, reference)?;
             (crate::atoms::select(), Operation::Accept, reference).encode(env)
@@ -884,6 +895,69 @@ impl NativeStack {
         let result = EncodedEndpoint::new(local, record.local_scope_id);
 
         Ok(self.finish_call(env, result, Effects::empty(), Vec::new()))
+    }
+
+    /// Disables Nagle's algorithm on a TCP socket when `nodelay` is true, and
+    /// re-enables it when false. On a listener it sets what the children it
+    /// accepts from now on get. Turning Nagle off sends a segment it was
+    /// holding back straight away, as `TCP_NODELAY` does.
+    pub fn tcp_set_nodelay(
+        &mut self,
+        env: Env<'_>,
+        identity: SocketIdentity,
+        nodelay: bool,
+        now: Instant,
+    ) -> Result<Envelope<Atom>, SocketError> {
+        self.ensure_running()?;
+        self.socket_table.validate(identity, SocketKind::Tcp)?;
+
+        if let Some(listener) = self
+            .tcp_listeners
+            .get_mut(&identity.id)
+            .filter(|listener| listener.identity == identity)
+        {
+            listener.nodelay = nodelay;
+        } else {
+            let record = *self.tcp_record(identity)?;
+            self.sockets
+                .get_mut::<tcp::Socket<'static>>(record.handle)
+                .set_nagle_enabled(!nodelay);
+        }
+
+        // Driving the stack also reports its next poll, which the caller
+        // replaces its timer with, so a listener's other sockets keep theirs.
+        let effects = self
+            .drive(now, None)
+            .expect("TCP nodelay change without ingress cannot fail");
+        Ok(self.finish_call(env, crate::atoms::ok(), effects, Vec::new()))
+    }
+
+    /// Whether Nagle's algorithm is disabled on a TCP socket, or on the
+    /// children a listener accepts.
+    pub fn tcp_nodelay(
+        &mut self,
+        env: Env<'_>,
+        identity: SocketIdentity,
+    ) -> Result<Envelope<bool>, SocketError> {
+        self.ensure_running()?;
+        self.socket_table.validate(identity, SocketKind::Tcp)?;
+
+        let nodelay = match self
+            .tcp_listeners
+            .get(&identity.id)
+            .filter(|listener| listener.identity == identity)
+        {
+            Some(listener) => listener.nodelay,
+            None => {
+                let record = self.tcp_record(identity)?;
+                !self
+                    .sockets
+                    .get::<tcp::Socket<'static>>(record.handle)
+                    .nagle_enabled()
+            }
+        };
+
+        Ok(self.finish_call(env, nodelay, Effects::empty(), Vec::new()))
     }
 
     pub fn tcp_peername(

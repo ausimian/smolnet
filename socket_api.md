@@ -148,6 +148,15 @@ peer = %{family: :inet6, addr: remote, port: 443}
 TCP receive and transmit buffers default to 256 KiB. `rcvbuf` and `sndbuf`
 accept sizes from 1 KiB through 1 MiB and cannot be resized after opening.
 
+Nagle's algorithm is on by default. Turn it off, as `TCP_NODELAY` does, with
+`{:tcp, :nodelay}`, before connecting or at any time after; turning it off
+sends a segment it was holding at once:
+
+```elixir
+:ok = SmolNet.setopt(socket, {:tcp, :nodelay}, true)
+{:ok, true} = SmolNet.getopt(socket, {:tcp, :nodelay})
+```
+
 `recv(socket, 0, timeout)` returns one bounded currently available chunk. A
 positive synchronous length accumulates bounded reads until it has exactly
 that many bytes, the operation fails, or the peer reaches EOF. EOF returns
@@ -177,7 +186,8 @@ A bound stream socket becomes a listener with a backlog from 1 through 128:
 ```
 
 Each accepted child has a new public identity and becomes independent of its
-listener. A listener maintains up to four native listening sockets and an
+listener. It takes the listener's `{:tcp, :nodelay}` setting as `accept`
+returns it. A listener maintains up to four native listening sockets and an
 accepted queue no larger than its requested backlog. Closing the listener
 aborts a pending accept and releases queued children; children already returned
 to callers remain usable.
