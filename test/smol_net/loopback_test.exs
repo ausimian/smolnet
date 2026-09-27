@@ -5,6 +5,8 @@ defmodule SmolNet.LoopbackTest do
   alias SmolNet.Stack.Ref
   alias SmolNet.Test.Timing
 
+  import SmolNet.Test.Monitoring, only: [monitor_in_place: 1]
+
   # Liveness budgets: bounds on how long a healthy run may take to make
   # progress, not properties under test. See `SmolNet.Test.Timing`.
   @wait_1s Timing.liveness(1_000)
@@ -140,7 +142,7 @@ defmodule SmolNet.LoopbackTest do
 
   test "a stack crash stops the link that loops it" do
     {:ok, link, stack} = Loopback.start_link(addresses: @addresses)
-    monitor = Process.monitor(link)
+    monitor = monitor_in_place(link)
     %{stack: stack_pid} = Ref.pids(stack)
 
     Process.exit(stack_pid, :kill)
