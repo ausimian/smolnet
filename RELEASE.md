@@ -35,8 +35,8 @@
   round trip, however narrow the path, and lost much of it wherever a queue
   was short: through a 20 Mbit/s bottleneck it sent at about 1.5 Mbit/s,
   and with several streams less. A connection now starts from a window of
-  two segments and grows it, so it takes a few more round trips to reach
-  full speed on a clean path.
+  ten segments, 14,600 bytes on a typical path, as RFC 6928 and Linux do, and
+  grows it from there. After a lost SYN it starts from one segment.
 - The minimum TCP retransmission timeout is now 200 ms, as on Linux,
   instead of 1 s. This deliberately departs from RFC 6298, which says the
   minimum SHOULD be 1 s: on paths with round trips of tens of milliseconds,

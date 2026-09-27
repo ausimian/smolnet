@@ -137,6 +137,19 @@ Hex packages are unaffected: they ship only precompiled NIFs and omit
   costs a go-back-N resend and, with CUBIC, a window of one segment; Linux
   runs with the same floor. `test_rtt_estimator_min_rto` covers the floor
   and the backoff from it.
+- #123: upstream's CUBIC started every connection from 2,048 bytes, two
+  segments of its 1,024-byte default MSS, and `set_mss` never scaled it: a
+  1,460-byte path started from 1.4 segments, a jumbo one from less than
+  one. A short transfer over a round trip of tens of milliseconds finished
+  in slow start, and a 1 MiB TLS upload to speed.cloudflare.com ran at
+  0.4 times the kernel's speed, against 0.97 with no controller. `set_mss`
+  now sets the RFC 6928 initial window, `min(10 * MSS, max(2 * MSS,
+  14600))`, as Linux does, unless the connection has already had a loss or
+  a timeout: a retransmitted SYN leaves the loss window, as RFC 6928 (2)
+  requires. Reno has its own `set_mss` and is not enabled, so it keeps the
+  upstream start. `mix precommit` now runs the library tests with
+  `socket-tcp-cubic` enabled, so that CUBIC's own tests run: two new ones
+  cover the window for three MSS values and the no-raise cases.
 
 ## Later configuration
 
@@ -148,9 +161,9 @@ than to its code:
   controller ran: a sender put its whole send buffer into the network each
   round trip, however narrow the path. Through a 20 Mbit/s bottleneck with a
   50-packet queue, that lost about half of every window, and SmolNet sent
-  at 1.5 Mbit/s against the kernel's 19. The cost is slow start from an
-  initial window of two segments, which takes a few round trips longer to
-  fill a clean path than Linux's ten. smoltcp's CUBIC ends its fast recovery
+  at 1.5 Mbit/s against the kernel's 19. Upstream's CUBIC started from two
+  segments, far below Linux's ten, which #123 then patched (see "Later
+  patches"). smoltcp's CUBIC ends its fast recovery
   on the first ACK of new data, a partial ACK included, and deflates the
   window to `ssthresh` there, while the patch's `recover` keeps
   retransmitting the remaining holes.

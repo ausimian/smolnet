@@ -90,17 +90,19 @@ sender: RFC 6582 partial-ACK recovery (ADR 0013), a fix that keeps a fast
 retransmission pending when the device refuses it (#80), and Minshall's
 variant of Nagle's algorithm, which sends the partial tail of a write longer
 than an MSS without waiting for an ACK (#102), RFC 6675's duplicate ACK,
-which counts an ACK that SACKs new data whatever its window (#103), and a
-200 ms minimum RTO in place of RFC 6298's 1 s (#103). The commit that added
+which counts an ACK that SACKs new data whatever its window (#103), a
+200 ms minimum RTO in place of RFC 6298's 1 s (#103), and CUBIC's RFC 6928
+initial window of up to ten segments (#123). The commit that added
 the directory holds the crates.io package unmodified, so
 `git log -p -- native/vendor/smoltcp` after that commit is the complete set of
 SmolNet changes. Keep any further patch small, covered by tests in the
 vendored crate, and suitable for offering upstream.
 
-`mix precommit` runs the vendored crate's library tests. To run them alone:
+`mix precommit` runs the vendored crate's library tests, with the CUBIC
+controller SmolNet enables, so that its tests run too. To run them alone:
 
 ```console
-cargo test --manifest-path native/vendor/smoltcp/Cargo.toml --lib --target-dir native/target/vendor
+cargo test --manifest-path native/vendor/smoltcp/Cargo.toml --lib --features socket-tcp-cubic --target-dir native/target/vendor
 ```
 
 To move to a new smoltcp release, first check whether it already recovers
