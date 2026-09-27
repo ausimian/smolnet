@@ -4,11 +4,19 @@ defmodule SmolNet.Inet6TcpTest do
   alias SmolNet.Inet6.Tcp
   alias SmolNet.Stack.Ref
   alias SmolNet.Test.IPv6TcpPeer
+  alias SmolNet.Test.Timing
 
   import Bitwise, only: [band: 2]
 
   @client {0xFD00, 0, 0, 0, 0, 0, 0, 1}
   @peer {0xFD00, 0, 0, 0, 0, 0, 0, 2}
+
+  # Liveness budgets scale with the host. See `SmolNet.Test.Timing`.
+  @wait_1s Timing.liveness(1_000)
+  # A read that must still be pending after the work the test does while it
+  # waits. It is asserted to expire, not to expire at a particular time, so
+  # it bounds that work and scales like any other liveness budget.
+  @pending_read Timing.liveness(250)
 
   setup do
     on_exit(&stop_all_stacks/0)
@@ -65,7 +73,7 @@ defmodule SmolNet.Inet6TcpTest do
     {stack, peer} = stack_and_peer()
     {:ok, socket} = :gen_tcp.connect(@peer, 443, client_options(stack, [:list]), 1_000)
 
-    receiver = Task.async(fn -> :gen_tcp.recv(socket, 4, 100) end)
+    receiver = Task.async(fn -> :gen_tcp.recv(socket, 4, @pending_read) end)
 
     assert_eventually(fn -> Tcp.info(socket).read_pending end)
     assert :ok = :gen_tcp.send(socket, "ping")
@@ -569,7 +577,7 @@ defmodule SmolNet.Inet6TcpTest do
     end
   end
 
-  defp assert_eventually(check, timeout \\ 1_000) do
+  defp assert_eventually(check, timeout \\ @wait_1s) do
     deadline = System.monotonic_time(:millisecond) + timeout
     do_assert_eventually(check, deadline)
   end
