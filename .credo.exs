@@ -25,6 +25,7 @@
           "lib/",
           "src/",
           "test/",
+          "integration/",
           "web/",
           "apps/*/lib/",
           "apps/*/src/",

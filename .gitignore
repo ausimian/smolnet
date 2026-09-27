@@ -38,3 +38,7 @@ smolnet-*.tar
 
 # Rust binary artifacts
 /target/
+
+# Integration harness: the built TUN helper and per-run artifacts.
+/integration/tun_helper/_build/
+/integration/runs/
