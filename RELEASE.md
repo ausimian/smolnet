@@ -9,6 +9,14 @@
   `port/1`, `monitor/1` and `cancel_monitor/1`, so `:inet.monitor/1` works
   on SmolNet sockets and delivers `{:DOWN, ref, :socket, socket, :closed}`
   when one closes. See the `:gen_tcp` guide.
+- `:gen_tcp`'s `nodelay` option, which turns Nagle's algorithm off. It is
+  accepted at connect, listen and `:inet.setopts/2` and reported by
+  `:inet.getopts/2`, and defaults to `false` as in `:gen_tcp`. A socket
+  accepted from a listener takes the listener's setting. Before, SmolNet
+  rejected the option with `:einval`, so code that turned Nagle off could
+  not run over it unchanged. The low-level API gets the same switch as
+  `SmolNet.setopt(socket, {:tcp, :nodelay}, true)`, read back with
+  `SmolNet.getopt/2`.
 - A real-network integration harness in the source repository, under
   `integration/`, for long runs of SmolNet against real peers. It is not
   part of the Hex package and does not run in `mix test`. It provides a

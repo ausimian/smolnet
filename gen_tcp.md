@@ -190,6 +190,13 @@ a later option explicitly lowers `buffer`.
 read and one write may be in progress concurrently; a second operation in the
 same direction returns `:busy`.
 
+`nodelay` is as for `:gen_tcp`. It defaults to `false`, which leaves Nagle's
+algorithm on: a write shorter than a segment waits while an earlier short one
+is unacknowledged, in Minshall's variant, as on Linux. `nodelay: true` turns
+it off, at connect or listen or later with `:inet.setopts/2`; turning it off
+sends a write it was holding at once. A socket accepted from a listener takes
+the listener's `nodelay` as `:gen_tcp.accept/2` returns it.
+
 ## TLS with `:ssl`
 
 `:ssl` takes its transport through the `cb_info` option, and either callback
@@ -250,6 +257,7 @@ The inet option surface is deliberately finite:
 | `:header` | `0` only | `0` only |
 | `:buffer` | `1..1048576` | supported |
 | `:recbuf` / `:sndbuf` | `1024..1048576` | fixed |
+| `:nodelay` | `true` or `false` (default) | supported |
 | `:send_timeout` / `:send_timeout_close` | supported | supported |
 | `:ip` / `:ifaddr` / `:port` | supported | fixed |
 | `:backlog` | listen only, `1..128` | fixed |

@@ -348,6 +348,35 @@ defmodule SmolNet do
           {:ok, Socket.sockaddr_in() | Socket.sockaddr_in6()} | {:error, atom()}
   defdelegate peername(socket), to: Socket
 
+  @doc """
+  Sets a socket option on a TCP socket.
+
+  The one option is `{:tcp, :nodelay}`, as in `:socket.setopt/3`: `true`
+  disables Nagle's algorithm, so a small write is sent while an earlier one
+  is still unacknowledged, and `false`, the default, enables it again.
+  Disabling it sends a segment it was holding back at once.
+
+  Set it before connecting, or at any time after. On a listener it applies
+  to the children `accept/2` returns from then on, which each take the
+  listener's setting as they are returned; changing it on a child afterwards
+  does not affect the listener.
+
+  A UDP socket returns `{:error, :invalid_socket_state}`, and any other
+  option or value `{:error, :invalid_options}`.
+  """
+  @spec setopt(Socket.t(), {:tcp, :nodelay}, boolean()) :: :ok | {:error, atom()}
+  defdelegate setopt(socket, option, value), to: Socket
+
+  @doc """
+  Returns a TCP socket option set with `setopt/3`.
+
+  `{:tcp, :nodelay}` returns `{:ok, true}` when Nagle's algorithm is
+  disabled; on a listener, whether the children it accepts will have it
+  disabled.
+  """
+  @spec getopt(Socket.t(), {:tcp, :nodelay}) :: {:ok, boolean()} | {:error, atom()}
+  defdelegate getopt(socket, option), to: Socket
+
   @doc "Closes a socket and permanently invalidates its public handle."
   @spec close(Socket.t()) :: :ok | {:error, atom()}
   defdelegate close(socket), to: Socket

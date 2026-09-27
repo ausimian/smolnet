@@ -290,6 +290,7 @@ defmodule SmolNet.Inet6.Tcp do
              sndbuf: options.sndbuf
            ),
          :ok <- Stack.socket_watch_owner(socket, self()),
+         :ok <- open_nodelay(socket, options.nodelay),
          :ok <- SmolNet.bind(socket, listener_endpoint(options)),
          :ok <- SmolNet.listen(socket, options.backlog) do
       {:ok, :listening, %{data | low_socket: socket}}
@@ -393,8 +394,10 @@ defmodule SmolNet.Inet6.Tcp do
   end
 
   def handle_event({:call, from}, {:setopts, options}, :listening, data) do
-    case Options.update(data.options, options) do
-      {:ok, updated} -> {:keep_state, %{data | options: updated}, [{:reply, from, :ok}]}
+    with {:ok, updated} <- Options.update(data.options, options),
+         :ok <- update_nodelay(data, updated) do
+      {:keep_state, %{data | options: updated}, [{:reply, from, :ok}]}
+    else
       {:error, reason} -> {:keep_state_and_data, [{:reply, from, {:error, reason}}]}
     end
   end
@@ -794,6 +797,7 @@ defmodule SmolNet.Inet6.Tcp do
         data = %{data | low_socket: socket}
 
         with :ok <- Stack.socket_watch_owner(socket, self()),
+             :ok <- open_nodelay(socket, data.options.nodelay),
              :ok <- maybe_bind(socket, Options.local_endpoint(data.options)) do
           attempt_connect(data)
         else
@@ -807,6 +811,19 @@ defmodule SmolNet.Inet6.Tcp do
 
   defp maybe_bind(_socket, nil), do: :ok
   defp maybe_bind(socket, endpoint), do: SmolNet.bind(socket, endpoint)
+
+  # A new native socket has Nagle's algorithm on, gen_tcp's `nodelay: false`.
+  defp open_nodelay(_socket, false), do: :ok
+  defp open_nodelay(socket, true), do: SmolNet.setopt(socket, {:tcp, :nodelay}, true)
+
+  defp update_nodelay(%{options: %{nodelay: nodelay}}, %Options{nodelay: nodelay}), do: :ok
+
+  defp update_nodelay(data, %Options{nodelay: nodelay}) do
+    case SmolNet.setopt(data.low_socket, {:tcp, :nodelay}, nodelay) do
+      :ok -> :ok
+      {:error, reason} -> {:error, translate_reason(reason)}
+    end
+  end
 
   defp drive_accept(%{accept: nil} = data), do: {:keep, data}
 
@@ -1346,7 +1363,8 @@ defmodule SmolNet.Inet6.Tcp do
 
   defp set_options(from, options, data) do
     with {:ok, updated} <- Options.update(data.options, options),
-         :ok <- option_change_allowed(data, updated) do
+         :ok <- option_change_allowed(data, updated),
+         :ok <- update_nodelay(data, updated) do
       data = apply_active_change(data, updated)
       {:keep_state, data, [{:reply, from, :ok}]}
     else

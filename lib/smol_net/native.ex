@@ -93,6 +93,14 @@ defmodule SmolNet.Native do
   @spec tcp_peername(reference(), map()) :: {:ok, map()} | {:error, atom()}
   def tcp_peername(_stack, _identity), do: :erlang.nif_error(:nif_not_loaded)
 
+  @spec tcp_set_nodelay(reference(), map(), boolean(), integer()) ::
+          {:ok, map()} | {:error, atom()}
+  def tcp_set_nodelay(_stack, _identity, _nodelay, _now),
+    do: :erlang.nif_error(:nif_not_loaded)
+
+  @spec tcp_nodelay(reference(), map()) :: {:ok, map()} | {:error, atom()}
+  def tcp_nodelay(_stack, _identity), do: :erlang.nif_error(:nif_not_loaded)
+
   @spec tcp_close(reference(), map(), integer()) :: {:ok, map()} | {:error, atom()}
   def tcp_close(_stack, _identity, _now), do: :erlang.nif_error(:nif_not_loaded)
 

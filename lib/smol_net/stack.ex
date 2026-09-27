@@ -263,6 +263,22 @@ defmodule SmolNet.Stack do
   end
 
   @doc false
+  @spec socket_set_nodelay(Socket.t(), boolean()) :: :ok | {:error, atom()}
+  def socket_set_nodelay(%Socket{stack: stack, id: id, generation: generation}, nodelay) do
+    GenServer.call(stack, {:socket_set_nodelay, id, generation, nodelay})
+  catch
+    :exit, _reason -> {:error, :closed}
+  end
+
+  @doc false
+  @spec socket_nodelay(Socket.t()) :: {:ok, boolean()} | {:error, atom()}
+  def socket_nodelay(%Socket{stack: stack, id: id, generation: generation}) do
+    GenServer.call(stack, {:socket_nodelay, id, generation})
+  catch
+    :exit, _reason -> {:error, :closed}
+  end
+
+  @doc false
   @spec socket_peername(Socket.t()) ::
           {:ok, Socket.sockaddr_in() | Socket.sockaddr_in6()} | {:error, atom()}
   def socket_peername(%Socket{stack: stack, id: id, generation: generation, kind: kind}) do
@@ -764,6 +780,21 @@ defmodule SmolNet.Stack do
 
     result
     |> reply_native(state, &normalize_endpoint/1, :preserve_timer)
+  end
+
+  def handle_call({:socket_set_nodelay, id, generation, nodelay}, _from, state) do
+    state.native_module.tcp_set_nodelay(
+      state.native,
+      %{id: id, generation: generation},
+      nodelay,
+      state.clock.now()
+    )
+    |> reply_native(state)
+  end
+
+  def handle_call({:socket_nodelay, id, generation}, _from, state) do
+    state.native_module.tcp_nodelay(state.native, %{id: id, generation: generation})
+    |> reply_native(state, &{:ok, &1}, :preserve_timer)
   end
 
   def handle_call({:socket_peername, id, generation, kind}, _from, state) do

@@ -219,6 +219,10 @@ pub struct ListenerRecord {
     pub accepted: VecDeque<SocketIdentity>,
     pub rcvbuf: usize,
     pub sndbuf: usize,
+    /// Whether a child the listener accepts has Nagle's algorithm disabled.
+    /// It is applied when `accept` returns the child, so the child takes the
+    /// listener's setting as it is at that moment.
+    pub nodelay: bool,
 }
 
 impl ListenerRecord {
@@ -242,6 +246,7 @@ impl ListenerRecord {
             accepted: VecDeque::with_capacity(backlog),
             rcvbuf: buffer_sizes.rcvbuf,
             sndbuf: buffer_sizes.sndbuf,
+            nodelay: false,
         }
     }
 }
