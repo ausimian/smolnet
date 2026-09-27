@@ -167,6 +167,44 @@ defmodule SmolNet.Integration.TunLinkTest do
     assert {:error, {:helper_exit, 1}} = TunLink.start(device: "smolnet-name-too-long")
   end
 
+  test "starving the stack stops its egress, and ending it returns every packet's credit" do
+    credit = %{packets: 4, bytes: 8_000}
+    {link, stack} = start_link(egress_credit: {4, 8_000})
+
+    assert :ok = TunLink.starve(link, :stop)
+    echo = Task.async(fn -> echo(stack, 65_536) end)
+
+    assert_eventually(fn -> egress_credit(stack).packets == 0 end)
+    assert %{starve: :stop, credit_withheld_packets: withheld} = TunLink.stats(link)
+    assert withheld > 0
+    assert Task.yield(echo, 200) == nil
+
+    assert :ok = TunLink.starve(link, :off)
+    assert Task.await(echo, 30_000)
+    assert_eventually(fn -> egress_credit(stack) == credit end)
+    assert %{credit_withheld_packets: 0, credit_withheld_bytes: 0} = TunLink.stats(link)
+  end
+
+  test "a trickle or a delay of credit slows the stack without losing any" do
+    credit = %{packets: 4, bytes: 8_000}
+    {link, stack} = start_link(egress_credit: {4, 8_000})
+
+    for mode <- [{:trickle, 2}, {:delay, 20}] do
+      assert :ok = TunLink.starve(link, mode)
+      assert echo(stack, 65_536)
+      assert :ok = TunLink.starve(link, :off)
+
+      assert_eventually(fn ->
+        egress_credit(stack) == credit and TunLink.stats(link).credit_withheld_packets == 0
+      end)
+    end
+  end
+
+  test "a stack with unlimited credit cannot be starved" do
+    {link, _stack} = start_link(egress_credit: :infinity)
+    assert TunLink.starve(link, :stop) == {:error, :no_credit}
+  end
+
   defp start_link(options \\ []) do
     {:ok, link, stack} = TunLink.start([loopback: true, addresses: [{@address, 24}]] ++ options)
 
