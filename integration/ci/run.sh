@@ -139,13 +139,31 @@ jq -n \
 
 integration/ci/summary.sh "$out/outcome.json" >>"${GITHUB_STEP_SUMMARY:-/dev/stdout}"
 
+# `gh run view` shows annotations but not job summaries, so each run's
+# annotation carries the gist: the reason, the verdict, the counters, the
+# first failures and the throughput.
+message=$(jq -r '
+  (.verdict // {}) as $v |
+  (if .reason != "" then .reason else empty end),
+  (if .verdict == null then "no verdict.json (exit status \(.exit_status))" else
+    "verdict \($v.verdict): \($v.mode), \($v.families | join("+")), \($v.netem // "no netem"), " +
+      "\($v.elapsed_s | round) s" end),
+  (($v.counters // {}) | select(length > 0) |
+    "counters: " + (to_entries | map("\(.key)=\(.value)") | join(", "))),
+  (($v.failures // [])[:5][] | "failure \(.kind): \(.summary)"),
+  (($v.results.throughput // [])[] |
+    "\(.family) \(.phase), \(.client) client to \(.server): \(.median_mbit_s) Mbit/s" +
+      (if .ratio_to_kernel then " (\(.ratio_to_kernel)x the kernel)" else "" end) +
+      ", handshake \(.median_handshake_ms) ms")
+' "$out/outcome.json")
+
 # An annotation's message is one line, with % and line breaks escaped.
-message=${reason//'%'/'%25'}
+message=${message//'%'/'%25'}
 message=${message//$'\r'/'%0D'}
 message=${message//$'\n'/'%0A'}
 
 case $outcome in
-  pass) echo "$id passed" ;;
+  pass) echo "::notice title=$id passed::$message" ;;
   fault) echo "::error title=$id failed::$message" ;;
   network) echo "::warning title=$id: network flakiness, not filed::$message" ;;
   environment) echo "::warning title=$id: environment error, not filed::$message" ;;

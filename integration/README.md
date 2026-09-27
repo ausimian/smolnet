@@ -83,15 +83,16 @@ rates. The run is built with the release NIF.
 ```console
 gh run list --repo ausimian/smolnet --workflow integration.yml --limit 5
 gh run watch <run-id> --repo ausimian/smolnet
-gh run view <run-id> --repo ausimian/smolnet             # annotations: outcomes
+gh run view <run-id> --repo ausimian/smolnet             # each run's annotation
 gh run view <run-id> --repo ausimian/smolnet --log        # console output
 gh run download <run-id> --repo ausimian/smolnet --name results-<id>
 ```
 
 Each run's job, named by its id (`dispatch-<scenario>` for a dispatched
-one), writes a job summary with the outcome, the verdict, failures,
-counters, the throughput table and the notes. Open the run in a browser to
-see it. The `results-<id>` artifact (kept 30 days) holds `<id>/` with
+one), leaves one annotation, which `gh run view` prints: the outcome and
+why, the verdict, the counters, the first failures and the throughput of
+each phase, next to the kernel's. Its job summary, in the browser, adds
+tables and the notes. The `results-<id>` artifact (kept 30 days) holds `<id>/` with
 the files above, plus `console.log` and `outcome.json`, and
 `<id>-recheck/` if the path was rechecked. A failed run's capture is the
 `pcap-<id>` artifact (kept 7 days).
