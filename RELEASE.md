@@ -85,6 +85,14 @@
   TCP sockets at the default sizes: a stack with a raised socket limit that
   opens more than that gets `{:error, :system_limit}` unless it asks for
   smaller buffers. `:gen_tcp`'s `buffer` still defaults to 64 KiB.
+- A TCP sender now resends several lost segments per round trip when its
+  peer supports SACK, as Linux does, using RFC 6675's SACK scoreboard.
+  Before, it resent one lost segment per round trip, so a window that lost
+  many segments, as a congested queue or a burst of loss does, took many
+  round trips or a retransmission timeout to repair. An ACK that SACKs data
+  below a range the peer reported earlier now also counts as a duplicate
+  ACK; before, it did not when it also changed the window, which could
+  delay a fast retransmission.
 
 ### Fixed
 
