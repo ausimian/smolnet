@@ -9,6 +9,12 @@ defmodule SmolNet.UdpTest do
   @wait_6s Timing.liveness(6_000)
   @idle_20ms Timing.quiescence(20)
 
+  # Datagrams a UDP socket's receive ring holds. UDP has no flow control: a
+  # sender that gets further ahead of its reader than this loses the excess,
+  # as it may. A burst that must arrive whole fits in the ring, and the next
+  # is sent once the reader has taken it.
+  @udp_ring_packets 16
+
   @server {0xFD00, 0, 0, 0, 0, 0, 0, 1}
   @client {0xFD00, 0, 0, 0, 0, 0, 0, 2}
 
@@ -333,11 +339,15 @@ defmodule SmolNet.UdpTest do
 
     assert :ok = :inet.setopts(server, active: true)
 
-    for sequence <- 1..20 do
-      assert :ok = :gen_udp.send(client, @server, server_port, <<sequence>>)
+    for burst <- Enum.chunk_every(1..20, @udp_ring_packets) do
+      for sequence <- burst do
+        assert :ok = :gen_udp.send(client, @server, server_port, <<sequence>>)
+      end
+
+      assert Enum.sort(receive_active(server, length(burst), [])) ==
+               Enum.map(burst, &<<&1>>)
     end
 
-    assert Enum.sort(receive_active(server, 20, [])) == Enum.map(1..20, &<<&1>>)
     assert :ok = :inet.setopts(server, active: false)
     assert :ok = :gen_udp.close(server)
     assert :ok = :gen_udp.close(client)

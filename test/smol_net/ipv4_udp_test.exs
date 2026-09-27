@@ -21,6 +21,12 @@ defmodule SmolNet.IPv4UdpTest do
   @idle_10ms Timing.quiescence(10)
   @idle_20ms Timing.quiescence(20)
 
+  # Datagrams a UDP socket's receive ring holds, as the first test asserts.
+  # UDP has no flow control: a sender that gets further ahead of its reader
+  # than this loses the excess, as it may. A burst that must arrive whole
+  # fits in the ring, and the next is sent once the reader has taken it.
+  @udp_ring_packets 16
+
   @server4 {192, 0, 2, 1}
   @client4 {192, 0, 2, 2}
   @server6 {0xFD00, 0, 0, 0, 0, 0, 0, 1}
@@ -381,6 +387,12 @@ defmodule SmolNet.IPv4UdpTest do
                  )
       end
 
+      # A send returns once the client queues it, not once the server has
+      # it. Receives alternate between the per-address rings, so the order
+      # below holds only after every datagram has reached its ring: a
+      # receive that overtakes delivery finds the alternate ring alone.
+      assert_eventually(fn -> ingested?(server_stack, 17) end)
+
       assert {:ok, %{destination: %{addr: @server4}, data: <<1::16>>}} =
                SmolNet.recvfrom(server, 0, @wait_1s)
 
@@ -528,11 +540,15 @@ defmodule SmolNet.IPv4UdpTest do
 
       assert :ok = :inet.setopts(server, active: true)
 
-      for sequence <- 1..20 do
-        assert :ok = :gen_udp.send(client, <<sequence>>)
+      for burst <- Enum.chunk_every(1..20, @udp_ring_packets) do
+        for sequence <- burst do
+          assert :ok = :gen_udp.send(client, <<sequence>>)
+        end
+
+        assert Enum.sort(receive_active(server, length(burst), [])) ==
+                 Enum.map(burst, &<<&1>>)
       end
 
-      assert Enum.sort(receive_active(server, 20, [])) == Enum.map(1..20, &<<&1>>)
       assert :ok = :inet.setopts(server, active: false)
 
       assert {:ok, [active: false, mode: :binary, buffer: 65_536, recbuf: 65_536]} =
@@ -651,18 +667,34 @@ defmodule SmolNet.IPv4UdpTest do
     tcp_read4 = Task.async(fn -> SmolNet.recv(tcp_server4, 512, @wait_3s) end)
     tcp_read6 = Task.async(fn -> SmolNet.recv(tcp_server6, 512, @wait_3s) end)
 
-    udp_read4 = Task.async(fn -> receive_datagrams(udp_server4, 20, []) end)
-    udp_read6 = Task.async(fn -> receive_datagrams(udp_server6, 20, []) end)
+    parent = self()
+    udp_read4 = Task.async(fn -> receive_datagrams(udp_server4, 20, [], {parent, :inet}) end)
+    udp_read6 = Task.async(fn -> receive_datagrams(udp_server6, 20, [], {parent, :inet6}) end)
 
     tcp_send4 = Task.async(fn -> SmolNet.send(tcp_client4, tcp4_payload, @wait_3s) end)
     tcp_send6 = Task.async(fn -> SmolNet.send(tcp_client6, tcp6_payload, @wait_3s) end)
 
-    for sequence <- 1..20 do
-      assert :ok =
-               SmolNet.sendto(udp_client4, <<sequence::16>>, endpoint4(@server4, port), @wait_3s)
+    for burst <- Enum.chunk_every(1..20, @udp_ring_packets) do
+      for sequence <- burst do
+        assert :ok =
+                 SmolNet.sendto(
+                   udp_client4,
+                   <<sequence::16>>,
+                   endpoint4(@server4, port),
+                   @wait_3s
+                 )
 
-      assert :ok =
-               SmolNet.sendto(udp_client6, <<sequence::16>>, endpoint6(@server6, port), @wait_3s)
+        assert :ok =
+                 SmolNet.sendto(
+                   udp_client6,
+                   <<sequence::16>>,
+                   endpoint6(@server6, port),
+                   @wait_3s
+                 )
+      end
+
+      await_datagrams(:inet, length(burst))
+      await_datagrams(:inet6, length(burst))
     end
 
     assert :ok = Task.await(tcp_send4, @wait_4s)
@@ -701,11 +733,19 @@ defmodule SmolNet.IPv4UdpTest do
     end
   end
 
-  defp receive_datagrams(_socket, 0, sequences), do: sequences
+  defp receive_datagrams(_socket, 0, sequences, _progress), do: sequences
 
-  defp receive_datagrams(socket, remaining, sequences) do
+  defp receive_datagrams(socket, remaining, sequences, {parent, tag} = progress) do
     {:ok, %{data: <<sequence::16>>, truncated: false}} = SmolNet.recvfrom(socket, 0, @wait_3s)
-    receive_datagrams(socket, remaining - 1, [sequence | sequences])
+    send(parent, {:udp_datagram, tag})
+    receive_datagrams(socket, remaining - 1, [sequence | sequences], progress)
+  end
+
+  defp await_datagrams(_tag, 0), do: :ok
+
+  defp await_datagrams(tag, remaining) do
+    assert_receive {:udp_datagram, ^tag}, @wait_3s
+    await_datagrams(tag, remaining - 1)
   end
 
   defp receive_active(_socket, 0, packets), do: packets
@@ -800,6 +840,13 @@ defmodule SmolNet.IPv4UdpTest do
       <<sequence::16, _padding::binary>> = payload
       sequence
     end)
+  end
+
+  # The stack has taken in `packets` packets and none waits in its device
+  # queue, so each has reached the socket it was addressed to.
+  defp ingested?(stack, packets) do
+    {:ok, info} = SmolNet.stack_info(stack)
+    info.processed_ingress >= packets and info.native.result.receive_packets == 0
   end
 
   defp call_queued?(stack, caller) do
