@@ -153,6 +153,9 @@ plan() {
       run tls-internet tls 1m '' both
       # The whole matrix, which ends on its own in a few minutes.
       run pmtu pmtu 15m '' both
+      # Long enough for a reboot's path to return and be detected.
+      run idle idle 3m '' both --quiet 30s --idle-max 1m --trickle-max 10s \
+        --outage-max 20s --nat-timeout 20s
       ;;
     *) die "no runs are planned for the event '${EVENT_NAME:-}'" ;;
   esac
@@ -173,6 +176,9 @@ scheduled() {
       run smoke-1h smoke 1h '' both
       run tls-local-4h tls 4h '' both --target local
       run tls-internet-4h tls 4h '' both --round-pause 300000
+      # Idles of seconds to hours, and NAT timeouts of half an hour.
+      run idle-4h idle 4h '' both --quiet 5m --idle-max 2h --outage-max 10m \
+        --nat-timeout 30m
       ;;
     *) die "no runs are planned for the schedule '${SCHEDULE:-}'" ;;
   esac

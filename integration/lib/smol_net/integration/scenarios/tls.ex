@@ -311,7 +311,7 @@ defmodule SmolNet.Integration.Scenarios.Tls do
   # The local target
 
   defp local(context, settings) do
-    {server_tls, client_tls} = local_tls_options()
+    %{server: server_tls, client: client_tls} = Tls.local_options()
 
     servers =
       for family <- context.families, role <- [:peer, :subject] do
@@ -355,26 +355,6 @@ defmodule SmolNet.Integration.Scenarios.Tls do
 
       phase(context, family, round, kind, client, target, :local)
     end
-  end
-
-  defp local_tls_options do
-    key = [key: {:namedCurve, :secp256r1}, digest: :sha256]
-    chain = %{root: key, intermediates: [], peer: key}
-
-    %{server_config: server, client_config: client} =
-      :public_key.pkix_test_data(%{server_chain: chain, client_chain: chain})
-
-    server_tls = [cert: server[:cert], key: server[:key], active: false, mode: :binary]
-
-    client_tls = [
-      verify: :verify_peer,
-      cacerts: client[:cacerts],
-      server_name_indication: :disable,
-      active: false,
-      mode: :binary
-    ]
-
-    {server_tls, client_tls}
   end
 
   # A server listens with `:ssl.listen/2` and accepts with

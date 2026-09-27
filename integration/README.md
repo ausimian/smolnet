@@ -13,6 +13,7 @@ script takes.
 sudo integration/setup.sh              # tun0, addresses and NAT; --no-nat for none
 sudo mix run integration/smoke.exs --duration 30s
 sudo mix run integration/tls.exs --duration 10m --target local
+sudo mix run integration/idle.exs --duration 1h --idle-max 30m
 sudo integration/teardown.sh
 ```
 
@@ -30,6 +31,34 @@ It reports each case as `adapts`, `stalls` or `fails`, next to what is
 expected of it, and keeps its captures in `captures/`; see
 `SmolNet.Integration.Scenarios.Pmtu` and the path MTU guide,
 `path_mtu.md`, for what the outcomes mean.
+
+The idle scenario, `idle.exs`, holds up to 240 TCP and TLS connections
+for the whole run. Some idle for seconds to hours, some trickle single
+bytes, some burst, and some stall on a closed window. A share lose their
+peer silently, through nftables (see `SmolNet.Integration.Scenarios.Idle`).
+The connections' peers are on the host, so it needs setup.sh's device but
+not its NAT. It also runs without sudo in a user namespace of its own,
+where a tmpfs on `/run` holds setup.sh's state:
+
+```console
+PATH=/usr/sbin:/sbin:$PATH unshare -rnm sh -c 'mount -t tmpfs tmpfs /run &&
+  integration/setup.sh --no-nat && mix run integration/idle.exs --duration 30m'
+```
+
+The detection times in its notes are measurements, not verdicts. The
+first runs, of 200 connections for 30 min with 40 peers vanishing,
+found:
+
+| a peer that vanished | SmolNet | Linux (`--baseline`) |
+| --- | --- | --- |
+| with nothing outstanding (`silent`) | never noticed | never noticed, without keepalive |
+| with data unacknowledged (`unacked`, `nat`) | never noticed: it retransmits forever, 60 s apart (#132) | `ETIMEDOUT` after about 940 s |
+| while its zero window was being probed (`zero_window`) | never noticed (#132) | not within 970 s |
+| and came back as a host that answers with a RST (`reboot`) | 2 to 53 s after the path returned | 1 to 15 s after |
+
+SmolNet does not accept `keepalive` (#133). While all 200 connections
+were idle, the stack did not poll once in 120 s, and the VM used 0.24% of
+a core.
 
 Each script's `--help` lists its options. `--self-check` runs a scenario
 over the TUN helper's loopback with no device and no root, and `--baseline`
@@ -59,9 +88,9 @@ which is not a failure. IPv6 over the device, to the host, works.
 | trigger | runs | files issues |
 | --- | --- | --- |
 | nightly, 03:17 UTC | 10 min each of `smoke`, `tls --target local` and `tls` to speed.cloudflare.com | yes |
-| weekly, Sunday 04:43 UTC | 1 h of `smoke`; 4 h each of `tls --target local` and `tls` to the internet, 5 min between rounds | yes |
+| weekly, Sunday 04:43 UTC | 1 h of `smoke`; 4 h each of `tls --target local`, `tls` to the internet (5 min between rounds) and `idle` (idles of up to 2 h) | yes |
 | `workflow_dispatch` | one run from the inputs below | no |
-| pull request changing `integration/**` or the workflow | 1 to 2 min each of `smoke`, `smoke` under netem `delay`, `tls --target local` and `tls` to the internet, and the whole `pmtu` matrix | no |
+| pull request changing `integration/**` or the workflow | 1 to 2 min each of `smoke`, `smoke` under netem `delay`, `tls --target local` and `tls` to the internet, the whole `pmtu` matrix, and 3 min of `idle` | no |
 
 `integration/ci/plan.sh` holds the schedule, and `integration/ci/run.sh`
 runs a `pmtu` run under `pmtu-topology.sh isolate`, so that its routers
@@ -83,7 +112,7 @@ gh workflow run integration.yml --repo ausimian/smolnet --ref <branch> \
 
 | input | values | default |
 | --- | --- | --- |
-| `scenario` | `tls`, `smoke`, `pmtu`: runs `integration/<scenario>.exs` | `tls` |
+| `scenario` | `tls`, `smoke`, `pmtu`, `idle`: runs `integration/<scenario>.exs` | `tls` |
 | `duration` | `90s`, `10m`, `1h30m`: at most `5h` | `10m` |
 | `netem` | `none` or a profile of `SmolNet.Integration.Soak.Netem` | `none` |
 | `family` | `both`, `inet`, `inet6` | `both` |
