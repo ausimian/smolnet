@@ -505,10 +505,10 @@ impl NativeStack {
 
         let now = Instant::ZERO;
         let deadline = now + Duration::from_millis(tcp_support::CLOSE_TIMEOUT_MILLIS);
-        // The default buffers, or the largest that `count` sockets fit under
-        // the stack's buffer cap, so a full stack can be prepared.
-        let buffer =
-            (MAX_SOCKET_BUFFER_BYTES / (2 * count.max(1))).min(tcp_support::DEFAULT_BUFFER_BYTES);
+        // The 64 KiB each way these sockets had while that was the default:
+        // 512 sockets at today's default would not fit under the stack's
+        // buffer cap, and the budget evidence stays comparable.
+        let buffer = 64 * 1024;
 
         for _index in 0..count {
             self.ensure_logical_socket_capacity()?;
