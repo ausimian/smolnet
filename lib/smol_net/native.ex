@@ -1,7 +1,7 @@
 defmodule SmolNet.Native do
   @moduledoc false
 
-  @tcp_default_buffer_bytes 65_536
+  @tcp_default_buffer_bytes 262_144
 
   version = Mix.Project.config()[:version]
   source_build? = File.dir?(Path.expand("../../native/smolnet_nif", __DIR__))

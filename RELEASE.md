@@ -45,6 +45,15 @@
   of a transfer. The timeout computed from measured round trips still
   applies above the floor, and the first one, before any round trip is
   measured, is still 1 s.
+- TCP receive and send buffers (`rcvbuf`/`sndbuf`, and `:gen_tcp`'s
+  `recbuf`/`sndbuf`) now default to 256 KiB each instead of 64 KiB. At
+  64 KiB, a stream over a 100 ms round trip could not exceed about 5 Mbit/s,
+  whatever the path; 256 KiB allows about 20 Mbit/s. They still do not tune
+  themselves. Each TCP socket therefore holds 512 KiB by default, 64
+  sockets about 32 MiB, and the per-stack 128 MiB buffer cap now fits 256
+  TCP sockets at the default sizes: a stack with a raised socket limit that
+  opens more than that gets `{:error, :system_limit}` unless it asks for
+  smaller buffers. `:gen_tcp`'s `buffer` still defaults to 64 KiB.
 
 ### Fixed
 

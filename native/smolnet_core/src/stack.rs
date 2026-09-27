@@ -505,12 +505,16 @@ impl NativeStack {
 
         let now = Instant::ZERO;
         let deadline = now + Duration::from_millis(tcp_support::CLOSE_TIMEOUT_MILLIS);
+        // The default buffers, or the largest that `count` sockets fit under
+        // the stack's buffer cap, so a full stack can be prepared.
+        let buffer =
+            (MAX_SOCKET_BUFFER_BYTES / (2 * count.max(1))).min(tcp_support::DEFAULT_BUFFER_BYTES);
 
         for _index in 0..count {
             self.ensure_logical_socket_capacity()?;
             self.ensure_native_socket_capacity(1, 0)?;
-            self.ensure_socket_buffer_capacity(2 * tcp_support::DEFAULT_BUFFER_BYTES)?;
-            let handle = self.sockets.add(tcp_support::default_socket());
+            self.ensure_socket_buffer_capacity(2 * buffer)?;
+            let handle = self.sockets.add(tcp_support::socket(buffer, buffer)?);
             let identity = match self.socket_table.insert(SocketKind::Tcp, 0) {
                 Ok(identity) => identity,
                 Err(error) => {
@@ -518,13 +522,7 @@ impl NativeStack {
                     return Err(error);
                 }
             };
-            let mut record = TcpRecord::new(
-                identity,
-                handle,
-                AddressFamily::Inet6,
-                tcp_support::DEFAULT_BUFFER_BYTES,
-                tcp_support::DEFAULT_BUFFER_BYTES,
-            );
+            let mut record = TcpRecord::new(identity, handle, AddressFamily::Inet6, buffer, buffer);
             record.phase = ConnectPhase::Connected;
             record.close_deadline = Some(deadline);
             self.tcp_records.insert(identity.id, record);

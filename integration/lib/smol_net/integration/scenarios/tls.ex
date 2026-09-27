@@ -18,8 +18,9 @@ defmodule SmolNet.Integration.Scenarios.Tls do
   duration, and then the stack's sockets must all be released.
 
   SmolNet's sockets get `--socket-buffer` receive and send buffers, 256 KiB
-  by default, so that its windows exceed 64 KiB and need window scaling; at
-  SmolNet's default of 64 KiB, a 100 ms path caps a stream near 5 Mbit/s.
+  by default, the same as SmolNet's own default, so that its windows exceed
+  64 KiB and need window scaling; at 64 KiB, a 100 ms path caps a stream
+  near 5 Mbit/s.
   The kernel's buffers tune themselves.
 
   `--target internet`, the default, transfers to `speed.cloudflare.com`,
@@ -96,7 +97,7 @@ defmodule SmolNet.Integration.Scenarios.Tls do
         --round-pause MS      the pause between rounds (default 60000)
         --transfer-timeout MS each transfer's deadline, handshake included (default 120000)
         --socket-buffer N     SmolNet's receive and send buffers, in bytes, 1024 to 1048576,
-                              or 0 for its default of 65536 (default 262144)
+                              or 0 for its default of 262144 (default 262144)
         --no-compare          do not repeat each phase over the kernel's stack
 
       --concurrency sets the streams of the multi-stream phases (default 4).

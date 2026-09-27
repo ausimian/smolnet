@@ -27,7 +27,7 @@ defmodule SmolNet.Stack do
   # the guard grows with the stack's socket limit.
   @shutdown_continuation_limit 1_024
   @shutdown_continuations_per_socket 16
-  @tcp_default_buffer_bytes 65_536
+  @tcp_default_buffer_bytes 262_144
   @tcp_min_buffer_bytes 1_024
   @tcp_max_buffer_bytes 1_048_576
   @max_egress_credit 0xFFFF_FFFF

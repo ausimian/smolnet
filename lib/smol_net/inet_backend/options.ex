@@ -4,6 +4,7 @@ defmodule SmolNet.InetBackend.Options do
   alias SmolNet.Stack.Ref
 
   @default_buffer 65_536
+  @default_tcp_buffer 262_144
   @min_tcp_buffer 1_024
   @max_buffer 1_048_576
   @max_timeout 4_294_967_295
@@ -18,8 +19,8 @@ defmodule SmolNet.InetBackend.Options do
             packet: :raw,
             packet_size: @default_buffer,
             buffer: @default_buffer,
-            recbuf: @default_buffer,
-            sndbuf: @default_buffer,
+            recbuf: @default_tcp_buffer,
+            sndbuf: @default_tcp_buffer,
             send_timeout: :infinity,
             send_timeout_close: false,
             bind_address: nil,

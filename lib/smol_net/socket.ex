@@ -16,7 +16,7 @@ defmodule SmolNet.Socket do
   @max_immediate_retries 16
   @max_timeout 4_294_967_295
   @max_backlog 128
-  @default_tcp_buffer_bytes 65_536
+  @default_tcp_buffer_bytes 262_144
   @min_tcp_buffer_bytes 1_024
   @max_tcp_buffer_bytes 1_048_576
 

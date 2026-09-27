@@ -100,3 +100,10 @@ Several per-call smoltcp operations, such as egress polling and ingress socket
 lookup, visit every socket in the stack. They stay under the call deadline at
 512 sockets, but a stack with many sockets does more work per call than one
 with few.
+
+## Later changes
+
+- #103 raised the default TCP buffers to 256 KiB each way, and left the
+  128 MiB cap alone. At the default sizes a stack now holds about 32 MiB for
+  64 TCP sockets, and at most 256 TCP sockets fit under the cap; 512 need
+  buffers averaging at most 128 KiB each way.
