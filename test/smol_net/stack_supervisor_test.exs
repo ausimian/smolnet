@@ -7,6 +7,8 @@ defmodule SmolNet.StackSupervisorTest do
   alias SmolNet.Test.FixtureAdapter
   alias SmolNet.Test.NativeDouble
 
+  import SmolNet.Test.Monitoring, only: [monitor_in_place: 1]
+
   setup do
     previous_native = Application.get_env(:smolnet, :native_module)
     previous_process = Application.get_env(:smolnet, :native_test_process)
@@ -134,8 +136,8 @@ defmodule SmolNet.StackSupervisorTest do
     pids = Ref.pids(ref)
     {:ok, adapter} = start_adapter(ref, pids.stack)
     assert_receive {:adapter_initialized, ^adapter}
-    adapter_monitor = Process.monitor(adapter)
-    bundle_monitor = Process.monitor(pids.bundle)
+    adapter_monitor = monitor_in_place(adapter)
+    bundle_monitor = monitor_in_place(pids.bundle)
 
     Process.exit(pids.stack, :kill)
 

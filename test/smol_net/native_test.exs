@@ -8,15 +8,13 @@ defmodule SmolNet.NativeTest do
   alias SmolNet.Stack.Ref
   alias SmolNet.Test.Timing
 
+  import SmolNet.Test.NativeBudget, only: [without_deadline: 1]
+
   @wait_1s Timing.liveness(1_000)
 
   # Fresh pairs of calls the reduction-slice comparison may measure before
   # concluding that the host will not leave one pair undisturbed.
   @slice_samples 20
-
-  # Forced budget checkpoints enough for any one call here to end on its own
-  # work limits, never on the wall clock. See `without_deadline/1`.
-  @no_deadline_checkpoints 1_000_000
 
   setup do
     on_exit(fn -> stop_all_stacks() end)
@@ -758,17 +756,6 @@ defmodule SmolNet.NativeTest do
 
       %{identity: identity, direction: :read}
     end)
-  end
-
-  # Lifts the wall-clock deadline from the resource's next call. A preempted
-  # runner can spend the whole work budget before the call does the work a
-  # test expects of it in one call, and the call then returns `more: true`
-  # with that work retained for a continuation.
-  defp without_deadline(resource) do
-    assert {:ok, %{result: :ok}} =
-             Native.test_set_budget_checkpoints(resource, @no_deadline_checkpoints)
-
-    resource
   end
 
   defp sample_slices(attempt \\ 1) do
