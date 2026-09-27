@@ -55,6 +55,16 @@ done <"$state"
 # What is already gone needs no undoing.
 while read -r key value; do
   case $key in
+    xt_rule)
+      # shellcheck disable=SC2086 # the recorded rule is its words
+      set -- $value
+      command=$1
+      chain=$2
+      shift 2
+      if "$command" -w -C "$chain" "$@" 2>/dev/null; then
+        restore "$command" -w -D "$chain" "$@"
+      fi
+      ;;
     nft_table)
       if nft list table inet "$value" >/dev/null 2>&1; then
         restore nft delete table inet "$value"
