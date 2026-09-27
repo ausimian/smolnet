@@ -27,3 +27,14 @@
   body's length and SHA-256 is checked, any TLS alert fails the run, and
   throughput is reported next to the kernel's on the same path, in the notes
   and as a result in `verdict.json`.
+
+### Fixed
+
+- A TCP write longer than one segment no longer holds its last, partial
+  segment back until the peer acknowledges the earlier ones. Nagle's
+  algorithm now holds a partial segment only while another partial segment
+  is unacknowledged, as Linux does, instead of while any data is. The old
+  rule cost such a write a round trip plus the peer's delayed ACK, and did so
+  on every TLS 1.3 handshake whose server asks for a post-quantum key share,
+  as `speed.cloudflare.com` does: `:ssl`'s second ClientHello is longer than
+  a segment. Those handshakes now take as long as over the kernel's stack.
