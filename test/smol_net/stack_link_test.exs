@@ -8,6 +8,7 @@ defmodule SmolNet.StackLinkTest do
   alias SmolNet.Test.NativeDouble
 
   import SmolNet.Test.Monitoring, only: [monitor_in_place: 1]
+  import SmolNet.Test.NativeBudget, only: [without_deadline: 1]
 
   @address_a {0xFD00, 0, 0, 0, 0, 0, 0, 1}
   @address_b {0xFD00, 0, 0, 0, 0, 0, 0, 2}
@@ -110,6 +111,7 @@ defmodule SmolNet.StackLinkTest do
     end
   end
 
+  @tag :debug_nif
   test "accepts a bounded ingress batch and drives every packet in one native call" do
     {:ok, stack} =
       SmolNet.start_stack(
@@ -122,19 +124,20 @@ defmodule SmolNet.StackLinkTest do
 
     first = echo_request(@address_b, @address_a, "first")
     second = echo_request(@address_b, @address_a, "second")
-    assert {:ok, 2} = SmolNet.ingress(stack, [first, second])
+    assert {:ok, 2} = ingress_without_deadline(stack, [first, second])
 
     assert_receive {:smol_stack, :ingress_batch, :egress, responses}
     assert length(responses) == 2
     assert Enum.map(responses, &binary_part(&1, 48, byte_size(&1) - 48)) == ["first", "second"]
     refute_receive {:smol_stack, :ingress_batch, :egress, _duplicate}, 50
 
+    # One native call for the batch, besides the one that lifted its deadline.
     assert_eventually(fn ->
       {:ok, info} = SmolNet.stack_info(stack)
 
       info.processed_ingress == 2 and info.native.result.counters.ingress_packets == 2 and
         info.native.result.counters.max_input_packets == 2 and
-        info.native.result.counters.native_calls == 1
+        info.native.result.counters.native_calls == 2
     end)
   end
 
@@ -205,6 +208,7 @@ defmodule SmolNet.StackLinkTest do
     assert info.ingress.rejected == 5
   end
 
+  @tag :debug_nif
   test "a full-budget ingress emits its reply in the same native call" do
     {:ok, stack} =
       SmolNet.start_stack(
@@ -216,8 +220,8 @@ defmodule SmolNet.StackLinkTest do
 
     packet = echo_request(@address_b, @address_a, :binary.copy(<<1>>, 1_232))
     assert byte_size(packet) == 1_280
-    assert :ok = SmolNet.ingress(stack, packet)
-    assert :ok = SmolNet.ingress(stack, packet)
+    assert :ok = ingress_without_deadline(stack, packet)
+    assert :ok = ingress_without_deadline(stack, packet)
 
     assert_receive {:smol_stack, :full_budget, :egress, [first_response]}
     assert_receive {:smol_stack, :full_budget, :egress, [second_response]}
@@ -226,13 +230,15 @@ defmodule SmolNet.StackLinkTest do
 
     # Input and output each have a whole bytes_copied budget, so each reply
     # left in its ingress call rather than a continuation poll, and the
-    # counter reports the larger direction rather than their sum.
+    # counter reports the larger direction rather than their sum. The two
+    # ingress calls are the only native calls besides the two that lifted
+    # their deadlines.
     assert_eventually(fn ->
       {:ok, info} = SmolNet.stack_info(stack)
       counters = info.native.result.counters
 
       counters.max_bytes_copied == 1_280 and counters.poll_calls == 0 and
-        counters.native_calls == 2 and info.processed_ingress == 2 and
+        counters.native_calls == 4 and info.processed_ingress == 2 and
         info.failed_ingress == 0
     end)
   end
@@ -833,6 +839,22 @@ defmodule SmolNet.StackLinkTest do
              {:error, :invalid_link_down_policy}
 
     assert SmolNet.start_stack(unknown: true) == {:error, :invalid_options}
+  end
+
+  # Ingresses `input` with the wall-clock deadline lifted from the native call
+  # that processes it, for a test that counts native calls: a preempted
+  # runner could otherwise yield before the call's work is done and leave the
+  # rest to a continuation poll (#113). Lifting the deadline is itself a
+  # native call. Returns once the ingress call has run: the stack
+  # acknowledges an ingress before its native call, which it makes in
+  # `handle_continue/2`, so the next call to the stack waits for it.
+  defp ingress_without_deadline(stack, input) do
+    %{stack: stack_pid} = Ref.pids(stack)
+    %{native: native} = :sys.get_state(stack_pid)
+    without_deadline(native)
+    result = SmolNet.ingress(stack, input)
+    _state = :sys.get_state(stack_pid)
+    result
   end
 
   defp configure_native_double(ingress_result, options \\ []) do
