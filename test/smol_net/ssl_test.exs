@@ -257,8 +257,8 @@ defmodule SmolNet.SslTest do
     end
 
     test "a term that is not a SmolNet socket is rejected" do
-      assert_raise ArgumentError, fn -> SmolNet.Inet6.Tcp.monitor(:not_a_socket) end
-      assert_raise ArgumentError, fn -> SmolNet.Inet6.Tcp.cancel_monitor(:not_a_ref) end
+      assert_raise ArgumentError, fn -> SmolNet.Inet6.Tcp.monitor(opaque(:not_a_socket)) end
+      assert_raise ArgumentError, fn -> SmolNet.Inet6.Tcp.cancel_monitor(opaque(:not_a_ref)) end
       refute SmolNet.Inet6.Tcp.cancel_monitor(make_ref())
     end
   end
@@ -316,6 +316,10 @@ defmodule SmolNet.SslTest do
       @wait_30s -> {:error, :timeout}
     end
   end
+
+  # Hides `term`'s type from the compiler, which would otherwise reject a
+  # call the test makes on purpose with the wrong type.
+  defp opaque(term), do: Process.get({__MODULE__, :opaque}, term)
 
   defp accept_for(listener, owner) do
     with {:ok, socket} <- :gen_tcp.accept(listener, @wait_30s),
