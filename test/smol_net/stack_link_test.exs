@@ -7,6 +7,8 @@ defmodule SmolNet.StackLinkTest do
   alias SmolNet.Test.ManualClock
   alias SmolNet.Test.NativeDouble
 
+  import SmolNet.Test.Monitoring, only: [monitor_in_place: 1]
+
   @address_a {0xFD00, 0, 0, 0, 0, 0, 0, 1}
   @address_b {0xFD00, 0, 0, 0, 0, 0, 0, 2}
   @ipv4_a {192, 0, 2, 1}
@@ -742,7 +744,7 @@ defmodule SmolNet.StackLinkTest do
     link = idle_process()
     {:ok, stack} = SmolNet.start_stack(egress: {link, :stop}, link_down: :stop)
     %{bundle: bundle} = Ref.pids(stack)
-    monitor = Process.monitor(bundle)
+    monitor = monitor_in_place(bundle)
 
     Process.exit(link, :kill)
 
