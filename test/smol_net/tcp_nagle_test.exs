@@ -71,7 +71,9 @@ defmodule SmolNet.TcpNagleTest do
   end
 
   defp tcp_data(<<4::4, ihl::4, _tos, total::16, _rest::binary>> = packet) do
-    <<_ip::binary-size(ihl * 4), tcp::binary-size(total - ihl * 4), _padding::binary>> = packet
+    header_bytes = ihl * 4
+    tcp_bytes = total - header_bytes
+    <<_ip::binary-size(^header_bytes), tcp::binary-size(^tcp_bytes), _padding::binary>> = packet
     <<_ports::32, sequence::32, _ack::32, offset::4, _bits::12, _tail::binary>> = tcp
 
     case binary_part(tcp, offset * 4, byte_size(tcp) - offset * 4) do
