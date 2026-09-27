@@ -81,12 +81,13 @@ defmodule SmolNet do
   first sustains about `sockets / 10` new connections per second. An open
   beyond the limit returns `{:error, :system_limit}`. Each slot holds its
   buffers from open until the slot is freed: a TCP socket's receive and send
-  buffers (64 KiB each by default, up to 1 MiB each) and 32 KiB for a UDP
-  socket. At the default buffer sizes, 64 TCP sockets hold about 8 MiB and
-  512 hold about 64 MiB. Whatever the limit, a stack's socket buffers total at
-  most 128 MiB, what 64 TCP sockets with the largest buffers hold; an open
-  that would pass that also returns `{:error, :system_limit}`, so 512
-  sockets need buffers averaging at most 256 KiB. `stack_info/1` reports the
+  buffers (256 KiB each by default, up to 1 MiB each) and 32 KiB for a UDP
+  socket. At the default buffer sizes, 64 TCP sockets hold about 32 MiB.
+  Whatever the limit, a stack's socket buffers total at most 128 MiB, what
+  64 TCP sockets with the largest buffers hold; an open that would pass that
+  also returns `{:error, :system_limit}`. So at the default sizes a stack
+  holds at most 256 TCP sockets, and 512 need buffers averaging at most
+  128 KiB each way. `stack_info/1` reports the
   slots in use as `native.result.native_socket_count`, the limit as
   `native.result.native_socket_capacity`, the closed TCP sockets still
   holding one as `native.result.closing_tcp_socket_count`, and buffer bytes
@@ -196,7 +197,7 @@ defmodule SmolNet do
 
   Family and kind are explicit and immutable. TCP and UDP support both IPv4
   and IPv6. TCP accepts socket-style `:rcvbuf` and `:sndbuf` options from
-  1 KiB through 1 MiB; both default to 64 KiB and remain fixed after open.
+  1 KiB through 1 MiB; both default to 256 KiB and remain fixed after open.
   """
   @spec open(:inet6 | :inet, :stream | :dgram, :tcp | :udp, keyword()) ::
           {:ok, Socket.t()} | {:error, atom()}

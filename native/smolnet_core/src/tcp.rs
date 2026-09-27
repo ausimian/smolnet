@@ -9,7 +9,7 @@ use smoltcp::wire::{IpAddress, IpEndpoint, IpListenEndpoint, Ipv4Address, Ipv6Ad
 use crate::socket_table::SocketError;
 use crate::waiter::SocketIdentity;
 
-pub const DEFAULT_BUFFER_BYTES: usize = 64 * 1024;
+pub const DEFAULT_BUFFER_BYTES: usize = 256 * 1024;
 pub const MIN_BUFFER_BYTES: usize = 1024;
 pub const MAX_BUFFER_BYTES: usize = 1024 * 1024;
 pub const CONNECT_TIMEOUT_MILLIS: u64 = 30_000;
@@ -319,6 +319,7 @@ pub fn socket(rcvbuf: usize, sndbuf: usize) -> Result<tcp::Socket<'static>, Sock
     ))
 }
 
+#[cfg(feature = "fuzzing")]
 pub fn default_socket() -> tcp::Socket<'static> {
     socket(DEFAULT_BUFFER_BYTES, DEFAULT_BUFFER_BYTES)
         .expect("the TCP default buffer size is within the validated range")

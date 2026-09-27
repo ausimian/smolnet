@@ -277,12 +277,12 @@ defmodule SmolNet.TcpConnectTest do
     assert {:ok, info} = SmolNet.stack_info(stack)
 
     assert %{
-             default_rcvbuf: 65_536,
-             default_sndbuf: 65_536,
+             default_rcvbuf: 262_144,
+             default_sndbuf: 262_144,
              sockets: socket_buffers
            } = info.native.result.tcp_buffer_bytes
 
-    assert %{id: default.id, generation: default.generation, rcvbuf: 65_536, sndbuf: 65_536} in socket_buffers
+    assert %{id: default.id, generation: default.generation, rcvbuf: 262_144, sndbuf: 262_144} in socket_buffers
 
     assert %{
              id: configured.id,
@@ -389,13 +389,13 @@ defmodule SmolNet.TcpConnectTest do
     assert blocked_info.native.result.waiter_count == 32
 
     assert %{
-             default_rcvbuf: 65_536,
-             default_sndbuf: 65_536,
+             default_rcvbuf: 262_144,
+             default_sndbuf: 262_144,
              sockets: blocked_buffers
            } = blocked_info.native.result.tcp_buffer_bytes
 
     assert length(blocked_buffers) == 32
-    assert Enum.all?(blocked_buffers, &match?(%{rcvbuf: 65_536, sndbuf: 65_536}, &1))
+    assert Enum.all?(blocked_buffers, &match?(%{rcvbuf: 262_144, sndbuf: 262_144}, &1))
 
     {active_stack, _active_peer} = start_peer_stack(:accept)
     {:ok, active} = SmolNet.open(:inet6, :stream, :tcp, stack: active_stack)

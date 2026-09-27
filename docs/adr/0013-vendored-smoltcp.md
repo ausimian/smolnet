@@ -56,9 +56,12 @@ The patch, in `src/socket/tcp.rs`, implements RFC 6582's partial-ACK rule:
 - Duplicate ACKs during recovery do not start another fast retransmission, and
   a retransmission timeout abandons recovery in favour of its go-back-N resend.
 
-SmolNet enables no smoltcp congestion controller, so the RFC's congestion
-window inflation and deflation rules would have no effect and are left out.
-The 1 s minimum RTO is unchanged.
+SmolNet enabled no smoltcp congestion controller when this was written, so
+the RFC's congestion window inflation and deflation rules would have had no
+effect and were left out. It has since enabled CUBIC (see "Later
+configuration"), whose own recovery rules now apply alongside the patch.
+The patch left the 1 s minimum RTO unchanged; #103 later lowered it to
+200 ms (see "Later patches").
 
 ## Verification
 
@@ -80,7 +83,7 @@ time, so a slow runner does not change its outcome.
 A multi-segment loss within one window is now repaired at one segment per
 round trip instead of costing a 1 s timeout per burst. Losses that leave no
 later segment to produce duplicate ACKs, such as the tail of a transfer, still
-wait for the 1 s minimum RTO. Many holes in one window over a long RTT still
+wait for the minimum RTO, 1 s when this was written and 200 ms since #103. Many holes in one window over a long RTT still
 recover more slowly than SACK-based recovery would, since smoltcp's sender
 does not use SACK.
 
@@ -121,3 +124,46 @@ Hex packages are unaffected: they ship only precompiled NIFs and omit
   one. Without SACK, the window rule still applies. Two unit tests cover
   duplicates with a growing window and a window update that repeats an
   earlier SACK block.
+- #103: the minimum RTO is 200 ms, Linux's `TCP_RTO_MIN`, instead of the
+  1 s that RFC 6298 (2.4) says it SHOULD be. This departs from the RFC on
+  purpose. The 1 s floor dates from coarse timers and long, variable round
+  trips; on the tens-of-milliseconds paths SmolNet mostly runs over, it
+  costs a whole second for every loss that fast retransmit cannot repair,
+  such as a lost retransmission or the last segments of a transfer, and the
+  backoff doubles from there. Under netem's Gilbert-Elliott burst loss it
+  was most of SmolNet's shortfall against Linux. The RTO computed from
+  SRTT and RTTVAR still applies above the floor, the initial RTO before any
+  sample is still 1 s, and a timeout still doubles it. A spurious timeout
+  costs a go-back-N resend and, with CUBIC, a window of one segment; Linux
+  runs with the same floor. `test_rtt_estimator_min_rto` covers the floor
+  and the backoff from it.
+- #123: upstream's CUBIC started every connection from 2,048 bytes, two
+  segments of its 1,024-byte default MSS, and `set_mss` never scaled it: a
+  1,460-byte path started from 1.4 segments, a jumbo one from less than
+  one. A short transfer over a round trip of tens of milliseconds finished
+  in slow start, and a 1 MiB TLS upload to speed.cloudflare.com ran at
+  0.4 times the kernel's speed, against 0.97 with no controller. `set_mss`
+  now sets the RFC 6928 initial window, `min(10 * MSS, max(2 * MSS,
+  14600))`, as Linux does, unless the connection has already had a loss or
+  a timeout: a retransmitted SYN leaves the loss window, as RFC 6928 (2)
+  requires. Reno has its own `set_mss` and is not enabled, so it keeps the
+  upstream start. `mix precommit` now runs the library tests with
+  `socket-tcp-cubic` enabled, so that CUBIC's own tests run: two new ones
+  cover the window for three MSS values and the no-raise cases.
+
+## Later configuration
+
+Changes to which of the vendored crate's features SmolNet enables, rather
+than to its code:
+
+- #103: `socket-tcp-cubic` is enabled, so every TCP socket runs CUBIC
+  congestion control (RFC 9438), as Linux does by default. Before, no
+  controller ran: a sender put its whole send buffer into the network each
+  round trip, however narrow the path. Through a 20 Mbit/s bottleneck with a
+  50-packet queue, that lost about half of every window, and SmolNet sent
+  at 1.5 Mbit/s against the kernel's 19. Upstream's CUBIC started from two
+  segments, far below Linux's ten, which #123 then patched (see "Later
+  patches"). smoltcp's CUBIC ends its fast recovery
+  on the first ACK of new data, a partial ACK included, and deflates the
+  window to `ssthresh` there, while the patch's `recover` keeps
+  retransmitting the remaining holes.

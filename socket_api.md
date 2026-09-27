@@ -145,7 +145,7 @@ peer = %{family: :inet6, addr: remote, port: 443}
 :ok = SmolNet.close(socket)
 ```
 
-TCP receive and transmit buffers default to 64 KiB. `rcvbuf` and `sndbuf`
+TCP receive and transmit buffers default to 256 KiB. `rcvbuf` and `sndbuf`
 accept sizes from 1 KiB through 1 MiB and cannot be resized after opening.
 
 `recv(socket, 0, timeout)` returns one bounded currently available chunk. A

@@ -28,6 +28,33 @@
   throughput is reported next to the kernel's on the same path, in the notes
   and as a result in `verdict.json`.
 
+### Changed
+
+- TCP sockets now run CUBIC congestion control, as Linux's do by default.
+  Before, a SmolNet sender put its whole send buffer into the network every
+  round trip, however narrow the path, and lost much of it wherever a queue
+  was short: through a 20 Mbit/s bottleneck it sent at about 1.5 Mbit/s,
+  and with several streams less. A connection now starts from a window of
+  ten segments, 14,600 bytes on a typical path, as RFC 6928 and Linux do, and
+  grows it from there. After a lost SYN it starts from one segment.
+- The minimum TCP retransmission timeout is now 200 ms, as on Linux,
+  instead of 1 s. This deliberately departs from RFC 6298, which says the
+  minimum SHOULD be 1 s: on paths with round trips of tens of milliseconds,
+  that floor cost a whole second, doubling from there, for every loss that
+  fast retransmit could not repair, such as a lost retransmission or the end
+  of a transfer. The timeout computed from measured round trips still
+  applies above the floor, and the first one, before any round trip is
+  measured, is still 1 s.
+- TCP receive and send buffers (`rcvbuf`/`sndbuf`, and `:gen_tcp`'s
+  `recbuf`/`sndbuf`) now default to 256 KiB each instead of 64 KiB. At
+  64 KiB, a stream over a 100 ms round trip could not exceed about 5 Mbit/s,
+  whatever the path; 256 KiB allows about 20 Mbit/s. They still do not tune
+  themselves. Each TCP socket therefore holds 512 KiB by default, 64
+  sockets about 32 MiB, and the per-stack 128 MiB buffer cap now fits 256
+  TCP sockets at the default sizes: a stack with a raised socket limit that
+  opens more than that gets `{:error, :system_limit}` unless it asks for
+  smaller buffers. `:gen_tcp`'s `buffer` still defaults to 64 KiB.
+
 ### Fixed
 
 - A TCP write longer than one segment no longer holds its last, partial

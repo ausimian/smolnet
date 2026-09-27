@@ -231,6 +231,23 @@ impl Controller for Cubic {
     }
 
     fn set_mss(&mut self, mss: usize) {
+        // RFC 6928: once the MSS is known, a connection that has seen no loss
+        // or timeout, the SYN's included, starts from the larger initial
+        // window. After a timeout the window stays at the loss window.
+        if self.ssthresh == usize::MAX
+            && self.recovery_start.is_none()
+            && !self.in_fast_recovery
+            && !self.in_rto_recovery
+        {
+            let window = initial_window(mss);
+            if self.cwnd < window {
+                self.cwnd = window;
+                self.w_max = window;
+                self.w_est = window as f64;
+                self.cwnd_prior = window;
+            }
+        }
+
         self.mss = mss;
         self.recompute_k();
     }
@@ -240,6 +257,11 @@ impl Controller for Cubic {
             self.rwnd = remote_window;
         }
     }
+}
+
+/// RFC 6928 (2): the initial window, `min(10 * MSS, max(2 * MSS, 14600))`.
+fn initial_window(mss: usize) -> usize {
+    (10 * mss).min((2 * mss).max(14_600))
 }
 
 /// Efficient cube root using f64 bit tricks and Newton-Raphson.
@@ -594,6 +616,36 @@ mod test {
         let initial_cwnd = cubic.window();
         ack(&mut cubic, MSS, Instant::from_millis(time));
         assert!(cubic.window() >= initial_cwnd);
+    }
+
+    #[test]
+    fn initial_window_follows_the_mss() {
+        // RFC 6928: min(10 * MSS, max(2 * MSS, 14600)).
+        for (mss, window) in [(536, 5_360), (1_460, 14_600), (8_960, 17_920)] {
+            let mut cubic = Cubic::new();
+            cubic.set_mss(mss);
+            assert_eq!(cubic.window(), window, "MSS {mss}");
+            assert_eq!(cubic.w_max, window);
+            assert_eq!(cubic.ssthresh, usize::MAX);
+        }
+    }
+
+    #[test]
+    fn initial_window_is_not_raised_after_a_timeout() {
+        // A retransmitted SYN leaves the window at the loss window.
+        let mut cubic = Cubic::new();
+        cubic.on_rto(Instant::from_millis(0), 0);
+        let window = cubic.window();
+        cubic.set_mss(1_460);
+        assert_eq!(cubic.window(), window);
+
+        // So does a window that has grown or shrunk from use.
+        let mut cubic = Cubic::new();
+        cubic.set_mss(1_460);
+        cubic.on_loss(Instant::from_millis(0), cubic.window());
+        let window = cubic.window();
+        cubic.set_mss(1_460);
+        assert_eq!(cubic.window(), window);
     }
 
     #[test]

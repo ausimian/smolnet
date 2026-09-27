@@ -175,9 +175,14 @@ There are two layers of buffer configuration:
 - `buffer` is the adapter's Elixir-side receive buffer.
 - `recbuf` and `sndbuf` are the native TCP receive and transmit capacities.
 
-All three default to 65,536 bytes and accept values up to 1 MiB. Native
-`recbuf` and `sndbuf` have a 1 KiB minimum and are fixed when the socket is
-created; attempts to change them with `:inet.setopts/2` return `:einval`.
+`buffer` defaults to 65,536 bytes, and `recbuf` and `sndbuf` to 262,144
+bytes (256 KiB), enough for a stream to keep about 20 Mbit/s in flight over a
+100 ms round trip. All three accept values up to 1 MiB. Native `recbuf` and
+`sndbuf` have a 1 KiB minimum and are fixed when the socket is created;
+attempts to change them with `:inet.setopts/2` return `:einval`. They do not
+tune themselves as Linux's do: size them for the path, larger for a long fast
+one, or smaller to fit more sockets under a stack's buffer cap (see
+`SmolNet.start_stack/1`).
 Setting `recbuf` at creation also raises `buffer` to at least that size unless
 a later option explicitly lowers `buffer`.
 

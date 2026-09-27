@@ -17,11 +17,12 @@ defmodule SmolNet.EgressCreditTest do
     on_exit(&stop_all_stacks/0)
   end
 
-  # Eight streams can have eight send buffers of data in flight, far more than
-  # the link's buffer holds. With credit, the surplus waits in the senders'
-  # sockets instead of overrunning the link.
+  # Eight streams can have far more data in flight than the link's buffer of
+  # four packets holds: each stream's congestion window passes four segments
+  # within a few round trips of slow start. With credit, the surplus waits in
+  # the senders' sockets instead of overrunning the link.
   test "parallel TCP streams through a bounded link never overrun it" do
-    {server, client, link} = credit_stacks({16, 16 * @mtu})
+    {server, client, link} = credit_stacks({4, 4 * @mtu})
     streams = 8
     stream_bytes = 128 * 1024
 
