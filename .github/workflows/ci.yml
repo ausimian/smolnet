@@ -254,3 +254,71 @@ jobs:
           name: fuzz-crashes
           path: native/fuzz/artifacts
           if-no-files-found: ignore
+
+  # The real-network integration harness (integration/). The long scenarios
+  # are opt-in and never run here; this job keeps the harness working: its
+  # own tests, then a short smoke run through a real TUN device, which the
+  # runner's passwordless sudo makes possible.
+  integration-smoke:
+    name: integration / smoke over tun
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - uses: erlef/setup-beam@54075bcc5e249e4758d363f27d099f55d843f124 # v1
+        id: beam
+        with:
+          elixir-version: "1.19.5"
+          otp-version: "28.3"
+
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          toolchain: 1.94.0
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          workspaces: native -> target
+
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: deps
+          key: >-
+            integration-${{ runner.os }}-1.19.5-28.3-
+            ${{ hashFiles('mix.lock', 'native/Cargo.lock') }}
+
+      # See the compatibility job for why smolnet itself is excluded.
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            _build/*/lib
+            !_build/*/lib/smolnet
+            !_build/*/lib/smolnet/**
+          key: mix-build-${{ runner.os }}-${{ runner.arch }}-elixir-${{ steps.beam.outputs.elixir-version }}-otp-${{ steps.beam.outputs.otp-version }}-${{ hashFiles('mix.lock', 'mix.exs') }}
+
+      - run: mix local.hex --force
+      - run: mix local.rebar --force
+      - run: mix deps.get
+      - run: mix compile --warnings-as-errors
+      # Needs no device and no root: the pure pieces, and whole runs over the
+      # TUN helper's loopback, including a deliberately stalled operation.
+      - run: mix run integration/test.exs
+      - name: Set up the TUN device
+        run: |
+          command -v nft >/dev/null || { sudo apt-get update && sudo apt-get install -y nftables; }
+          sudo integration/setup.sh
+      # Pings SmolNet from the host and echoes TCP each way through the
+      # device, over IPv4 and IPv6. tcpdump needs root for the capture.
+      - run: >-
+          sudo -E env "PATH=$PATH" "HOME=$HOME"
+          mix run integration/smoke.exs --duration 20s --out integration/runs/smoke
+      - if: always()
+        run: sudo integration/teardown.sh
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: failure()
+        with:
+          name: integration-smoke
+          path: integration/runs
+          if-no-files-found: ignore
