@@ -60,6 +60,27 @@ SmolNet does not accept `keepalive` (#133). While all 200 connections
 were idle, the stack did not poll once in 120 s, and the VM used 0.24% of
 a core.
 
+The chaos scenario, `chaos.exs`, injects faults into a stack while it
+carries TLS transfers, connection churn and calls that block for good:
+kills of the TUN helper and of the link under each `link_down` policy,
+`SmolNet.stop_stack/1`, device and route flaps, egress credit delayed,
+trickled or withheld, and socket owners killed or swapped (see
+`SmolNet.Integration.Scenarios.Chaos`). Its flaps change the device and
+the host's routes, so it runs as `pmtu.exs` does:
+
+```console
+integration/pmtu-topology.sh isolate mix run integration/chaos.exs --duration 10m
+integration/pmtu-topology.sh isolate mix run integration/chaos.exs --seed 1234 \
+  --faults helper_kill --policies mark_down --episodes 3
+```
+
+The run logs its seed, and the same `--seed` replays the same faults at
+the same times. A failed episode writes `episodes/NN-<fault>-<policy>.txt`,
+with its plan, timeline and snapshots, and keeps its capture in
+`captures/NN/`; `--keep-going` runs every episode before failing. The
+`link_restart` result records, for #43, what a link that could be
+replaced would have saved under `:mark_down` and `:notify`.
+
 Each script's `--help` lists its options. `--self-check` runs a scenario
 over the TUN helper's loopback with no device and no root, and `--baseline`
 over the kernel's stack alone. Use `MIX_ENV=prod` for measurements: the
@@ -90,11 +111,11 @@ which is not a failure. IPv6 over the device, to the host, works.
 | nightly, 03:17 UTC | 10 min each of `smoke`, `tls --target local` and `tls` to speed.cloudflare.com | yes |
 | weekly, Sunday 04:43 UTC | 1 h of `smoke`; 4 h each of `tls --target local`, `tls` to the internet (5 min between rounds) and `idle` (idles of up to 2 h) | yes |
 | `workflow_dispatch` | one run from the inputs below | no |
-| pull request changing `integration/**` or the workflow | 1 to 2 min each of `smoke`, `smoke` under netem `delay`, `tls --target local` and `tls` to the internet, the whole `pmtu` matrix, and 3 min of `idle` | no |
+| pull request changing `integration/**` or the workflow | 1 to 2 min each of `smoke`, `smoke` under netem `delay`, `tls --target local` and `tls` to the internet, the whole `pmtu` matrix, and 3 min each of `idle` and `chaos` | no |
 
 `integration/ci/plan.sh` holds the schedule, and `integration/ci/run.sh`
-runs a `pmtu` run under `pmtu-topology.sh isolate`, so that its routers
-never touch the runner's own network. A hosted job may run 6 h,
+runs `pmtu` and `chaos` under `pmtu-topology.sh isolate`, so that their
+routers and flaps never touch the runner's own network. A hosted job may run 6 h,
 so the long soak is 4 h rather than 6 h, and a dispatched run at most 5 h.
 GitHub disables scheduled workflows after 60 days without a commit to the
 repository; re-enable it from the Actions tab.
@@ -112,7 +133,7 @@ gh workflow run integration.yml --repo ausimian/smolnet --ref <branch> \
 
 | input | values | default |
 | --- | --- | --- |
-| `scenario` | `tls`, `smoke`, `pmtu`, `idle`: runs `integration/<scenario>.exs` | `tls` |
+| `scenario` | `tls`, `smoke`, `pmtu`, `idle`, `chaos`: runs `integration/<scenario>.exs` | `tls` |
 | `duration` | `90s`, `10m`, `1h30m`: at most `5h` | `10m` |
 | `netem` | `none` or a profile of `SmolNet.Integration.Soak.Netem` | `none` |
 | `family` | `both`, `inet`, `inet6` | `both` |
