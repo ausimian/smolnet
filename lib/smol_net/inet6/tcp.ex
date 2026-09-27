@@ -9,10 +9,16 @@ defmodule SmolNet.Inet6.Tcp do
   This module is the IPv6 callback and shared socket implementation. Use
   `SmolNet.Inet.Tcp` as the callback for IPv4. File descriptors and
   packet modes other than raw, line, 1, 2, and 4 fail explicitly.
+
+  Either module can also be `:ssl`'s transport, as its `cb_info`:
+  `{SmolNet.Inet6.Tcp, :tcp, :tcp_closed, :tcp_error}`, or `SmolNet.Inet.Tcp`
+  for IPv4, with `:smolnet_stack` among the socket options. See the
+  `:gen_tcp` guide.
   """
 
   @behaviour :gen_statem
 
+  alias SmolNet.InetBackend.Monitor
   alias SmolNet.InetBackend.Options
   alias SmolNet.InetBackend.Packet
   alias SmolNet.Socket
@@ -202,6 +208,51 @@ defmodule SmolNet.Inet6.Tcp do
 
   @spec getstat(socket_term(), list()) :: {:ok, list()} | {:error, atom()}
   def getstat(socket, names), do: socket_call(socket, {:getstat, names})
+
+  @doc """
+  Returns the local port of `socket`, as `:inet.port/1` does.
+
+  `:ssl` calls this on a transport given through `cb_info`.
+  """
+  @spec port(socket_term()) :: {:ok, :inet.port_number()} | {:error, atom()}
+  def port(socket) do
+    with {:ok, {_address, port}} <- sockname(socket), do: {:ok, port}
+  end
+
+  @doc """
+  Starts a monitor of `socket` for the calling process; `:inet.monitor/1`
+  calls this for a SmolNet socket.
+
+  When the socket closes, the caller gets
+  `{:DOWN, ref, :socket, socket, :closed}`, as for an OTP `socket`-backed
+  `:gen_tcp` socket, or `{:DOWN, ref, :socket, socket, :nosock}` at once if
+  `socket` was already closed. Any process may monitor a socket, and each
+  call creates a separate monitor. See `cancel_monitor/1`.
+
+  A SmolNet socket closes when `close/1` is called, when its owner exits,
+  when a send timeout closes it (`send_timeout_close`), on a connection
+  error, or when its stack stops. A peer's FIN alone does not close it,
+  since the socket can still send.
+  """
+  @spec monitor(socket_term()) :: reference()
+  def monitor(socket) do
+    case socket_pid(socket) do
+      pid when is_pid(pid) -> Monitor.monitor(socket, pid)
+      _other -> :erlang.error(:badarg, [socket])
+    end
+  end
+
+  @doc """
+  Cancels a monitor that the calling process started with `monitor/1`;
+  `:inet.cancel_monitor/1` calls this for a SmolNet socket's monitor.
+
+  Returns `true` if the monitor was removed, in which case no DOWN message
+  for it arrives, or `false` if it was not found, typically because it has
+  already triggered and its DOWN message is in the caller's mailbox.
+  """
+  @spec cancel_monitor(reference()) :: boolean()
+  def cancel_monitor(ref) when is_reference(ref), do: Monitor.cancel(ref)
+  def cancel_monitor(ref), do: :erlang.error(:badarg, [ref])
 
   # Temporary adapter child / gen_statem callbacks
 

@@ -49,4 +49,13 @@ defmodule SmolNet.Inet.Tcp do
   defdelegate info(socket), to: Tcp6
   defdelegate socket_to_list(socket), to: Tcp6
   defdelegate getstat(socket, names), to: Tcp6
+
+  @doc "See `SmolNet.Inet6.Tcp.port/1`."
+  defdelegate port(socket), to: Tcp6
+
+  @doc "See `SmolNet.Inet6.Tcp.monitor/1`."
+  defdelegate monitor(socket), to: Tcp6
+
+  @doc "See `SmolNet.Inet6.Tcp.cancel_monitor/1`."
+  defdelegate cancel_monitor(ref), to: Tcp6
 end

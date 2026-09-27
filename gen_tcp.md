@@ -185,6 +185,51 @@ a later option explicitly lowers `buffer`.
 read and one write may be in progress concurrently; a second operation in the
 same direction returns `:busy`.
 
+## TLS with `:ssl`
+
+`:ssl` takes its transport through the `cb_info` option, and either callback
+module can be that transport. Pass the stack, and the family and address
+options, alongside the TLS options, as for `:gen_tcp`:
+
+```elixir
+cb_info = {SmolNet.Inet.Tcp, :tcp, :tcp_closed, :tcp_error}
+transport = [:inet, {:cb_info, cb_info}, {:smolnet_stack, stack}]
+
+# A client.
+{:ok, tls} =
+  :ssl.connect({192, 0, 2, 1}, 443, transport ++ [verify: :verify_peer, cacerts: cacerts], 5_000)
+
+:ok = :ssl.send(tls, "request")
+{:ok, response} = :ssl.recv(tls, 0, 5_000)
+
+# A server.
+{:ok, listener} = :ssl.listen(443, transport ++ [cert: cert, key: key])
+{:ok, accepted} = :ssl.transport_accept(listener, 5_000)
+{:ok, tls} = :ssl.handshake(accepted, 5_000)
+```
+
+Use `SmolNet.Inet6.Tcp` and `:inet6` for IPv6. A socket that is already
+connected, whether it was accepted or connected with `:gen_tcp`, can be
+upgraded too: `:ssl.handshake/3` for the server side and `:ssl.connect/3` for
+the client side, with the same `cb_info` in their options.
+
+`:ssl` uses three calls a plain `:gen_tcp` user rarely needs, and both modules
+provide them:
+
+- `port/1`, the socket's local port, as `:inet.port/1` returns it.
+- `monitor/1` and `cancel_monitor/1`, which `:inet.monitor/1` and
+  `:inet.cancel_monitor/1` call for a SmolNet socket. `:ssl.listen/2` watches
+  its listener this way. As for an OTP socket-backed `:gen_tcp` socket, the
+  monitor's message is `{:DOWN, ref, :socket, socket, :closed}` when the
+  socket closes, or `{:DOWN, ref, :socket, socket, :nosock}` at once if it
+  was already closed. Any process may monitor a socket, but only the process
+  that set a monitor can cancel it.
+
+A SmolNet socket closes when it is closed, when its owner exits, when a
+fatal error or `send_timeout_close` ends it, or when its stack stops. A peer's
+FIN alone does not close it, since the socket can still send, so a monitor
+does not trigger until one of those.
+
 ## Supported options
 
 The inet option surface is deliberately finite:
@@ -197,6 +242,7 @@ The inet option surface is deliberately finite:
 | `:active` | `false`, `true`, `:once`, or `1..32767` | supported |
 | `:packet` | `:raw`, `:line`, `1`, `2`, or `4` | supported |
 | `:packet_size` | `0..1048576` | supported |
+| `:header` | `0` only | `0` only |
 | `:buffer` | `1..1048576` | supported |
 | `:recbuf` / `:sndbuf` | `1024..1048576` | fixed |
 | `:send_timeout` / `:send_timeout_close` | supported | supported |

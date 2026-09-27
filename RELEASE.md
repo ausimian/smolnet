@@ -1,5 +1,14 @@
 ### Added
 
+- `:ssl` can run over SmolNet with `SmolNet.Inet.Tcp` or `SmolNet.Inet6.Tcp`
+  as its `cb_info` transport, as a client (`:ssl.connect/4`, or
+  `:ssl.connect/3` on a connected socket) and as a server (`:ssl.listen/2`
+  with `:ssl.transport_accept/2` and `:ssl.handshake/2`, or
+  `:ssl.handshake/3` on an accepted socket). Both modules now accept the
+  `{:header, 0}` option `:ssl` sets, report it from `getopts`, and export
+  `port/1`, `monitor/1` and `cancel_monitor/1`, so `:inet.monitor/1` works
+  on SmolNet sockets and delivers `{:DOWN, ref, :socket, socket, :closed}`
+  when one closes. See the `:gen_tcp` guide.
 - A real-network integration harness in the source repository, under
   `integration/`, for long runs of SmolNet against real peers. It is not
   part of the Hex package and does not run in `mix test`. It provides a
@@ -17,6 +26,4 @@
   servers on the host, with SmolNet as the TLS client and the server. Every
   body's length and SHA-256 is checked, any TLS alert fails the run, and
   throughput is reported next to the kernel's on the same path, in the notes
-  and as a result in `verdict.json`. `:ssl` cannot yet take SmolNet's
-  `:gen_tcp` modules as its transport directly (#97), so the harness wraps
-  them.
+  and as a result in `verdict.json`.
