@@ -112,6 +112,39 @@ defmodule SmolNet.Integration.TunLinkTest do
     SmolNet.stop_stack(stack)
   end
 
+  # Egress queued ahead of the helper's exit status finds its port closed.
+  # Suspending the link queues it there deterministically.
+  test "a helper that dies with egress queued takes the link down with its exit status" do
+    {link, _stack} = start_link()
+    link_monitor = Process.monitor(link)
+    %{port: port} = :sys.get_state(link)
+    {:os_pid, helper} = Port.info(port, :os_pid)
+
+    capture_log(fn ->
+      :ok = :sys.suspend(link)
+      send(link, {:smol_stack, :tun_link, :egress, [<<0::160>>]})
+      {_output, 0} = System.cmd("kill", ["-KILL", to_string(helper)])
+      assert_eventually(fn -> Port.info(port) == nil end)
+      :ok = :sys.resume(link)
+
+      assert_receive {:DOWN, ^link_monitor, :process, _pid, {:helper_exit, 137}}, 5_000
+    end)
+  end
+
+  # A write to a helper already gone closes its port with :epipe, which
+  # reaches the link as an exit rather than as an exit status. That race
+  # cannot be forced, so the port's exit is delivered as the link sees it.
+  test "a port that exits instead of reporting a status takes the link down too" do
+    {link, _stack} = start_link()
+    link_monitor = Process.monitor(link)
+    %{port: port} = :sys.get_state(link)
+
+    capture_log(fn ->
+      send(link, {:EXIT, port, :epipe})
+      assert_receive {:DOWN, ^link_monitor, :process, _pid, {:helper_exit, :epipe}}, 5_000
+    end)
+  end
+
   test "stopping the stack stops the link" do
     {link, stack} = start_link()
     monitor = Process.monitor(link)

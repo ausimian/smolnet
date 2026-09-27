@@ -52,7 +52,9 @@ defmodule SmolNet.Integration.TunLink do
 
   ## Failure
 
-  If the helper exits, the link exits with `{:helper_exit, status}`, and the
+  If the helper exits, the link exits with `{:helper_exit, status}`, where
+  `status` is the helper's exit status or, if the link wrote to the helper
+  after it had gone, the reason its port closed, such as `:epipe`. The
   stack applies its `:link_down` policy as for any other link that dies. The
   link watches its stack with `SmolNet.monitor/1` and stops normally when the
   stack stops. Stopping the link closes the port; the helper then sees end of
@@ -145,6 +147,9 @@ defmodule SmolNet.Integration.TunLink do
 
   @impl true
   def init(options) do
+    # A port closed by a write to a helper already gone exits, rather than
+    # reporting the helper's exit status.
+    Process.flag(:trap_exit, true)
     {link_options, stack_options} = Keyword.split(options, @link_options)
     stack_options = Keyword.put_new(stack_options, :egress_credit, @default_credit)
 
@@ -214,6 +219,19 @@ defmodule SmolNet.Integration.TunLink do
     {:stop, {:helper_exit, status}, %{state | port: nil}}
   end
 
+  def handle_info({:EXIT, port, reason}, %{port: port} = state) do
+    receive do
+      {^port, {:exit_status, status}} -> {:stop, {:helper_exit, status}, %{state | port: nil}}
+    after
+      0 -> {:stop, {:helper_exit, reason}, %{state | port: nil}}
+    end
+  end
+
+  # The feeder returns once its stack has gone; any other exit is a crash.
+  def handle_info({:EXIT, feeder, reason}, %{feeder: feeder} = state) do
+    if reason == :normal, do: {:noreply, state}, else: {:stop, reason, state}
+  end
+
   # The stack was stopped from elsewhere, so the device it fed has no purpose.
   def handle_info({:DOWN, monitor, :process, _object, _reason}, %{monitor: monitor} = state) do
     {:stop, :normal, state}
@@ -274,12 +292,20 @@ defmodule SmolNet.Integration.TunLink do
   defp grant_ingress(state) do
     room = state.ingress_queue - state.rx_granted - :counters.get(state.ingress, @ingress_queued)
 
-    if room >= grant_batch(state.ingress_queue) do
-      true = Port.command(state.port, <<1, room::32>>)
+    if room >= grant_batch(state.ingress_queue) and command(state.port, <<1, room::32>>) do
       %{state | rx_granted: state.rx_granted + room}
     else
       state
     end
+  end
+
+  # A helper that exits closes its port, possibly before the link has seen
+  # the exit status that stops it, and a command to a closed port raises.
+  # Whatever the link sends meanwhile is lost with the helper.
+  defp command(port, data) do
+    Port.command(port, data)
+  catch
+    :error, :badarg -> false
   end
 
   defp grant_batch(queue), do: max(1, div(queue, 4))
@@ -378,14 +404,16 @@ defmodule SmolNet.Integration.TunLink do
   end
 
   defp transmit(packet, state) do
-    true = Port.command(state.port, [0, packet])
-
-    count(state,
-      tx_packets: 1,
-      tx_bytes: byte_size(packet),
-      in_flight_packets: 1,
-      in_flight_bytes: byte_size(packet)
-    )
+    if command(state.port, [0, packet]) do
+      count(state,
+        tx_packets: 1,
+        tx_bytes: byte_size(packet),
+        in_flight_packets: 1,
+        in_flight_bytes: byte_size(packet)
+      )
+    else
+      count(state, tx_packets: 1, tx_bytes: byte_size(packet), tx_dropped: 1)
+    end
   end
 
   defp note_credit_wait(%{credit: nil} = state), do: state
