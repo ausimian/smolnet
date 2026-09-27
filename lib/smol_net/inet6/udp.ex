@@ -447,11 +447,18 @@ defmodule SmolNet.Inet6.Udp do
 
   def handle_event(:info, _message, _state_name, _data), do: :keep_state_and_data
 
+  # As in `SmolNet.Inet6.Tcp`: the supervisor's shutdown can overtake the
+  # stack's DOWN, so a shutdown after the stack has gone fails what is pending
+  # with `:enetdown`, as the DOWN would have.
   @impl true
-  def terminate(_reason, _state_name, data) do
+  def terminate(reason, _state_name, data) do
+    data = if stack_lost?(reason, data), do: fail_operations(data, :enetdown), else: data
     _result = close_low_socket(data)
     :ok
   end
+
+  defp stack_lost?(:shutdown, data), do: not Process.alive?(data.stack_pid)
+  defp stack_lost?(_reason, _data), do: false
 
   defp start_socket(%Options{} = options) do
     child = child_spec(%{owner: self(), options: options})

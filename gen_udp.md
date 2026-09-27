@@ -164,3 +164,8 @@ Network and lifecycle errors use OTP-style atoms such as `:enetunreach`,
 `:eaddrinuse`, `:emsgsize`, `:closed`, and `:enetdown`. One read and one write
 may progress independently; competing operations in the same direction return
 `:busy`.
+
+If a socket's stack fails, a call pending on the socket returns
+`{:error, :enetdown}`, and an active socket's owner receives
+`{:udp_error, socket, :enetdown}`. Calls pending when `SmolNet.stop_stack/1`
+stops the stack fail with `:closed`.
