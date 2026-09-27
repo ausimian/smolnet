@@ -13,6 +13,11 @@ defmodule SmolNet.TcpStreamTest do
   @client {0xFD00, 0, 0, 0, 0, 0, 0, 1}
   @peer {0xFD00, 0, 0, 0, 0, 0, 0, 2}
 
+  # A liveness budget scales with the host; a deadline under test does not.
+  # See `SmolNet.Test.Timing`.
+  @wait_1s Timing.liveness(1_000)
+  @receive_deadline Timing.quiescence(1_000)
+
   setup do
     previous_clock = Application.get_env(:smolnet, :clock_module)
     previous_manual_clock = Application.get_env(:smolnet, :manual_clock)
@@ -196,18 +201,28 @@ defmodule SmolNet.TcpStreamTest do
           info.native.result.read_waiter_count == 1
         end)
 
-        Process.sleep(300)
+        # Halfway through the deadline, so a slow host has half of it on
+        # either side: for this chunk to arrive before the deadline, and for
+        # the timeout to fire late without looking like a restarted one.
+        Process.sleep(div(@receive_deadline, 2))
+        sending_at = System.monotonic_time(:millisecond)
         :ok = IPv6TcpPeer.send_data(peer, "second")
-        System.monotonic_time(:millisecond)
+        sending_at
       end)
 
     started_at = System.monotonic_time(:millisecond)
-    assert {:error, {:timeout, "firstsecond"}} = SmolNet.recv(socket, 20, 1_000)
+    assert {:error, {:timeout, "firstsecond"}} = SmolNet.recv(socket, 20, @receive_deadline)
     finished_at = System.monotonic_time(:millisecond)
-    second_sent_at = Task.await(sender)
+    second_sending_at = Task.await(sender)
 
-    assert finished_at - started_at >= 850
-    assert finished_at - second_sent_at < 850
+    assert finished_at - started_at >= @receive_deadline - 150
+
+    # A deadline restarted by the second chunk could not have been set
+    # before that chunk was sent, so it would expire a whole deadline after
+    # `second_sending_at` at the earliest. The original deadline expires
+    # before then however late the host fires it, up to the time between
+    # the call and the second chunk.
+    assert finished_at < second_sending_at + @receive_deadline
   end
 
   test "EOF returns buffered data before closed and reset stays distinct" do
@@ -633,10 +648,10 @@ defmodule SmolNet.TcpStreamTest do
   end
 
   defp assert_select(%Socket{id: id, generation: generation}, {:select_info, _op, reference}) do
-    assert_receive {:"$smol_socket", {^id, ^generation}, :select, ^reference}, 1_000
+    assert_receive {:"$smol_socket", {^id, ^generation}, :select, ^reference}, @wait_1s
   end
 
-  defp assert_eventually(check, timeout \\ 1_000) do
+  defp assert_eventually(check, timeout \\ @wait_1s) do
     deadline = System.monotonic_time(:millisecond) + timeout
     do_assert_eventually(check, deadline)
   end

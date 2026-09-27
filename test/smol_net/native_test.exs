@@ -10,6 +10,14 @@ defmodule SmolNet.NativeTest do
 
   @wait_1s Timing.liveness(1_000)
 
+  # Fresh pairs of calls the reduction-slice comparison may measure before
+  # concluding that the host will not leave one pair undisturbed.
+  @slice_samples 20
+
+  # Forced budget checkpoints enough for any one call here to end on its own
+  # work limits, never on the wall clock. See `without_deadline/1`.
+  @no_deadline_checkpoints 1_000_000
+
   setup do
     on_exit(fn -> stop_all_stacks() end)
   end
@@ -237,37 +245,24 @@ defmodule SmolNet.NativeTest do
 
   @tag :debug_nif
   test "a caller whose reduction slice is spent receives a shorter native slice" do
-    ready_events = Stack.default_limits().ready_events
+    # Both calls also answer to the wall-clock work budget, and a preempted
+    # runner can spend all of it before a single readiness event goes out. A
+    # pair the host cut short says nothing about reductions, so fresh pairs
+    # are measured until one ran undisturbed, and every assertion is made on
+    # that pair.
+    %{starved: starved, snapshot: snapshot} = sample = sample_slices()
 
-    unconstrained = native_stack(ready_event_sockets())
-    keys = arm_read_waiters(unconstrained, ready_events)
-    # Arming the waiters spends this process's slice. Use a fresh process so
-    # the reference call cannot inherit a nearly exhausted reduction slice.
-    assert {:ok, _envelope} =
-             with_fresh_reduction_slice(fn ->
-               Native.test_socket_ready(unconstrained, keys)
-             end)
+    # Undisturbed: the reference call finished without yielding, and the
+    # starved call returned before its deadline could have stopped it, so
+    # its spent reduction slice is what shortened it.
+    assert sample.reference.counters.deadline_yields == 0
 
-    delivered_unconstrained = await_select_messages()
+    assert snapshot.counters.max_native_work_nanoseconds <
+             snapshot.work_budget_nanoseconds
 
-    starved = native_stack(ready_event_sockets())
-    keys = arm_read_waiters(starved, ready_events)
+    assert sample.delivered_starved > 0
+    assert sample.delivered_starved < sample.delivered_unconstrained
 
-    # The first incremental charge reports the caller's slice as spent, so the
-    # call stops after the chunk that charge covers instead of continuing to
-    # drain readiness.
-    assert {:ok, %{result: :ok}} = Native.test_set_slice_exhaustion(starved, 0)
-
-    assert {:ok, %{more: true}} =
-             with_fresh_reduction_slice(fn ->
-               Native.test_socket_ready(starved, keys)
-             end)
-
-    delivered_starved = await_select_messages()
-    assert delivered_starved > 0
-    assert delivered_starved < delivered_unconstrained
-
-    assert {:ok, %{result: snapshot}} = Native.stack_snapshot(starved)
     assert snapshot.counters.timeslice_exhaustions >= 1
     assert snapshot.counters.deadline_yields >= 1
     assert snapshot.counters.max_native_work_nanoseconds > 0
@@ -276,7 +271,7 @@ defmodule SmolNet.NativeTest do
     # Readiness retained by the shortened slice still completes across ordinary
     # continuations rather than being dropped.
     assert {:ok, %{more: false}} = poll_until_complete(starved)
-    assert delivered_starved + await_select_messages() == ready_events
+    assert sample.delivered_starved + drain_select_messages(0) == sample.ready_events
   end
 
   @tag :debug_nif
@@ -512,7 +507,9 @@ defmodule SmolNet.NativeTest do
     [first, second, third] =
       Enum.map(payloads, fn payload ->
         assert {:ok, %{output: [packet]}} =
-                 Native.udp_sendto(resource, sender, destination, payload, self(), make_ref(), 0)
+                 resource
+                 |> without_deadline()
+                 |> Native.udp_sendto(sender, destination, payload, self(), make_ref(), 0)
 
         packet
       end)
@@ -525,7 +522,12 @@ defmodule SmolNet.NativeTest do
              Native.stack_ingress_batch(resource, [first, second], 0)
 
     assert {:ok, %{result: %{receive_packets: 1}}} = Native.stack_snapshot(resource)
-    assert {:ok, %{result: 1, more: false}} = Native.stack_ingress_batch(resource, [third], 0)
+
+    assert {:ok, %{result: 1, more: false}} =
+             resource
+             |> without_deadline()
+             |> Native.stack_ingress_batch([third], 0)
+
     assert {:ok, %{result: %{receive_packets: 0}}} = Native.stack_snapshot(resource)
 
     for payload <- payloads do
@@ -758,11 +760,78 @@ defmodule SmolNet.NativeTest do
     end)
   end
 
-  defp await_select_messages do
-    assert_receive {:"$smol_socket", _identity, :select, _reference}, @wait_1s
-    drain_select_messages(1)
+  # Lifts the wall-clock deadline from the resource's next call. A preempted
+  # runner can spend the whole work budget before the call does the work a
+  # test expects of it in one call, and the call then returns `more: true`
+  # with that work retained for a continuation.
+  defp without_deadline(resource) do
+    assert {:ok, %{result: :ok}} =
+             Native.test_set_budget_checkpoints(resource, @no_deadline_checkpoints)
+
+    resource
   end
 
+  defp sample_slices(attempt \\ 1) do
+    sample = measure_slices()
+
+    if undisturbed?(sample) or attempt >= @slice_samples do
+      sample
+    else
+      sample_slices(attempt + 1)
+    end
+  end
+
+  # The wall clock rather than the reduction slice cut a call short when the
+  # reference yielded, or when the starved call (or one of the calls that set
+  # it up) ran as long as the work budget.
+  defp undisturbed?(%{reference: reference, snapshot: snapshot}) do
+    reference.counters.deadline_yields == 0 and
+      snapshot.counters.max_native_work_nanoseconds < snapshot.work_budget_nanoseconds
+  end
+
+  defp measure_slices do
+    ready_events = Stack.default_limits().ready_events
+
+    unconstrained = native_stack(ready_event_sockets())
+    keys = arm_read_waiters(unconstrained, ready_events)
+    # Arming the waiters spends this process's slice. Use a fresh process so
+    # the reference call cannot inherit a nearly exhausted reduction slice.
+    assert {:ok, _envelope} =
+             with_fresh_reduction_slice(fn ->
+               Native.test_socket_ready(unconstrained, keys)
+             end)
+
+    delivered_unconstrained = drain_select_messages(0)
+    assert {:ok, %{result: reference}} = Native.stack_snapshot(unconstrained)
+
+    starved = native_stack(ready_event_sockets())
+    keys = arm_read_waiters(starved, ready_events)
+
+    # The first incremental charge reports the caller's slice as spent, so the
+    # call stops after the chunk that charge covers instead of continuing to
+    # drain readiness.
+    assert {:ok, %{result: :ok}} = Native.test_set_slice_exhaustion(starved, 0)
+
+    assert {:ok, %{more: true}} =
+             with_fresh_reduction_slice(fn ->
+               Native.test_socket_ready(starved, keys)
+             end)
+
+    delivered_starved = drain_select_messages(0)
+    assert {:ok, %{result: snapshot}} = Native.stack_snapshot(starved)
+
+    %{
+      ready_events: ready_events,
+      delivered_unconstrained: delivered_unconstrained,
+      reference: reference,
+      starved: starved,
+      delivered_starved: delivered_starved,
+      snapshot: snapshot
+    }
+  end
+
+  # The call's readiness messages come from the task and precede its reply,
+  # so they are all in this mailbox by the time this returns.
   defp with_fresh_reduction_slice(call) do
     call
     |> Task.async()
