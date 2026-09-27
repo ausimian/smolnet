@@ -538,6 +538,10 @@ pub struct Socket<'a> {
 
     /// Nagle's Algorithm enabled.
     nagle: bool,
+    /// The end of the last segment sent with less than a full MSS of data, until it
+    /// is acknowledged. Nagle's algorithm holds back another such segment only while
+    /// this one is in flight (Minshall's variant).
+    nagle_small_segment_end: Option<TcpSeqNumber>,
 
     /// The congestion control algorithm.
     congestion_controller: congestion::AnyController,
@@ -622,6 +626,7 @@ impl<'a> Socket<'a> {
             ack_delay_timer: AckDelayTimer::Idle,
             challenge_ack_timer: Instant::from_secs(0),
             nagle: true,
+            nagle_small_segment_end: None,
             tsval_generator: None,
             last_remote_tsval: 0,
             congestion_controller: congestion::AnyController::new(),
@@ -929,6 +934,7 @@ impl<'a> Socket<'a> {
         self.remote_mss = DEFAULT_MSS;
         self.remote_last_ts = None;
         self.recover = None;
+        self.nagle_small_segment_end = None;
         self.ack_delay_timer = AckDelayTimer::Idle;
         self.challenge_ack_timer = Instant::from_secs(0);
 
@@ -2183,6 +2189,13 @@ impl<'a> Socket<'a> {
             // sequence number past it.
             self.local_seq_no = ack_number;
 
+            if self
+                .nagle_small_segment_end
+                .is_some_and(|end| end <= ack_number)
+            {
+                self.nagle_small_segment_end = None;
+            }
+
             // During retransmission, if an earlier segment got lost but later was
             // successfully received, self.local_seq_no can move past self.remote_last_seq.
             // Do not attempt to retransmit the latter segments; not only this is pointless
@@ -2382,12 +2395,20 @@ impl<'a> Socket<'a> {
             _ => false,
         };
 
-        // If we're applying the Nagle algorithm we don't want to send more
-        // until one of:
-        // * There's no data in flight
+        // If we're applying the Nagle algorithm, in Minshall's variant as Linux
+        // does, we don't want to send a segment shorter than a full MSS until one
+        // of:
+        // * There's no such segment in flight
         // * We can send a full packet
         // * We have all the data we'll ever send (we're closing send)
-        if self.nagle && data_in_flight && !can_send_full && !want_fin {
+        //
+        // Holding back every partial segment while any data at all is in flight,
+        // as RFC 896 does, would hold the tail of every write longer than an MSS
+        // for a round trip, plus the peer's delayed ACK.
+        let small_segment_in_flight = self
+            .nagle_small_segment_end
+            .is_some_and(|end| end > self.local_seq_no);
+        if self.nagle && data_in_flight && small_segment_in_flight && !can_send_full && !want_fin {
             can_send = false;
         }
 
@@ -2607,6 +2628,7 @@ impl<'a> Socket<'a> {
 
         let mut is_zero_window_probe = false;
         let mut is_fast_retransmit = false;
+        let mut is_small_segment = false;
 
         #[cfg_attr(
             not(feature = "segmentation-offload"),
@@ -2753,6 +2775,8 @@ impl<'a> Socket<'a> {
                     offset
                 };
 
+                is_small_segment = !repr.payload.is_empty() && repr.payload.len() < effective_mss;
+
                 // If we've sent everything we had in the buffer, follow it with the PSH or FIN
                 // flags, depending on whether the transmit half of the connection is open.
                 if offset + repr.payload.len() == self.tx_buffer.len() {
@@ -2862,6 +2886,14 @@ impl<'a> Socket<'a> {
         self.remote_last_seq = self
             .remote_last_seq
             .max(repr.seq_number + repr.segment_len());
+
+        if is_small_segment {
+            let end = repr.seq_number + repr.segment_len();
+            self.nagle_small_segment_end = Some(
+                self.nagle_small_segment_end
+                    .map_or(end, |last| last.max(end)),
+            );
+        }
         self.remote_last_ack = repr.ack_number;
         self.remote_last_win = repr.window_len;
 
@@ -5269,17 +5301,27 @@ mod test {
         s.set_tsval_generator(Some(|| 1));
         s.remote_mss = EFFECTIVE_MSS;
 
-        // Payload should contain 12 bytes less due to timestamp
+        // Payload should contain 12 bytes less due to timestamp, and those 12 bytes
+        // follow in a segment of their own
         s.send_slice(&[0; EFFECTIVE_MSS]).unwrap();
         recv!(
             s,
-            [TcpRepr {
-                seq_number: LOCAL_SEQ + 1,
-                ack_number: Some(REMOTE_SEQ + 1),
-                payload: &[0; EFFECTIVE_MSS - 12],
-                timestamp: Some(TcpTimestampRepr::new(1, 0)),
-                ..RECV_TEMPL
-            }]
+            [
+                TcpRepr {
+                    seq_number: LOCAL_SEQ + 1,
+                    ack_number: Some(REMOTE_SEQ + 1),
+                    payload: &[0; EFFECTIVE_MSS - 12],
+                    timestamp: Some(TcpTimestampRepr::new(1, 0)),
+                    ..RECV_TEMPL
+                },
+                TcpRepr {
+                    seq_number: LOCAL_SEQ + 1 + (EFFECTIVE_MSS - 12),
+                    ack_number: Some(REMOTE_SEQ + 1),
+                    payload: &[0; 12],
+                    timestamp: Some(TcpTimestampRepr::new(1, 0)),
+                    ..RECV_TEMPL
+                }
+            ]
         );
     }
 
@@ -5293,17 +5335,27 @@ mod test {
         s.remote_mss = 9999;
         s.remote_win_len = 9999;
 
-        // Payload should contain 12 bytes less due to timestamp
+        // Payload should contain 12 bytes less due to timestamp, and those 12 bytes
+        // follow in a segment of their own
         s.send_slice(&[0; EFFECTIVE_MSS]).unwrap();
         recv!(
             s,
-            [TcpRepr {
-                seq_number: LOCAL_SEQ + 1,
-                ack_number: Some(REMOTE_SEQ + 1),
-                payload: &[0; EFFECTIVE_MSS - 12],
-                timestamp: Some(TcpTimestampRepr::new(1, 0)),
-                ..RECV_TEMPL
-            }]
+            [
+                TcpRepr {
+                    seq_number: LOCAL_SEQ + 1,
+                    ack_number: Some(REMOTE_SEQ + 1),
+                    payload: &[0; EFFECTIVE_MSS - 12],
+                    timestamp: Some(TcpTimestampRepr::new(1, 0)),
+                    ..RECV_TEMPL
+                },
+                TcpRepr {
+                    seq_number: LOCAL_SEQ + 1 + (EFFECTIVE_MSS - 12),
+                    ack_number: Some(REMOTE_SEQ + 1),
+                    payload: &[0; 12],
+                    timestamp: Some(TcpTimestampRepr::new(1, 0)),
+                    ..RECV_TEMPL
+                }
+            ]
         );
     }
 
@@ -5350,13 +5402,22 @@ mod test {
         s.send_slice(&[0; 64]).unwrap();
         recv!(
             s,
-            [TcpRepr {
-                seq_number: LOCAL_SEQ + 1,
-                ack_number: Some(REMOTE_SEQ + 1),
-                payload: &[0; MIN_REMOTE_MSS - 12],
-                timestamp: Some(TcpTimestampRepr::new(1, 500)),
-                ..RECV_TEMPL
-            }]
+            [
+                TcpRepr {
+                    seq_number: LOCAL_SEQ + 1,
+                    ack_number: Some(REMOTE_SEQ + 1),
+                    payload: &[0; MIN_REMOTE_MSS - 12],
+                    timestamp: Some(TcpTimestampRepr::new(1, 500)),
+                    ..RECV_TEMPL
+                },
+                TcpRepr {
+                    seq_number: LOCAL_SEQ + 1 + (MIN_REMOTE_MSS - 12),
+                    ack_number: Some(REMOTE_SEQ + 1),
+                    payload: &[0; 64 - (MIN_REMOTE_MSS - 12)],
+                    timestamp: Some(TcpTimestampRepr::new(1, 500)),
+                    ..RECV_TEMPL
+                }
+            ]
         );
     }
 
@@ -9591,18 +9652,32 @@ mod test {
         );
 
         s.send_slice(b"aaabbbccc").unwrap();
-        // If there's data in flight, not-full segments don't get sent.
+        // If there's data in flight but no not-full segment, the not-full segment at
+        // the end of a write gets sent at once.
         recv!(
             s,
-            [TcpRepr {
-                seq_number: LOCAL_SEQ + 1 + 6 + 6,
-                ack_number: Some(REMOTE_SEQ + 1),
-                payload: &b"aaabbb"[..],
-                ..RECV_TEMPL
-            }]
+            [
+                TcpRepr {
+                    seq_number: LOCAL_SEQ + 1 + 6 + 6,
+                    ack_number: Some(REMOTE_SEQ + 1),
+                    payload: &b"aaabbb"[..],
+                    ..RECV_TEMPL
+                },
+                TcpRepr {
+                    seq_number: LOCAL_SEQ + 1 + 6 + 6 + 6,
+                    ack_number: Some(REMOTE_SEQ + 1),
+                    payload: &b"ccc"[..],
+                    ..RECV_TEMPL
+                }
+            ]
         );
 
-        // Data gets ACKd, so there's no longer data in flight
+        // If a not-full segment is in flight, another one doesn't get sent.
+        s.send_slice(b"dd").unwrap();
+        recv_nothing!(s);
+
+        // The data before the not-full segment gets ACKd, but that segment is still
+        // in flight.
         send!(
             s,
             TcpRepr {
@@ -9611,16 +9686,72 @@ mod test {
                 ..SEND_TEMPL
             }
         );
+        recv_nothing!(s);
 
-        // Now non-full segment gets sent.
+        // The not-full segment gets ACKd, so the next one gets sent.
+        send!(
+            s,
+            TcpRepr {
+                seq_number: REMOTE_SEQ + 1,
+                ack_number: Some(LOCAL_SEQ + 1 + 6 + 6 + 6 + 3),
+                ..SEND_TEMPL
+            }
+        );
         recv!(
             s,
             [TcpRepr {
-                seq_number: LOCAL_SEQ + 1 + 6 + 6 + 6,
+                seq_number: LOCAL_SEQ + 1 + 6 + 6 + 6 + 3,
                 ack_number: Some(REMOTE_SEQ + 1),
-                payload: &b"ccc"[..],
+                payload: &b"dd"[..],
                 ..RECV_TEMPL
             }]
+        );
+    }
+
+    #[test]
+    fn test_nagle_sends_the_tail_of_a_write_longer_than_mss() {
+        let mut s = socket_established();
+        s.remote_mss = 6;
+
+        // A small segment is in flight and gets ACKd.
+        s.send_slice(b"abc").unwrap();
+        recv!(
+            s,
+            [TcpRepr {
+                seq_number: LOCAL_SEQ + 1,
+                ack_number: Some(REMOTE_SEQ + 1),
+                payload: &b"abc"[..],
+                ..RECV_TEMPL
+            }]
+        );
+        send!(
+            s,
+            TcpRepr {
+                seq_number: REMOTE_SEQ + 1,
+                ack_number: Some(LOCAL_SEQ + 1 + 3),
+                ..SEND_TEMPL
+            }
+        );
+
+        // A write longer than the MSS goes out whole, with no ACK in between: its
+        // full segment is in flight, but no not-full one is.
+        s.send_slice(b"foobarbaz").unwrap();
+        recv!(
+            s,
+            [
+                TcpRepr {
+                    seq_number: LOCAL_SEQ + 1 + 3,
+                    ack_number: Some(REMOTE_SEQ + 1),
+                    payload: &b"foobar"[..],
+                    ..RECV_TEMPL
+                },
+                TcpRepr {
+                    seq_number: LOCAL_SEQ + 1 + 3 + 6,
+                    ack_number: Some(REMOTE_SEQ + 1),
+                    payload: &b"baz"[..],
+                    ..RECV_TEMPL
+                }
+            ]
         );
     }
 

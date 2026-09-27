@@ -102,3 +102,12 @@ Hex packages are unaffected: they ship only precompiled NIFs and omit
   flight stalled for good. The flag is now cleared only once `emit`
   succeeds, for both the third duplicate ACK and partial ACKs. Two unit
   tests cover a refused retransmission of each kind.
+- #102: upstream's Nagle's algorithm held back any segment shorter than the
+  MSS while any data was unacknowledged, so the partial tail of every write
+  longer than an MSS waited for the ACK of the write's full segments: a
+  round trip, plus the peer's delayed ACK, which Linux peers apply to a lone
+  full segment. The socket now records the end of the last partial segment
+  it sent and holds another only while that one is unacknowledged
+  (Minshall's variant, as in Linux). `test_nagle` and three payload-size
+  tests that relied on the old hold now expect the tail, and a new test
+  covers a write longer than the MSS after a partial segment was ACKed.

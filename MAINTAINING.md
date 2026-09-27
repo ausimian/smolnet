@@ -86,8 +86,10 @@ waiter, and packet capacities and is included in the benchmark.
 ## Vendored smoltcp
 
 `native/vendor/smoltcp` is smoltcp 0.14.0 with SmolNet patches to the TCP
-sender: RFC 6582 partial-ACK recovery (ADR 0013), and a fix that keeps a fast
-retransmission pending when the device refuses it (#80). The commit that added
+sender: RFC 6582 partial-ACK recovery (ADR 0013), a fix that keeps a fast
+retransmission pending when the device refuses it (#80), and Minshall's
+variant of Nagle's algorithm, which sends the partial tail of a write longer
+than an MSS without waiting for an ACK (#102). The commit that added
 the directory holds the crates.io package unmodified, so
 `git log -p -- native/vendor/smoltcp` after that commit is the complete set of
 SmolNet changes. Keep any further patch small, covered by tests in the
