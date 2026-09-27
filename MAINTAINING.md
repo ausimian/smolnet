@@ -89,7 +89,9 @@ waiter, and packet capacities and is included in the benchmark.
 sender: RFC 6582 partial-ACK recovery (ADR 0013), a fix that keeps a fast
 retransmission pending when the device refuses it (#80), and Minshall's
 variant of Nagle's algorithm, which sends the partial tail of a write longer
-than an MSS without waiting for an ACK (#102). The commit that added
+than an MSS without waiting for an ACK (#102), and RFC 6675's duplicate ACK,
+which counts an ACK that SACKs new data whatever its window (#103). The
+commit that added
 the directory holds the crates.io package unmodified, so
 `git log -p -- native/vendor/smoltcp` after that commit is the complete set of
 SmolNet changes. Keep any further patch small, covered by tests in the

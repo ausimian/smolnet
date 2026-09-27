@@ -111,3 +111,13 @@ Hex packages are unaffected: they ship only precompiled NIFs and omit
   (Minshall's variant, as in Linux). `test_nagle` and three payload-size
   tests that relied on the old hold now expect the tail, and a new test
   covers a write longer than the MSS after a partial segment was ACKed.
+- #103: upstream counted an ACK as a duplicate only if its window was
+  unchanged, following RFC 5681. A Linux receiver grows its window on
+  nearly every ACK while its receive buffer autotunes, so against Linux
+  none of its duplicate ACKs counted, fast retransmit never started, and
+  every loss waited for the 1 s retransmission timer. An ACK whose SACK
+  blocks report data above the cumulative ACK that no earlier ACK
+  reported is now a duplicate whatever its window, as RFC 6675 defines
+  one. Without SACK, the window rule still applies. Two unit tests cover
+  duplicates with a growing window and a window update that repeats an
+  earlier SACK block.
