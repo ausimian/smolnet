@@ -16,6 +16,21 @@ sudo mix run integration/tls.exs --duration 10m --target local
 sudo integration/teardown.sh
 ```
 
+The path MTU scenario, `pmtu.exs`, builds a routed path of its own, with
+a hop whose MTU is below SmolNet's, so it runs in a network namespace of
+its own, with its own device, which `pmtu-topology.sh isolate` creates.
+Where the host allows unprivileged user namespaces, it needs no sudo:
+
+```console
+integration/pmtu-topology.sh isolate mix run integration/pmtu.exs
+integration/pmtu-topology.sh isolate mix run integration/pmtu.exs --mtu 1280 --family inet
+```
+
+It reports each case as `adapts`, `stalls` or `fails`, next to what is
+expected of it, and keeps its captures in `captures/`; see
+`SmolNet.Integration.Scenarios.Pmtu` and the path MTU guide,
+`path_mtu.md`, for what the outcomes mean.
+
 Each script's `--help` lists its options. `--self-check` runs a scenario
 over the TUN helper's loopback with no device and no root, and `--baseline`
 over the kernel's stack alone. Use `MIX_ENV=prod` for measurements: the
@@ -46,9 +61,11 @@ which is not a failure. IPv6 over the device, to the host, works.
 | nightly, 03:17 UTC | 10 min each of `smoke`, `tls --target local` and `tls` to speed.cloudflare.com | yes |
 | weekly, Sunday 04:43 UTC | 1 h of `smoke`; 4 h each of `tls --target local` and `tls` to the internet, 5 min between rounds | yes |
 | `workflow_dispatch` | one run from the inputs below | no |
-| pull request changing `integration/**` or the workflow | 1 to 2 min each of `smoke`, `smoke` under netem `delay`, `tls --target local` and `tls` to the internet | no |
+| pull request changing `integration/**` or the workflow | 1 to 2 min each of `smoke`, `smoke` under netem `delay`, `tls --target local` and `tls` to the internet, and the whole `pmtu` matrix | no |
 
-`integration/ci/plan.sh` holds the schedule. A hosted job may run 6 h,
+`integration/ci/plan.sh` holds the schedule, and `integration/ci/run.sh`
+runs a `pmtu` run under `pmtu-topology.sh isolate`, so that its routers
+never touch the runner's own network. A hosted job may run 6 h,
 so the long soak is 4 h rather than 6 h, and a dispatched run at most 5 h.
 GitHub disables scheduled workflows after 60 days without a commit to the
 repository; re-enable it from the Actions tab.
@@ -66,7 +83,7 @@ gh workflow run integration.yml --repo ausimian/smolnet --ref <branch> \
 
 | input | values | default |
 | --- | --- | --- |
-| `scenario` | `tls`, `smoke`: runs `integration/<scenario>.exs` | `tls` |
+| `scenario` | `tls`, `smoke`, `pmtu`: runs `integration/<scenario>.exs` | `tls` |
 | `duration` | `90s`, `10m`, `1h30m`: at most `5h` | `10m` |
 | `netem` | `none` or a profile of `SmolNet.Integration.Soak.Netem` | `none` |
 | `family` | `both`, `inet`, `inet6` | `both` |
