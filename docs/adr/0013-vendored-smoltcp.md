@@ -92,3 +92,13 @@ the registry dependency restored.
 
 Hex packages are unaffected: they ship only precompiled NIFs and omit
 `native/`.
+
+## Later patches
+
+- #80: upstream `dispatch` cleared a queued fast retransmission before
+  handing it to the device. If the device refused it, as SmolNet's device
+  does once a link's egress credit runs out part-way through a poll, the
+  resend was lost with nothing left to schedule it, and a window already in
+  flight stalled for good. The flag is now cleared only once `emit`
+  succeeds, for both the third duplicate ACK and partial ACKs. Two unit
+  tests cover a refused retransmission of each kind.

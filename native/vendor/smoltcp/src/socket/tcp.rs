@@ -2606,6 +2606,7 @@ impl<'a> Socket<'a> {
         };
 
         let mut is_zero_window_probe = false;
+        let mut is_fast_retransmit = false;
 
         #[cfg_attr(
             not(feature = "segmentation-offload"),
@@ -2667,7 +2668,9 @@ impl<'a> Socket<'a> {
                     repr.seq_number = self.local_seq_no;
                     repr.payload = self.tx_buffer.get_allocated(0, size);
 
-                    self.pending_fast_retransmit = false;
+                    // The resend stays pending until `emit` accepts it, so a device
+                    // that refuses it now is asked again on the next dispatch.
+                    is_fast_retransmit = true;
 
                     0
                 } else {
@@ -2820,6 +2823,10 @@ impl<'a> Socket<'a> {
         // for sure will not be successfully transmitted.
         ip_repr.set_payload_len(repr.buffer_len());
         emit(cx, packet_meta, (ip_repr, repr))?;
+
+        if is_fast_retransmit {
+            self.pending_fast_retransmit = false;
+        }
 
         // We've sent something, whether useful data or a keep-alive packet, so rewind
         // the keep-alive timer.
@@ -7171,6 +7178,52 @@ mod test {
         }
         recv!(s, time 1150, Ok(data_repr(15, b"fff")));
         assert_eq!(s.recover, Some(LOCAL_SEQ + 1 + 27));
+    }
+
+    // Dispatches to a device with no room, as when a link's egress credit runs
+    // out part-way through a poll.
+    #[track_caller]
+    fn dispatch_refused(s: &mut TestSocket, time: i64) {
+        s.cx.set_now(Instant::from_millis(time));
+        let result: Result<(), ()> = s.socket.dispatch(&mut s.cx, |_, _, _| Err(()));
+        assert_eq!(result, Err(()));
+    }
+
+    #[test]
+    fn test_fast_retransmit_survives_refused_emit() {
+        let mut s = socket_established();
+        s.remote_mss = 3;
+        send!(s, time 0, ack_repr(0));
+
+        s.send_slice(b"aaaBBBcccDDD").unwrap();
+        for (i, payload) in [b"aaa", b"BBB", b"ccc", b"DDD"].iter().enumerate() {
+            recv!(s, time 1000, Ok(data_repr(3 * i, &payload[..])));
+        }
+        recv_nothing!(s, time 1000);
+        for _ in 0..3 {
+            send!(s, time 1050, ack_repr(0));
+        }
+
+        // The retransmission is refused, but stays due.
+        dispatch_refused(&mut s, 1050);
+        assert_eq!(s.socket.poll_at(&mut s.cx), PollAt::Now);
+
+        // Once the device has room, the lost segment is resent and the
+        // retransmit timer guards it.
+        recv!(s, time 1060, Ok(data_repr(0, b"aaa")));
+        assert!(s.timer.is_retransmit());
+        recv_nothing!(s, time 1060);
+    }
+
+    #[test]
+    fn test_fast_recovery_partial_ack_survives_refused_emit() {
+        let mut s = socket_fast_recovery_two_holes();
+
+        send!(s, time 1060, ack_repr(3));
+        dispatch_refused(&mut s, 1060);
+
+        recv!(s, time 1070, Ok(data_repr(3, b"BBB")));
+        recv_nothing!(s, time 1070);
     }
 
     #[test]
