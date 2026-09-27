@@ -72,8 +72,7 @@ defmodule SmolNet.Integration.Scenarios.Tls do
         round_pause: :integer,
         transfer_timeout: :integer,
         socket_buffer: :integer,
-        compare: :boolean,
-        direct_ssl: :boolean
+        compare: :boolean
       ],
       defaults: [
         target: "internet",
@@ -82,8 +81,7 @@ defmodule SmolNet.Integration.Scenarios.Tls do
         round_pause: 60_000,
         transfer_timeout: 120_000,
         socket_buffer: 262_144,
-        compare: true,
-        direct_ssl: false
+        compare: true
       ],
       counters: [:rounds, :transfers, :bytes, :baseline_transfers],
       # Every transfer is a connection, and a socket that closes first holds
@@ -100,7 +98,6 @@ defmodule SmolNet.Integration.Scenarios.Tls do
         --socket-buffer N     SmolNet's receive and send buffers, in bytes, 1024 to 1048576,
                               or 0 for its default of 65536 (default 262144)
         --no-compare          do not repeat each phase over the kernel's stack
-        --direct-ssl          give :ssl SmolNet's own modules as cb_info, without the shim
 
       --concurrency sets the streams of the multi-stream phases (default 4).
       """
@@ -114,7 +111,6 @@ defmodule SmolNet.Integration.Scenarios.Tls do
 
     case settings(context) do
       {:ok, settings} ->
-        report_gaps(context)
         table = :ets.new(:tls_phases, [:public, :duplicate_bag])
         settings = Map.put(settings, :table, table)
 
@@ -148,8 +144,7 @@ defmodule SmolNet.Integration.Scenarios.Tls do
          round_pause: extra.round_pause,
          transfer_timeout: extra.transfer_timeout,
          buffer: if(extra.socket_buffer == 0, do: nil, else: extra.socket_buffer),
-         compare: extra.compare and context.mode == :smolnet and target == :internet,
-         direct: extra.direct_ssl
+         compare: extra.compare and context.mode == :smolnet and target == :internet
        }}
     end
   end
@@ -175,30 +170,6 @@ defmodule SmolNet.Integration.Scenarios.Tls do
     do: {:error, "--#{dasherize(name)} must not be negative, got #{value}"}
 
   defp dasherize(name), do: name |> to_string() |> String.replace("_", "-")
-
-  defp report_gaps(context) do
-    case Tls.gaps(context) do
-      nil ->
-        :ok
-
-      [] ->
-        Soak.record(context, :ssl_cb_info_gaps, [])
-
-        Soak.note(
-          context,
-          ":ssl can take SmolNet.Inet.Tcp directly as its cb_info; the harness's shim is not needed"
-        )
-
-      gaps ->
-        Soak.record(context, :ssl_cb_info_gaps, gaps)
-
-        Soak.note(
-          context,
-          ":ssl runs over SmolNet through the harness's transport shim; " <>
-            "as a cb_info itself, SmolNet: #{Enum.join(gaps, "; ")}"
-        )
-    end
-  end
 
   # The internet target
 
@@ -405,9 +376,9 @@ defmodule SmolNet.Integration.Scenarios.Tls do
     {server_tls, client_tls}
   end
 
-  # A server accepts with `:gen_tcp` and upgrades each connection with
-  # `:ssl.handshake/3`; see `SmolNet.Integration.Tls` for why not
-  # `:ssl.listen/2`.
+  # A server listens with `:ssl.listen/2` and accepts with
+  # `:ssl.transport_accept/2`; each connection's handler then runs the
+  # handshake.
   defp start_server(context, settings, family, role, tls) do
     parent = self()
     server = %{family: family, role: role, tls: tls}
@@ -425,19 +396,11 @@ defmodule SmolNet.Integration.Scenarios.Tls do
   end
 
   defp listen(parent, context, settings, server) do
-    options =
-      Network.tcp_options(context, server.role, server.family) ++
-        Tls.buffer_options(context, server.role, settings.buffer) ++
-        [
-          :binary,
-          active: false,
-          backlog: 16,
-          ip: Network.address(context, server.role, server.family)
-        ]
+    options = [buffer: settings.buffer]
 
-    case :gen_tcp.listen(0, options) do
+    case Tls.listen(context, server.role, server.family, server.tls, options) do
       {:ok, listener} ->
-        {:ok, {_address, port}} = :inet.sockname(listener)
+        {:ok, {_address, port}} = :ssl.sockname(listener)
         send(parent, {self(), {:ok, port}})
         accept(context, settings, Map.put(server, :listener, listener), 0)
 
@@ -448,22 +411,22 @@ defmodule SmolNet.Integration.Scenarios.Tls do
 
   defp accept(context, settings, server, served) do
     receive do
-      :stop -> :gen_tcp.close(server.listener)
+      :stop -> :ssl.close(server.listener)
     after
       0 ->
-        case :gen_tcp.accept(server.listener, @accept_poll) do
+        case :ssl.transport_accept(server.listener, @accept_poll) do
           {:ok, socket} ->
             mode = if rem(served, 2) == 0, do: :passive, else: :active
             handler = spawn(fn -> handle(context, settings, server, mode) end)
 
-            case :gen_tcp.controlling_process(socket, handler) do
+            case :ssl.controlling_process(socket, handler) do
               :ok ->
                 send(handler, {:socket, socket})
                 accept(context, settings, server, served + 1)
 
               {:error, reason} ->
                 Process.exit(handler, :kill)
-                :gen_tcp.close(socket)
+                :ssl.close(socket)
                 summary = "could not hand an accepted connection to its handler"
                 Soak.fail(context, :accept, summary, [{"reason", reason}])
             end
@@ -487,7 +450,7 @@ defmodule SmolNet.Integration.Scenarios.Tls do
       receive do
         {:socket, socket} ->
           Soak.within(context, name, settings.transfer_timeout, fn ->
-            serve(context, server, socket, mode, settings.direct)
+            serve(socket, mode)
           end)
       end
 
@@ -505,10 +468,8 @@ defmodule SmolNet.Integration.Scenarios.Tls do
       Soak.fail(context, :server_crashed, summary, [{"reason", {kind, reason, __STACKTRACE__}}])
   end
 
-  defp serve(context, server, socket, mode, direct) do
-    upgrade = Tls.upgrade(context, server.role, server.family, socket, server.tls, direct: direct)
-
-    case upgrade do
+  defp serve(socket, mode) do
+    case :ssl.handshake(socket, :infinity) do
       {:ok, tls} ->
         try do
           Https.serve(tls, mode)
@@ -517,7 +478,7 @@ defmodule SmolNet.Integration.Scenarios.Tls do
         end
 
       {:error, _reason} = error ->
-        :gen_tcp.close(socket)
+        :ssl.close(socket)
         error
     end
   end
@@ -597,7 +558,7 @@ defmodule SmolNet.Integration.Scenarios.Tls do
     Soak.within(context, name, settings.transfer_timeout, fn ->
       started = now()
       server = phase.server
-      options = [direct: settings.direct, timeout: @connect_timeout, buffer: settings.buffer]
+      options = [timeout: @connect_timeout, buffer: settings.buffer]
 
       connected =
         Tls.connect(context, phase.client, server.address, server.port, server.tls, options)
