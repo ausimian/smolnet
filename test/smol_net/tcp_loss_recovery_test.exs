@@ -17,7 +17,7 @@ defmodule SmolNet.TcpLossRecoveryTest do
 
   # A burst loss leaves the fast retransmission of its first segment answered
   # by a partial ACK. Without fast recovery (RFC 6582) the sender then waits
-  # out smoltcp's 1 s minimum retransmission timeout and resends every segment
+  # out its minimum retransmission timeout and resends every segment
   # after the hole; with it, the sender resends each lost segment exactly once.
   test "a burst of lost segments is resent segment by segment, not after a timeout" do
     {server, client, link} = lossy_stacks(every: 40, burst: 3, stream_bytes: @payload_bytes)

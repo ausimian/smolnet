@@ -37,6 +37,14 @@
   and with several streams less. A connection now starts from a window of
   two segments and grows it, so it takes a few more round trips to reach
   full speed on a clean path.
+- The minimum TCP retransmission timeout is now 200 ms, as on Linux,
+  instead of 1 s. This deliberately departs from RFC 6298, which says the
+  minimum SHOULD be 1 s: on paths with round trips of tens of milliseconds,
+  that floor cost a whole second, doubling from there, for every loss that
+  fast retransmit could not repair, such as a lost retransmission or the end
+  of a transfer. The timeout computed from measured round trips still
+  applies above the floor, and the first one, before any round trip is
+  measured, is still 1 s.
 
 ### Fixed
 

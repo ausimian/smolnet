@@ -60,7 +60,8 @@ SmolNet enabled no smoltcp congestion controller when this was written, so
 the RFC's congestion window inflation and deflation rules would have had no
 effect and were left out. It has since enabled CUBIC (see "Later
 configuration"), whose own recovery rules now apply alongside the patch.
-The 1 s minimum RTO is unchanged.
+The patch left the 1 s minimum RTO unchanged; #103 later lowered it to
+200 ms (see "Later patches").
 
 ## Verification
 
@@ -82,7 +83,7 @@ time, so a slow runner does not change its outcome.
 A multi-segment loss within one window is now repaired at one segment per
 round trip instead of costing a 1 s timeout per burst. Losses that leave no
 later segment to produce duplicate ACKs, such as the tail of a transfer, still
-wait for the 1 s minimum RTO. Many holes in one window over a long RTT still
+wait for the minimum RTO, 1 s when this was written and 200 ms since #103. Many holes in one window over a long RTT still
 recover more slowly than SACK-based recovery would, since smoltcp's sender
 does not use SACK.
 
@@ -123,6 +124,19 @@ Hex packages are unaffected: they ship only precompiled NIFs and omit
   one. Without SACK, the window rule still applies. Two unit tests cover
   duplicates with a growing window and a window update that repeats an
   earlier SACK block.
+- #103: the minimum RTO is 200 ms, Linux's `TCP_RTO_MIN`, instead of the
+  1 s that RFC 6298 (2.4) says it SHOULD be. This departs from the RFC on
+  purpose. The 1 s floor dates from coarse timers and long, variable round
+  trips; on the tens-of-milliseconds paths SmolNet mostly runs over, it
+  costs a whole second for every loss that fast retransmit cannot repair,
+  such as a lost retransmission or the last segments of a transfer, and the
+  backoff doubles from there. Under netem's Gilbert-Elliott burst loss it
+  was most of SmolNet's shortfall against Linux. The RTO computed from
+  SRTT and RTTVAR still applies above the floor, the initial RTO before any
+  sample is still 1 s, and a timeout still doubles it. A spurious timeout
+  costs a go-back-N resend and, with CUBIC, a window of one segment; Linux
+  runs with the same floor. `test_rtt_estimator_min_rto` covers the floor
+  and the backoff from it.
 
 ## Later configuration
 

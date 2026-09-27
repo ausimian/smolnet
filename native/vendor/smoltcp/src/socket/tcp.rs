@@ -152,7 +152,13 @@ const RTTE_K: u32 = 4;
 
 // RFC 6298 (2.4): Whenever RTO is computed, if it is less than 1 second, then the
 // RTO SHOULD be rounded up to 1 second.
-const RTTE_MIN_RTO: u32 = 1000;
+//
+// SmolNet departs from that SHOULD, as Linux does (TCP_RTO_MIN): a 1 s floor
+// costs a whole second for every loss fast retransmit cannot repair, such as a
+// lost retransmission or the tail of a transfer, on paths whose round trip is
+// tens of milliseconds. The computed RTO, SRTT + 4 * RTTVAR, still applies
+// above this floor, and the initial RTO before any sample is still 1 s.
+const RTTE_MIN_RTO: u32 = 200;
 
 // RFC 6298 (2.5) A maximum value MAY be placed on RTO provided it is at least 60
 // seconds
@@ -10019,6 +10025,23 @@ mod test {
             r.sample(2000);
             assert_eq!(r.retransmission_timeout(), Duration::from_millis(rto));
         }
+    }
+
+    #[test]
+    fn test_rtt_estimator_min_rto() {
+        let mut r = RttEstimator::default();
+        assert_eq!(r.retransmission_timeout(), Duration::from_millis(1000));
+
+        // Steady 10 ms samples converge on SRTT + 4 * RTTVAR well below 200 ms,
+        // so the floor holds the RTO there, and not at RFC 6298's 1 s.
+        for _ in 0..32 {
+            r.sample(10);
+        }
+        assert_eq!(r.retransmission_timeout(), Duration::from_millis(200));
+
+        // A timeout still backs off from the floor.
+        r.on_rto();
+        assert_eq!(r.retransmission_timeout(), Duration::from_millis(400));
     }
 
     #[test]
