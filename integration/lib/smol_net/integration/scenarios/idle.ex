@@ -101,6 +101,9 @@ defmodule SmolNet.Integration.Scenarios.Idle do
   # Closing a connection to a vanished peer takes SmolNet's 30 s close
   # deadline, and then TIME-WAIT.
   @release_timeout 90_000
+  # Time left at the end for every socket to close: SmolNet's 30 s close
+  # deadline for a vanished peer, then TIME-WAIT.
+  @close_reserve 45_000
 
   @sampled [
     :poll_calls,
@@ -555,7 +558,7 @@ defmodule SmolNet.Integration.Scenarios.Idle do
 
   defp behave(%{spec: %{role: :stall}} = state) do
     cycle(state, &idle/1, fn state ->
-      pause = log_uniform(state.settings.outage)
+      pause = min(log_uniform(state.settings.outage), pause_room(state))
       exchange(state, :crypto.strong_rand_bytes(state.settings.burst_bytes), pause)
     end)
   end
@@ -591,6 +594,13 @@ defmodule SmolNet.Integration.Scenarios.Idle do
   defp collect_and_wait(wait) do
     :erlang.garbage_collect()
     wait.()
+  end
+
+  # The longest a stalled exchange may pause and still finish, at its
+  # deadline, in time for the sockets to close before the run's duration
+  # ends: the runner allows the workload only a short overrun.
+  defp pause_room(state) do
+    max(0, state.timeline.ends_at - @close_reserve - state.settings.op_timeout - now())
   end
 
   defp idle(state), do: log_uniform(state.settings.idle)
@@ -946,7 +956,12 @@ defmodule SmolNet.Integration.Scenarios.Idle do
     work_until =
       max(active_start, context.ends_at - min(@final_lead, div(context.duration_ms, 4)))
 
-    timeline = %{active_start: active_start, work_until: work_until, blackhole: blackhole}
+    timeline = %{
+      active_start: active_start,
+      work_until: work_until,
+      ends_at: context.ends_at,
+      blackhole: blackhole
+    }
 
     before = snapshot(context)
 
