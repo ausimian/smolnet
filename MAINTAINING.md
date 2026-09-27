@@ -91,8 +91,10 @@ retransmission pending when the device refuses it (#80), and Minshall's
 variant of Nagle's algorithm, which sends the partial tail of a write longer
 than an MSS without waiting for an ACK (#102), RFC 6675's duplicate ACK,
 which counts an ACK that SACKs new data whatever its window (#103), a
-200 ms minimum RTO in place of RFC 6298's 1 s (#103), and CUBIC's RFC 6928
-initial window of up to ten segments (#123). The commit that added
+200 ms minimum RTO in place of RFC 6298's 1 s (#103), CUBIC's RFC 6928
+initial window of up to ten segments (#123), and RFC 6675's SACK-based loss
+recovery, which resends several lost segments per round trip (#119). The
+commit that added
 the directory holds the crates.io package unmodified, so
 `git log -p -- native/vendor/smoltcp` after that commit is the complete set of
 SmolNet changes. Keep any further patch small, covered by tests in the
