@@ -25,7 +25,6 @@ defmodule SmolNet.Integration.TlsTest do
     assert verdict.counters.rounds == 1
     assert verdict.counters.transfers == 2 * 2 * (1 + 1 + 2 + 2)
     assert verdict.counters.bytes == 2 * 2 * 2 * (100_000 + 50_000)
-    assert is_list(verdict.results.ssl_cb_info_gaps)
 
     rows = verdict.results.throughput
     assert length(rows) == 2 * 2 * 4
@@ -48,7 +47,6 @@ defmodule SmolNet.Integration.TlsTest do
     assert {:pass, verdict} = run(argv ++ ~w(--down-bytes 1000 --up-bytes 1000))
 
     assert verdict.counters.transfers == 2 * 2
-    refute Map.has_key?(verdict.results, :ssl_cb_info_gaps)
 
     assert verdict.results.throughput |> Enum.map(&{&1.phase, &1.client}) |> Enum.sort() == [
              {"down x1", "kernel"},

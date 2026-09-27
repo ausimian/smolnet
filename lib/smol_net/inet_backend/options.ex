@@ -237,6 +237,11 @@ defmodule SmolNet.InetBackend.Options do
     {:ok, %{options | packet_size: size}}
   end
 
+  # `:ssl` sets `{:header, 0}`, the default, on every transport it is given.
+  defp put_option(options, {:header, 0}, context)
+       when context in [:connect, :listen, :runtime],
+       do: {:ok, options}
+
   defp put_option(options, {:buffer, size}, _context)
        when is_integer(size) and size in 1..@max_buffer do
     {:ok, %{options | buffer: size}}
@@ -415,6 +420,7 @@ defmodule SmolNet.InetBackend.Options do
   defp option_value(options, :mode), do: {:ok, {:mode, options.mode}}
   defp option_value(options, :packet), do: {:ok, {:packet, options.packet}}
   defp option_value(options, :packet_size), do: {:ok, {:packet_size, options.packet_size}}
+  defp option_value(_options, :header), do: {:ok, {:header, 0}}
   defp option_value(options, :buffer), do: {:ok, {:buffer, options.buffer}}
   defp option_value(options, :recbuf), do: {:ok, {:recbuf, options.recbuf}}
   defp option_value(options, :sndbuf), do: {:ok, {:sndbuf, options.sndbuf}}
