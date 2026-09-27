@@ -21,6 +21,9 @@ defmodule SmolNet.NifBudget do
   # Thirty-two TCP frames of this size are the largest output that fits one
   # call's byte budget, so a maximum send can hand off both output maxima.
   @maximum_send_mtu div(@maximum_limits.bytes_copied, @maximum_limits.output_packets)
+  # Maximum sends that open a new connection's congestion window; see
+  # open_congestion_window/3.
+  @warmup_sends 8
   # Sockets with the largest TCP buffers that fit the per-stack buffer cap.
   @maximum_tcp_buffer_sockets 64
   @max_wall_nanoseconds 1_000_000
@@ -593,7 +596,37 @@ defmodule SmolNet.NifBudget do
     end
 
     {:ok, %{result: :ok}} = Native.tcp_connect(sender, identity, endpoint, self(), make_ref(), 0)
+    open_congestion_window(sender, receiver, identity)
     {sender, identity}
+  end
+
+  # CUBIC starts a connection from a window of about one of these segments,
+  # so a maximum send on a fresh connection hands off only what that window
+  # allows. Sending a few maximum sends first, and delivering them one packet
+  # at a time so that the receiver ACKs every second segment as it does on a
+  # real link, grows the window well past one output burst. The receiver's
+  # buffer still has room for the measured send.
+  defp open_congestion_window(sender, receiver, identity) do
+    data = :binary.copy(<<0>>, @maximum_limits.bytes_copied)
+
+    Enum.each(1..@warmup_sends, fn _send ->
+      {:ok, %{result: :ok} = envelope} =
+        Native.tcp_send(sender, identity, data, self(), make_ref(), 0)
+
+      exchange_singly(sender, receiver, envelope.output)
+    end)
+  end
+
+  defp exchange_singly(_from, _to, []), do: :ok
+
+  defp exchange_singly(from, to, packets) do
+    replies =
+      Enum.flat_map(packets, fn packet ->
+        {:ok, envelope} = Native.stack_ingress(to, packet, 0)
+        envelope.output
+      end)
+
+    exchange_singly(to, from, replies)
   end
 
   defp tcp_send_config(suffix) do

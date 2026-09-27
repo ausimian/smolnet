@@ -28,6 +28,16 @@
   throughput is reported next to the kernel's on the same path, in the notes
   and as a result in `verdict.json`.
 
+### Changed
+
+- TCP sockets now run CUBIC congestion control, as Linux's do by default.
+  Before, a SmolNet sender put its whole send buffer into the network every
+  round trip, however narrow the path, and lost much of it wherever a queue
+  was short: through a 20 Mbit/s bottleneck it sent at about 1.5 Mbit/s,
+  and with several streams less. A connection now starts from a window of
+  two segments and grows it, so it takes a few more round trips to reach
+  full speed on a clean path.
+
 ### Fixed
 
 - A TCP write longer than one segment no longer holds its last, partial

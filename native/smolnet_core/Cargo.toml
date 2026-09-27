@@ -21,5 +21,8 @@ smoltcp = { path = "../vendor/smoltcp", version = "=0.14.0", default-features = 
   "async",
   "iface-max-addr-count-8",
   "socket-tcp",
+  # Every TCP socket runs CUBIC congestion control (RFC 9438), as Linux's
+  # do by default; see docs/adr/0013.
+  "socket-tcp-cubic",
   "socket-udp",
 ] }

@@ -56,8 +56,10 @@ The patch, in `src/socket/tcp.rs`, implements RFC 6582's partial-ACK rule:
 - Duplicate ACKs during recovery do not start another fast retransmission, and
   a retransmission timeout abandons recovery in favour of its go-back-N resend.
 
-SmolNet enables no smoltcp congestion controller, so the RFC's congestion
-window inflation and deflation rules would have no effect and are left out.
+SmolNet enabled no smoltcp congestion controller when this was written, so
+the RFC's congestion window inflation and deflation rules would have had no
+effect and were left out. It has since enabled CUBIC (see "Later
+configuration"), whose own recovery rules now apply alongside the patch.
 The 1 s minimum RTO is unchanged.
 
 ## Verification
@@ -121,3 +123,20 @@ Hex packages are unaffected: they ship only precompiled NIFs and omit
   one. Without SACK, the window rule still applies. Two unit tests cover
   duplicates with a growing window and a window update that repeats an
   earlier SACK block.
+
+## Later configuration
+
+Changes to which of the vendored crate's features SmolNet enables, rather
+than to its code:
+
+- #103: `socket-tcp-cubic` is enabled, so every TCP socket runs CUBIC
+  congestion control (RFC 9438), as Linux does by default. Before, no
+  controller ran: a sender put its whole send buffer into the network each
+  round trip, however narrow the path. Through a 20 Mbit/s bottleneck with a
+  50-packet queue, that lost about half of every window, and SmolNet sent
+  at 1.5 Mbit/s against the kernel's 19. The cost is slow start from an
+  initial window of two segments, which takes a few round trips longer to
+  fill a clean path than Linux's ten. smoltcp's CUBIC ends its fast recovery
+  on the first ACK of new data, a partial ACK included, and deflates the
+  window to `ssthresh` there, while the patch's `recover` keeps
+  retransmitting the remaining holes.
