@@ -141,13 +141,22 @@ work-budget telemetry.
 The API is intentionally smaller than the host socket API. TCP supports raw,
 line, and 1/2/4-byte length-prefixed packet modes. UDP preserves datagram
 boundaries. Ancillary data, multicast, broadcast, OS file descriptors,
-IPv4-mapped IPv6 addresses, and fragmented IPv4 ingress are not supported.
+IPv4-mapped IPv6 addresses, and fragmented IPv4 or IPv6 ingress are not
+supported.
+
+SmolNet does no path MTU discovery. It never sends a packet larger than
+`:mtu`, but it ignores ICMP errors reporting a narrower hop, so a TCP send
+across one stalls. Set `:mtu` to the narrowest MTU on the path, or clamp
+the MSS on the router at the narrow link; see [Path MTU](path_mtu.md).
 
 ## Troubleshooting
 
 - If ingress fails, supply a complete IPv4 or IPv6 packet within the configured
   MTU, or a list within the stack's `input_packets` and `bytes_copied` limits.
   Do not include Ethernet headers.
+- If connections open and small exchanges work, but larger transfers hang
+  with no error, the path is probably narrower than `:mtu`; see
+  [Path MTU](path_mtu.md).
 - If an operation times out, confirm that the link is forwarding outbound
   packets and returning peer traffic. SmolNet drives protocol timers, but it
   cannot move packets across the external transport.

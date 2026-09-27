@@ -99,7 +99,8 @@ defmodule SmolNet.MixProject do
     guides = [
       "gen_tcp.md",
       "gen_udp.md",
-      "socket_api.md"
+      "socket_api.md",
+      "path_mtu.md"
     ]
 
     [
@@ -123,6 +124,7 @@ defmodule SmolNet.MixProject do
         "gen_tcp.md",
         "gen_udp.md",
         "socket_api.md",
+        "path_mtu.md",
         ".formatter.exs",
         "mix.exs",
         "README.md",
