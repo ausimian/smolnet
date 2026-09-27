@@ -46,13 +46,19 @@ if [[ -n $netem ]]; then argv+=(--netem "$netem"); fi
 argv+=("${extra[@]}" --out "$out")
 command="mix run ${argv[*]}"
 
+# The pmtu scenario builds its own routed path, so it runs in a network
+# namespace of its own, with a device of its own there, and leaves the
+# host's alone.
+isolate=()
+if [[ $scenario == pmtu ]]; then isolate=(integration/pmtu-topology.sh isolate); fi
+
 # soak SECONDS ARG...: runs `mix run ARG...` as root, as ci.yml's smoke job
 # does, killed if it outlasts SECONDS.
 soak() {
   local seconds=$1
   shift
   sudo -E env "PATH=$PATH" "HOME=$HOME" MIX_ENV=prod \
-    timeout --kill-after=60 "$seconds" mix run "$@"
+    timeout --kill-after=60 "$seconds" "${isolate[@]}" mix run "$@"
 }
 
 echo "$command"

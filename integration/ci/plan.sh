@@ -151,6 +151,8 @@ plan() {
       run smoke-netem smoke 1m delay both
       run tls-local tls 2m '' both --target local --round-pause 10000
       run tls-internet tls 1m '' both
+      # The whole matrix, which ends on its own in a few minutes.
+      run pmtu pmtu 15m '' both
       ;;
     *) die "no runs are planned for the event '${EVENT_NAME:-}'" ;;
   esac

@@ -31,7 +31,8 @@ defmodule SmolNet.Integration.Soak do
       values arrive in the context's `:extra`.
     * `:counters` - names of `count/3` counters to add to `metrics.csv`.
     * `:stack` - extra `SmolNet.start_stack/1` options, over
-      `SmolNet.Integration.Network.stack_options/0`.
+      `SmolNet.Integration.Network.stack_options/0`, or a function of the
+      script's switch values (the context's `:extra`) that returns them.
     * `:trend` - overrides of `SmolNet.Integration.Soak.Metrics.trend_limits/0`:
       `column: false` stops checking a column, and `column: [floor: f, ratio: r]`
       changes its limit.
@@ -395,7 +396,13 @@ defmodule SmolNet.Integration.Soak do
   end
 
   defp start_network(context, options, config) do
-    stack_options = [egress_credit: options.egress_credit] ++ Keyword.get(config, :stack, [])
+    stack_options =
+      case Keyword.get(config, :stack, []) do
+        stack when is_function(stack, 1) -> stack.(options.extra)
+        stack -> stack
+      end
+
+    stack_options = [egress_credit: options.egress_credit] ++ stack_options
 
     case Network.start(context.mode, context.device, stack_options) do
       {:ok, %{stack: nil}} ->
