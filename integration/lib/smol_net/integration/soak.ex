@@ -57,8 +57,9 @@ defmodule SmolNet.Integration.Soak do
   exceeded its `within/4` deadline, the workload called `fail/4` or
   crashed, the stack or link stopped, or a metric rose steadily after
   warm-up. It is an **error** when the environment could not be set up (the
-  device is missing, say), which is not a finding about SmolNet. `main/3`
-  exits 0, 1 or 2 respectively.
+  device is missing, say), or the workload found it unfit and called
+  `abandon/2`, which is not a finding about SmolNet. `main/3` exits 0, 1 or
+  2 respectively.
 
   A workload may also `record/3` results, measurements that are not
   judged, for the verdict.
@@ -138,8 +139,24 @@ defmodule SmolNet.Integration.Soak do
   @doc "Returns whether the run is still going: its time is not up and nothing has failed."
   @spec running?(Context.t()) :: boolean()
   def running?(context) do
-    not failed?(context) and System.monotonic_time(:millisecond) < context.ends_at
+    not failed?(context) and not abandoned?(context) and
+      System.monotonic_time(:millisecond) < context.ends_at
   end
+
+  @doc """
+  Ends the run as an environment error rather than a failure: `reason` says
+  what about this host stops the workload, such as an internet target it
+  cannot reach, which is not a finding about SmolNet. The workload should
+  return after calling it; the verdict is `:error`, unless something failed.
+  """
+  @spec abandon(Context.t(), String.t()) :: :ok
+  def abandon(context, reason) do
+    log(context, "ABANDONED: #{reason}")
+    :ets.insert_new(context.table, {:abandoned, reason})
+    :ok
+  end
+
+  defp abandoned?(context), do: :ets.member(context.table, :abandoned)
 
   @doc "Returns whether anything has failed yet."
   @spec failed?(Context.t()) :: boolean()
@@ -440,7 +457,7 @@ defmodule SmolNet.Integration.Soak do
     run_workload(context, workload)
     samples = Metrics.stop(metrics)
 
-    unless failed?(context) do
+    unless failed?(context) or abandoned?(context) do
       judge_trends(context, samples, options, config)
     end
   end
@@ -519,10 +536,17 @@ defmodule SmolNet.Integration.Soak do
   defp finish(context, setup, options) do
     {failures, failure_count} = Server.failures(context.server)
 
+    abandoned =
+      case :ets.lookup(context.table, :abandoned) do
+        [{:abandoned, reason}] -> reason
+        [] -> nil
+      end
+
     outcome =
       cond do
         setup != :ok -> :error
         failure_count > 0 -> :fail
+        abandoned != nil -> :error
         true -> :pass
       end
 
@@ -536,7 +560,7 @@ defmodule SmolNet.Integration.Soak do
       netem: options.netem,
       duration_s: options.duration_ms / 1_000,
       elapsed_s: (System.monotonic_time(:millisecond) - context.started_at) / 1_000,
-      error: setup_error(setup),
+      error: setup_error(setup) || abandoned,
       failure_count: failure_count,
       failures: failures,
       counters: counters(context.table),
@@ -579,7 +603,7 @@ defmodule SmolNet.Integration.Soak do
 
     details =
       Enum.map(verdict.failures, &"  #{&1.kind}: #{&1.summary} (#{&1.file})") ++
-        if(verdict.error, do: ["  setup: #{verdict.error}"], else: [])
+        if(verdict.error, do: ["  error: #{verdict.error}"], else: [])
 
     log(context, Enum.join([headline | details], "\n"))
   end

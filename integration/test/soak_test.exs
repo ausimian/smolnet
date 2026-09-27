@@ -122,6 +122,22 @@ defmodule SmolNet.Integration.SoakTest do
     assert dir |> Path.join("metrics.csv") |> File.read!() =~ ~r/,widgets\n/
   end
 
+  test "a workload that abandons the run makes it an error, not a failure", %{tmp_dir: dir} do
+    parent = self()
+
+    workload = fn context ->
+      Soak.abandon(context, "no route to the target")
+      send(parent, {:running, Soak.running?(context)})
+    end
+
+    assert {:error, verdict} =
+             run(~w(--baseline --duration 1h --out #{dir}), [name: "abandon"], workload)
+
+    assert_received {:running, false}
+    assert verdict.error == "no route to the target"
+    assert verdict.failure_count == 0
+  end
+
   test "a workload's results reach the verdict, the last of each name", %{tmp_dir: dir} do
     workload = fn context ->
       Soak.record(context, :speed, %{mbit_s: 1.5})
