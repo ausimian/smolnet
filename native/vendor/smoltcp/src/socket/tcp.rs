@@ -526,6 +526,9 @@ pub struct Socket<'a> {
     /// RFC 6582 `recover`: the highest sequence number sent when fast recovery
     /// began, or `None` outside fast recovery.
     recover: Option<TcpSeqNumber>,
+    /// The highest right edge of a SACK block the remote has reported above
+    /// its cumulative ACK, or `None` once that ACK has passed it.
+    remote_sack_high: Option<TcpSeqNumber>,
 
     /// Duration for Delayed ACK. If None no ACKs will be delayed.
     ack_delay: Option<Duration>,
@@ -622,6 +625,7 @@ impl<'a> Socket<'a> {
             local_rx_dup_acks: 0,
             pending_fast_retransmit: false,
             recover: None,
+            remote_sack_high: None,
             ack_delay: Some(ACK_DELAY_DEFAULT),
             ack_delay_timer: AckDelayTimer::Idle,
             challenge_ack_timer: Instant::from_secs(0),
@@ -934,6 +938,7 @@ impl<'a> Socket<'a> {
         self.remote_mss = DEFAULT_MSS;
         self.remote_last_ts = None;
         self.recover = None;
+        self.remote_sack_high = None;
         self.nagle_small_segment_end = None;
         self.ack_delay_timer = AckDelayTimer::Idle;
         self.challenge_ack_timer = Instant::from_secs(0);
@@ -1407,6 +1412,33 @@ impl<'a> Socket<'a> {
     /// Number of octets transmitted but not yet ACKed.
     fn flight_size(&self) -> usize {
         self.remote_last_seq - self.local_seq_no
+    }
+
+    /// Records the SACK blocks of an incoming ACK, and returns whether any of
+    /// them reports data above `ack_number` that no earlier ACK reported. A
+    /// block must end within what has been sent; D-SACK blocks, at or below
+    /// the ACK, never count.
+    fn sacks_new_data(&mut self, repr: &TcpRepr, ack_number: TcpSeqNumber) -> bool {
+        if self.remote_sack_high.is_some_and(|high| high <= ack_number) {
+            self.remote_sack_high = None;
+        }
+
+        if !self.remote_has_sack {
+            return false;
+        }
+
+        let mut new_data = false;
+        for &(_left, right) in repr.sack_ranges.iter().flatten() {
+            let right = TcpSeqNumber(right as i32);
+            if right <= ack_number || right > self.remote_last_seq {
+                continue;
+            }
+            if self.remote_sack_high.is_none_or(|high| right > high) {
+                self.remote_sack_high = Some(right);
+                new_data = true;
+            }
+        }
+        new_data
     }
 
     fn cwnd_remaining(&self) -> usize {
@@ -2103,6 +2135,14 @@ impl<'a> Socket<'a> {
             // TODO: When flow control is implemented,
             // refractor the following block within that implementation
 
+            // RFC 6675 (2): an ACK whose SACK blocks report data above the
+            // cumulative ACK that no earlier ACK reported is a duplicate ACK,
+            // whatever window it carries. Linux grows its advertised window on
+            // nearly every ACK while its receive buffer autotunes, so without
+            // this none of its duplicate ACKs would count, and every loss would
+            // wait for the retransmission timer.
+            let sacks_new_data = self.sacks_new_data(repr, ack_number);
+
             match self.local_rx_last_ack {
                 // Duplicate ACK if payload empty and ACK doesn't move send window ->
                 // Increment duplicate ACK count, notify congestion controller and
@@ -2111,7 +2151,7 @@ impl<'a> Socket<'a> {
                     if repr.payload.is_empty()
                         && last_rx_ack == ack_number
                         && ack_number < self.remote_last_seq
-                        && !is_window_update =>
+                        && (!is_window_update || sacks_new_data) =>
                 {
                     // Increment duplicate ACK count
                     self.local_rx_dup_acks = self.local_rx_dup_acks.saturating_add(1);
@@ -7415,6 +7455,69 @@ mod test {
             s.local_rx_dup_acks, 0,
             "duplicate ACK counter is not reset when receiving a window update"
         );
+    }
+
+    // An ACK carrying SACK blocks, as `ack_repr` does, with the given window
+    // and blocks given as offsets from the first octet sent.
+    fn sack_repr(ack: usize, window_len: u16, blocks: &[(usize, usize)]) -> TcpRepr<'static> {
+        let mut sack_ranges = [None; 3];
+        for (range, &(left, right)) in sack_ranges.iter_mut().zip(blocks) {
+            *range = Some((
+                (LOCAL_SEQ + 1 + left).0 as u32,
+                (LOCAL_SEQ + 1 + right).0 as u32,
+            ));
+        }
+        TcpRepr {
+            window_len,
+            sack_ranges,
+            ..ack_repr(ack)
+        }
+    }
+
+    // Sends five 3-octet segments to a SACK-capable peer. The first is lost.
+    fn socket_sack_first_segment_lost() -> TestSocket {
+        let mut s = socket_established();
+        s.remote_has_sack = true;
+        s.remote_mss = 3;
+        send!(s, time 0, ack_repr(0));
+
+        s.send_slice(b"aaaBBBcccDDDeee").unwrap();
+        for (i, payload) in [b"aaa", b"BBB", b"ccc", b"DDD", b"eee"].iter().enumerate() {
+            recv!(s, time 1000, Ok(data_repr(3 * i, &payload[..])));
+        }
+        s
+    }
+
+    #[test]
+    fn test_fast_retransmit_sack_duplicates_with_growing_window() {
+        let mut s = socket_sack_first_segment_lost();
+
+        // A Linux receiver grows its window with each segment, so each of its
+        // duplicate ACKs is also a window update. Their SACK blocks report new
+        // data each time, which makes them duplicates all the same.
+        send!(s, time 1050, sack_repr(0, 300, &[(3, 6)]));
+        send!(s, time 1051, sack_repr(0, 310, &[(3, 9)]));
+        send!(s, time 1052, sack_repr(0, 320, &[(3, 12)]));
+        assert_eq!(s.local_rx_dup_acks, 3);
+        recv!(s, time 1053, Ok(data_repr(0, b"aaa")));
+    }
+
+    #[test]
+    fn test_fast_retransmit_sack_window_update_without_new_data() {
+        let mut s = socket_sack_first_segment_lost();
+
+        send!(s, time 1050, sack_repr(0, 300, &[(3, 6)]));
+        assert_eq!(s.local_rx_dup_acks, 1);
+
+        // The same SACK block with a new window reports nothing new, so it is a
+        // window update, as it would be without SACK.
+        send!(s, time 1051, sack_repr(0, 310, &[(3, 6)]));
+        assert_eq!(s.local_rx_dup_acks, 0);
+
+        // A D-SACK block, below the ACK, reports nothing above it either.
+        send!(s, time 1052, sack_repr(0, 320, &[(0, 0)]));
+        assert_eq!(s.local_rx_dup_acks, 0);
+        recv_nothing!(s, time 1053);
     }
 
     #[test]

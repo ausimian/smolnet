@@ -44,3 +44,9 @@
   could get no `tcp_error`, `tcp_closed` or `udp_error` message at all. This
   covers pending receives, sends, accepts and connects. Calls pending when
   `SmolNet.stop_stack/1` stops a stack still fail with `:closed`.
+- A TCP sender now fast-retransmits a lost segment to a Linux peer instead
+  of waiting at least a second for its retransmission timer. Linux grows
+  its advertised window on nearly every ACK early in a connection, and
+  SmolNet counted an ACK as a duplicate only if its window was unchanged,
+  so none of Linux's duplicate ACKs counted. An ACK whose SACK blocks
+  report new data is now a duplicate whatever its window.
