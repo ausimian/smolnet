@@ -38,3 +38,9 @@
   on every TLS 1.3 handshake whose server asks for a post-quantum key share,
   as `speed.cloudflare.com` does: `:ssl`'s second ClientHello is longer than
   a segment. Those handshakes now take as long as over the kernel's stack.
+- A `:gen_tcp` or `:gen_udp` call pending on a SmolNet socket whose stack
+  fails now always returns `{:error, :enetdown}`. Depending on scheduling,
+  it could return `{:error, :closed}` instead, and an active socket's owner
+  could get no `tcp_error`, `tcp_closed` or `udp_error` message at all. This
+  covers pending receives, sends, accepts and connects. Calls pending when
+  `SmolNet.stop_stack/1` stops a stack still fail with `:closed`.

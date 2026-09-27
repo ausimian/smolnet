@@ -258,3 +258,8 @@ are not supported.
 Network and lifecycle errors use the usual OTP-style atoms, including
 `:econnrefused`, `:econnreset`, `:etimedout`, `:enetunreach`, `:eaddrinuse`,
 `:closed`, and `:enetdown`.
+
+If a socket's stack fails, a call pending on the socket returns
+`{:error, :enetdown}`, and an active socket's owner receives
+`{:tcp_error, socket, :enetdown}` and then `{:tcp_closed, socket}`. Calls
+pending when `SmolNet.stop_stack/1` stops the stack fail with `:closed`.

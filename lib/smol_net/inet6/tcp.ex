@@ -664,11 +664,22 @@ defmodule SmolNet.Inet6.Tcp do
 
   def handle_event(:info, _message, _state_name, _data), do: :keep_state_and_data
 
+  # A stack's death stops its bundle, whose shutdown reaches the adapter as an
+  # exit from its supervisor, and `:gen_statem` handles that exit by calling
+  # `terminate/3` directly. That exit and the stack's DOWN come from different
+  # processes, so either can arrive first. If the stack is gone, the shutdown
+  # fails what is pending with `:enetdown`, as the DOWN would have. A shutdown
+  # while the stack still runs, such as `SmolNet.stop_stack/1`, leaves them to
+  # see `:closed`.
   @impl true
-  def terminate(_reason, _state_name, data) do
+  def terminate(reason, _state_name, data) do
+    data = if stack_lost?(reason, data), do: fail_all(data, :enetdown), else: data
     _result = close_low_socket(data)
     :ok
   end
+
+  defp stack_lost?(:shutdown, data), do: not Process.alive?(data.stack_pid)
+  defp stack_lost?(_reason, _data), do: false
 
   defp getstat_reply(names) do
     supported = [
