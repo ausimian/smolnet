@@ -35,6 +35,29 @@
   body's length and SHA-256 is checked, any TLS alert fails the run, and
   throughput is reported next to the kernel's on the same path, in the notes
   and as a result in `verdict.json`.
+- A path MTU guide, `path_mtu.md`. It covers what SmolNet does when a hop
+  on the path is narrower than its `:mtu`, and how to configure a link so
+  that this does not happen. SmolNet does no path MTU discovery, so a TCP
+  send across such a hop stalls with no error, and UDP datagrams too large
+  for it are lost. Setting `:mtu` to the narrowest MTU on the path avoids
+  both. Where no `:mtu` fits, as on an IPv4 path below 1280, clamping the
+  MSS on the router at the narrow link fixes TCP, and UDP datagrams must
+  be kept within the path.
+- A path MTU integration script, run as
+  `integration/pmtu-topology.sh isolate mix run integration/pmtu.exs`. It
+  puts a hop with a smaller MTU between SmolNet and a Linux peer, in
+  network namespaces of its own, and needs no sudo where the host allows
+  unprivileged user namespaces. It sends TCP and UDP each way over IPv4
+  and IPv6, with and without the hop's ICMP errors and MSS clamping, and
+  reports each case as adapting, stalling or failing, next to what is
+  expected, with captures from both sides of the hop.
+- An idle-connection integration script, `sudo mix run integration/idle.exs`,
+  that holds up to 240 TCP and TLS connections open for the whole run, idle
+  for seconds to hours between echoes, trickling single bytes, bursting after
+  long idles and stalling on a closed receive window, while a share of them
+  lose their peer silently through nftables. It records how soon SmolNet
+  fails each connection to a vanished peer, or that it does not, and fails
+  the run if the stack polls while every connection is idle.
 
 ### Changed
 

@@ -9,8 +9,9 @@ name: Integration
 #
 #   schedule           nightly, 10 minutes each of smoke, TLS to a local
 #                      target and TLS to speed.cloudflare.com; weekly, 4 h
-#                      soaks of both TLS targets and 1 h of smoke. A hosted
-#                      job may take 6 h, so the long soak is 4 h, not 6 h.
+#                      soaks of both TLS targets and of idle connections,
+#                      and 1 h of smoke. A hosted job may take 6 h, so the
+#                      long soak is 4 h, not 6 h.
 #   workflow_dispatch  one run, from the inputs. It never files issues.
 #   pull_request       a minute or two of each kind, netem included, when
 #                      the harness or this workflow changes, so that a
@@ -32,7 +33,7 @@ on:
       scenario:
         description: The scenario, integration/<scenario>.exs
         type: choice
-        options: [tls, smoke]
+        options: [tls, smoke, pmtu, idle]
         default: tls
       duration:
         description: How long to run, such as 90s, 10m or 1h30m; at most 5h

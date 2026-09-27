@@ -43,6 +43,11 @@ defmodule SmolNet.Integration.Soak.Pcap do
   listening, or `{:error, output}` if it could not start.
 
   `:tcpdump` names the program to run, `tcpdump` on the path by default.
+  `:netns` runs it in that named network namespace (`ip netns exec`), and
+  `:snaplen` keeps that many bytes of each packet rather than all of it.
+  `immediate: true` has tcpdump take each packet as it arrives, rather
+  than in batches, so that a capture stopped straight after a short
+  exchange still holds it; it costs a wakeup per packet.
   """
   @spec start(String.t(), Path.t(), keyword()) :: {:ok, t()} | {:error, String.t()}
   def start(device, directory, options \\ []) do
@@ -54,8 +59,13 @@ defmodule SmolNet.Integration.Soak.Pcap do
         File.mkdir_p!(directory)
         {user, 0} = System.cmd("id", ["-un"])
 
+        snaplen = options |> Keyword.get(:snaplen, 0) |> Integer.to_string()
+        immediate = if Keyword.get(options, :immediate, false), do: ["--immediate-mode"], else: []
+
         arguments =
-          [tcpdump, "-i", device, "-n", "-s", "0", "-U", "-C", "100", "-W", "10"] ++
+          in_netns(Keyword.get(options, :netns)) ++
+            [tcpdump, "-i", device, "-n", "-s", snaplen, "-U", "-C", "100", "-W", "10"] ++
+            immediate ++
             ["-Z", String.trim(user), "-w", Path.join(directory, "#{device}.pcap")]
 
         port =
@@ -81,6 +91,9 @@ defmodule SmolNet.Integration.Soak.Pcap do
   catch
     :error, :badarg -> :ok
   end
+
+  defp in_netns(nil), do: []
+  defp in_netns(netns), do: [System.find_executable("ip") || "ip", "netns", "exec", netns]
 
   defp await_listening(pcap, output) do
     receive do

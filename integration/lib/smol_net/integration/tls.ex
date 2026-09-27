@@ -86,6 +86,32 @@ defmodule SmolNet.Integration.Tls do
       else: []
   end
 
+  @doc """
+  Returns TLS options for a local server and its clients, with a
+  certificate made for the purpose: `:server` holds the certificate and
+  key, and `:client` verifies the server against its root, without a host
+  name. Both are passive and binary.
+  """
+  @spec local_options() :: %{server: list(), client: list()}
+  def local_options do
+    key = [key: {:namedCurve, :secp256r1}, digest: :sha256]
+    chain = %{root: key, intermediates: [], peer: key}
+
+    %{server_config: server, client_config: client} =
+      :public_key.pkix_test_data(%{server_chain: chain, client_chain: chain})
+
+    %{
+      server: [cert: server[:cert], key: server[:key], active: false, mode: :binary],
+      client: [
+        verify: :verify_peer,
+        cacerts: client[:cacerts],
+        server_name_indication: :disable,
+        active: false,
+        mode: :binary
+      ]
+    }
+  end
+
   defp cb_info(:inet), do: {SmolNet.Inet.Tcp, :tcp, :tcp_closed, :tcp_error}
   defp cb_info(:inet6), do: {SmolNet.Inet6.Tcp, :tcp, :tcp_closed, :tcp_error}
 end
