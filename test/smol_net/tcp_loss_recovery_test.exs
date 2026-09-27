@@ -7,6 +7,7 @@ defmodule SmolNet.TcpLossRecoveryTest do
   @server {192, 0, 2, 1}
   @client {192, 0, 2, 2}
   @port 41_100
+  @payload_bytes 256 * 1024
 
   @wait_5s Timing.liveness(5_000)
 
@@ -19,7 +20,7 @@ defmodule SmolNet.TcpLossRecoveryTest do
   # out smoltcp's 1 s minimum retransmission timeout and resends every segment
   # after the hole; with it, the sender resends each lost segment exactly once.
   test "a burst of lost segments is resent segment by segment, not after a timeout" do
-    {server, client, link} = lossy_stacks(every: 40, burst: 3)
+    {server, client, link} = lossy_stacks(every: 40, burst: 3, stream_bytes: @payload_bytes)
 
     {:ok, listener} = SmolNet.open(:inet, :stream, :tcp, stack: server)
     :ok = SmolNet.bind(listener, endpoint(@server))
@@ -30,7 +31,7 @@ defmodule SmolNet.TcpLossRecoveryTest do
     :ok = SmolNet.connect(socket, endpoint(@server), @wait_5s)
     {:ok, child} = Task.await(accept, @wait_5s)
 
-    payload = :crypto.strong_rand_bytes(256 * 1024)
+    payload = :crypto.strong_rand_bytes(@payload_bytes)
     reader = Task.async(fn -> read_exactly(child, byte_size(payload), []) end)
     assert :ok = SmolNet.send(socket, payload, @wait_5s)
     assert Task.await(reader, @wait_5s) == payload
