@@ -46,6 +46,8 @@ defmodule SmolNet.Integration.Soak.OptionsTest do
                netem: nil,
                egress_credit: {64, 131_072},
                pcap: true,
+               keep_pcap: false,
+               pcap_snaplen: 0,
                metrics_interval_ms: 10_000,
                warmup_ms: 120_000,
                extra: %{size: 7}
@@ -96,6 +98,14 @@ defmodule SmolNet.Integration.Soak.OptionsTest do
                Options.parse(~w(--self-check), @config)
 
       assert self_check.out_dir =~ ~r/-self-check$/
+    end
+
+    test "keeps a passing run's capture, and trims its packets, on request" do
+      assert {:ok, %{pcap: true, keep_pcap: true, pcap_snaplen: 128}} =
+               Options.parse(~w(--keep-pcap --pcap-snaplen 128), @config)
+
+      assert {:error, message} = Options.parse(~w(--pcap-snaplen -1), @config)
+      assert message =~ "--pcap-snaplen must be 0 or more"
     end
 
     test "accepts unlimited egress credit" do
