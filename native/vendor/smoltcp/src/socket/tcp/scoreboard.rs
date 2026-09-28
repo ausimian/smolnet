@@ -128,6 +128,26 @@ impl Scoreboard {
         }
         None
     }
+
+    /// The lowest run of octets in `[from, to)` that no recorded range
+    /// covers, as `(start, end)`.
+    pub(super) fn unsacked_run(
+        &self,
+        from: TcpSeqNumber,
+        to: TcpSeqNumber,
+    ) -> Option<(TcpSeqNumber, TcpSeqNumber)> {
+        let mut start = from;
+        for &(l, r) in self.ranges() {
+            if start >= to || l >= to {
+                break;
+            }
+            if start < l {
+                return Some((start, l));
+            }
+            start = start.max(r);
+        }
+        (start < to).then_some((start, to))
+    }
 }
 
 #[cfg(test)]
@@ -246,5 +266,29 @@ mod test {
         assert_eq!(board.next_hole(seq(25)), Some((seq(25), seq(30))));
         assert_eq!(board.next_hole(seq(30)), None);
         assert_eq!(board.sacked_between(seq(15), seq(35)), 10);
+    }
+
+    #[test]
+    fn unsacked_run_finds_gaps_and_the_tail() {
+        let mut board = Scoreboard::new();
+        assert_eq!(board.unsacked_run(seq(0), seq(5)), Some((seq(0), seq(5))));
+        board.add(seq(10), seq(20));
+        board.add(seq(30), seq(40));
+        assert_eq!(board.unsacked_run(seq(0), seq(50)), Some((seq(0), seq(10))));
+        assert_eq!(
+            board.unsacked_run(seq(10), seq(50)),
+            Some((seq(20), seq(30)))
+        );
+        assert_eq!(
+            board.unsacked_run(seq(22), seq(25)),
+            Some((seq(22), seq(25)))
+        );
+        assert_eq!(
+            board.unsacked_run(seq(35), seq(50)),
+            Some((seq(40), seq(50)))
+        );
+        assert_eq!(board.unsacked_run(seq(12), seq(18)), None);
+        assert_eq!(board.unsacked_run(seq(30), seq(40)), None);
+        assert_eq!(board.unsacked_run(seq(5), seq(5)), None);
     }
 }
