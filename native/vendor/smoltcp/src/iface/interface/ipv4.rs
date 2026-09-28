@@ -324,6 +324,16 @@ impl InterfaceInner {
         ip_payload: &'frame [u8],
     ) -> Option<Packet<'frame>> {
         let icmp_packet = check!(Icmpv4Packet::new_checked(ip_payload));
+
+        // Handled here, since `Icmpv4Repr::parse` refuses the truncated
+        // packet these errors quote. ICMP sockets may still see it below.
+        #[cfg(feature = "socket-tcp")]
+        if icmp_packet.msg_type() == Icmpv4Message::DstUnreachable
+            && icmp_packet.msg_code() == u8::from(Icmpv4DstUnreachable::FragRequired)
+        {
+            self.process_icmpv4_frag_required(_sockets, ip_payload);
+        }
+
         let icmp_repr = check!(Icmpv4Repr::parse(&icmp_packet, &self.caps.checksum));
 
         #[cfg(feature = "socket-icmp")]
@@ -368,6 +378,50 @@ impl InterfaceInner {
             // By doing nothing, this arm handles the case when auto echo replies are disabled.
             _ => None,
         }
+    }
+
+    /// Handles an ICMP "Fragmentation Needed" error, `icmp`, about a TCP
+    /// segment (RFC 1191). A router that predates RFC 1191 leaves the
+    /// next-hop MTU zero; the MTU is then the largest plateau of RFC 1191 7
+    /// below the length of the packet it refused.
+    #[cfg(feature = "socket-tcp")]
+    fn process_icmpv4_frag_required(&mut self, sockets: &mut SocketSet, icmp: &[u8]) {
+        let next_hop_mtu = usize::from(u16::from_be_bytes([icmp[6], icmp[7]]));
+        let quoted = &icmp[8..];
+        let packet = Ipv4Packet::new_unchecked(quoted);
+        // Only an error about a TCP segment is counted and used.
+        if quoted.len() < IPV4_HEADER_LEN
+            || packet.version() != 4
+            || packet.next_header() != IpProtocol::Tcp
+        {
+            return;
+        }
+        if self.caps.checksum.icmpv4.rx() && !Icmpv4Packet::new_unchecked(icmp).verify_checksum() {
+            return self.reject_path_mtu_error();
+        }
+        let header_len = usize::from(packet.header_len());
+        if header_len < IPV4_HEADER_LEN || quoted.len() < header_len || packet.frag_offset() != 0 {
+            return self.reject_path_mtu_error();
+        }
+
+        let total_len = usize::from(packet.total_len());
+        let mtu = match next_hop_mtu {
+            0 => rfc1191_plateau(total_len),
+            mtu => mtu,
+        };
+        // The packet was too big for the hop, so the hop's MTU is below its
+        // length. An error that says otherwise is not about this packet.
+        if mtu >= total_len {
+            return self.reject_path_mtu_error();
+        }
+
+        self.process_tcp_path_mtu(
+            sockets,
+            packet.src_addr().into(),
+            packet.dst_addr().into(),
+            &quoted[header_len..],
+            mtu,
+        );
     }
 
     pub(super) fn icmpv4_reply<'frame, 'icmp: 'frame>(
@@ -480,4 +534,18 @@ impl InterfaceInner {
             frag.ipv4.frag_offset += payload_len as u16;
         })
     }
+}
+
+/// The MTU to assume for a "Fragmentation Needed" error without a next-hop
+/// MTU: the largest plateau of RFC 1191 7 below `total_len`, the length of
+/// the packet that was refused.
+#[cfg(feature = "socket-tcp")]
+fn rfc1191_plateau(total_len: usize) -> usize {
+    const PLATEAUS: [usize; 11] = [
+        65535, 32000, 17914, 8166, 4352, 2002, 1492, 1006, 508, 296, 68,
+    ];
+    PLATEAUS
+        .into_iter()
+        .find(|&plateau| plateau < total_len)
+        .unwrap_or(68)
 }

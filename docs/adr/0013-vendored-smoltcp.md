@@ -180,6 +180,55 @@ Hex packages are unaffected: they ship only precompiled NIFs and omit
   three holes resent at once, new data sent while `pipe` is below CUBIC's
   window, the #115 case, a partial ACK that must not resend, rule 3, a
   fast retransmission beside SACKed data, and the reset on a timeout.
+- #128: upstream dropped every ICMP error it had no ICMP socket for
+  (`_ => None` in `process_icmpv4` and `process_icmpv6`), and a
+  connection's segment size was fixed at the handshake. With Don't
+  Fragment on every IPv4 packet, a hop narrower than the interface's MTU
+  refused every full-size segment, and the sender resent it forever. The
+  patch adds path MTU discovery for TCP (RFC 1191, RFC 8201):
+  - `process_icmpv4` handles "Fragmentation Needed" itself, before
+    `Icmpv4Repr::parse`, which refuses the truncated packet such an error
+    quotes (the quoted header's total length exceeds what is quoted). It
+    checks the ICMP checksum and the quoted header, and takes the next-hop
+    MTU, or for a zero one the RFC 1191 plateau below the quoted packet's
+    length. `process_icmpv6` gets an arm for "Packet Too Big". Errors about
+    anything but TCP are left as before, as are ICMP sockets.
+  - Both discard an error whose MTU is not below the quoted packet's
+    length, and pass the rest to `InterfaceInner::process_tcp_path_mtu`
+    (`src/iface/interface/tcp.rs`), which requires the quoted source to
+    be an interface address, reads the ports and sequence number from the
+    first eight octets of the quoted TCP header, and offers the error to
+    each TCP socket in turn.
+  - `tcp::Socket::process_path_mtu`, the hook, holds the state the
+    interface cannot reach. It ignores another connection's error. It
+    raises the MTU to the family's floor: 576 for IPv4, whose MSS is
+    TCP's default of 536 (RFC 1191 allows 68, but with Don't Fragment set
+    a narrower path is a black hole whatever the floor, and the floor
+    bounds what a forged error can do; Linux's `min_pmtu` is 552), and
+    1280 for IPv6 (RFC 8201 4). An MTU not below what the connection sends
+    changes nothing. A lower one must quote a sequence number in
+    `SND.UNA..SND.NXT` of a connection in a data-sending state (RFC 5927
+    4.1). The socket then keeps it as `path_mtu`, which `seq_to_transmit`
+    and `dispatch` take the smaller of with the interface's MTU. The SYN's
+    MSS still comes from the interface's MTU alone.
+  - A reduction resends from `SND.UNA` at once, as a timeout's go-back-N
+    does, since `dispatch` segments from the send buffer and so resends at
+    the new size. It clears SACK and fast recovery state and Nagle's
+    record of a small segment in flight, and discards the RTT sample, but
+    does not call the congestion controller's `on_rto`: the drop was not
+    congestion. The controller's `set_mss` gets the new MSS.
+  - `Interface::path_mtu_stats` counts the errors received about TCP,
+    those rejected, and the reductions, for SmolNet's `stack_info`.
+  - The path MTU is the connection's own and is forgotten with it:
+    smoltcp has no destination cache, so each new connection learns it
+    again from its first full-size flight. `SND.NXT` is `remote_last_seq`,
+    which a reduction or a timeout rewinds, so an error reporting a still
+    lower MTU for a segment of the old flight is out of the window and
+    ignored. If the path narrows further, the resend draws a fresh error.
+  - Eight interface tests, five for IPv4 and three for IPv6, and a socket
+    test cover the resend at the new size, errors quoting data not
+    in flight, never raising, both floors, the plateaus, and implausible or
+    corrupt errors. They fail without the patch, which dropped the errors.
 
 ## Later configuration
 

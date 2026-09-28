@@ -7,7 +7,7 @@ use rustler::{
     Atom, Binary, Decoder, Encoder, Env, LocalPid, NewBinary, NifMap, NifResult, NifUnitEnum,
     Reference, Resource, ResourceArc, Term,
 };
-use smoltcp::iface::{Config, Interface, PollResult, Route, SocketHandle, SocketSet};
+use smoltcp::iface::{Config, Interface, PathMtuStats, PollResult, Route, SocketHandle, SocketSet};
 use smoltcp::socket::tcp::{self, ConnectError, ListenError};
 use smoltcp::socket::udp::{self, BindError as UdpBindError, SendError as UdpSendError};
 use smoltcp::time::Duration;
@@ -386,7 +386,7 @@ impl NativeStack {
                 call_target_nanoseconds: CALL_TARGET.as_nanos() as u64,
                 work_budget_nanoseconds: WORK_BUDGET.as_nanos() as u64,
                 encoding_headroom_nanoseconds: ENCODING_HEADROOM.as_nanos() as u64,
-                counters: self.counters,
+                counters: self.counters.with_path_mtu(self.interface.path_mtu_stats()),
             },
             output: Vec::new(),
             poll_at: None,
@@ -4412,9 +4412,24 @@ pub struct Counters {
     deadline_yields: usize,
     timeslice_exhaustions: usize,
     max_native_work_nanoseconds: u64,
+    /// ICMP "Fragmentation Needed" and "Packet Too Big" errors about a TCP
+    /// segment, those ignored as invalid, and the connections whose segment
+    /// size they lowered (RFC 1191, RFC 8201).
+    icmp_too_big_received: u64,
+    icmp_too_big_rejected: u64,
+    path_mtu_reductions: u64,
 }
 
 impl Counters {
+    fn with_path_mtu(self, stats: PathMtuStats) -> Self {
+        Self {
+            icmp_too_big_received: stats.received,
+            icmp_too_big_rejected: stats.rejected,
+            path_mtu_reductions: stats.reductions,
+            ..self
+        }
+    }
+
     fn observe(&mut self, work: Work) {
         self.max_bytes_copied = self.max_bytes_copied.max(work.bytes_copied);
         self.max_input_packets = self.max_input_packets.max(work.input_packets);

@@ -436,6 +436,14 @@ impl InterfaceInner {
                 _ => None,
             },
 
+            // A Packet Too Big about a TCP segment lowers the path MTU of
+            // its connection (RFC 8201).
+            #[cfg(feature = "socket-tcp")]
+            Icmpv6Repr::PktTooBig { mtu, header, data } => {
+                self.process_icmpv6_pkt_too_big(_sockets, mtu, header, data);
+                None
+            }
+
             // Don't report an error if a packet with unknown type
             // has been handled by an ICMP socket
             #[cfg(feature = "socket-icmp")]
@@ -445,6 +453,37 @@ impl InterfaceInner {
             // By doing nothing, this arm handles the case when auto echo replies are disabled.
             _ => None,
         }
+    }
+
+    /// Handles an ICMPv6 "Packet Too Big" error that quotes `header` and
+    /// then `quoted`, if it is about a TCP segment (RFC 8201).
+    #[cfg(feature = "socket-tcp")]
+    fn process_icmpv6_pkt_too_big(
+        &mut self,
+        sockets: &mut SocketSet,
+        mtu: u32,
+        header: Ipv6Repr,
+        quoted: &[u8],
+    ) {
+        // smoltcp sends TCP without extension headers, so a segment of its
+        // own has TCP as the next header.
+        if header.next_header != IpProtocol::Tcp {
+            return;
+        }
+        // The packet was too big for the hop, so the hop's MTU is below its
+        // length. An error that says otherwise is not about this packet.
+        let mtu = usize::try_from(mtu).unwrap_or(usize::MAX);
+        if mtu >= IPV6_HEADER_LEN + header.payload_len {
+            return self.reject_path_mtu_error();
+        }
+
+        self.process_tcp_path_mtu(
+            sockets,
+            header.src_addr.into(),
+            header.dst_addr.into(),
+            quoted,
+            mtu,
+        );
     }
 
     #[cfg(any(feature = "medium-ethernet", feature = "medium-ieee802154"))]

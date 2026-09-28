@@ -29,7 +29,7 @@ defmodule SmolNet.Integration.PmtuTest do
     assert "inet-1000-udp-in-icmp-on-peer-df-off" in ids
   end
 
-  test "only a clamp saves SmolNet's own sends" do
+  test "SmolNet's own sends adapt to ICMP errors, and without them only to a clamp" do
     expect = fn overrides ->
       [:inet]
       |> then(&Pmtu.cases(1500, [1000], &1))
@@ -38,8 +38,8 @@ defmodule SmolNet.Integration.PmtuTest do
     end
 
     out = %{hop: 1000, transport: :tcp, direction: :out}
-    assert expect.(Map.merge(out, %{icmp: :on, clamp: :none})) == {:stalls, :no_pmtud}
-    assert expect.(Map.merge(out, %{icmp: :off, clamp: :none})) == {:stalls, :no_pmtud}
+    assert expect.(Map.merge(out, %{icmp: :on, clamp: :none})) == {:adapts, :pmtud}
+    assert expect.(Map.merge(out, %{icmp: :off, clamp: :none})) == {:stalls, :icmp_black_hole}
     assert expect.(Map.merge(out, %{icmp: :on, clamp: :rt})) == {:adapts, :clamped}
     assert expect.(Map.merge(out, %{icmp: :off, clamp: :fixed})) == {:adapts, :clamped}
 

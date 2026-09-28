@@ -1866,3 +1866,105 @@ fn test_solicited_node_multicast_autojoin(#[case] medium: Medium) {
     assert!(!iface.has_multicast_group(addr1.solicited_node()));
     assert!(!iface.has_multicast_group(addr2.solicited_node()));
 }
+
+/// What each path MTU test sends: three segments at an MTU of 1500.
+#[cfg(all(feature = "medium-ip", feature = "socket-tcp"))]
+const PMTU_DATA: usize = 4000;
+
+#[cfg(all(feature = "medium-ip", feature = "socket-tcp"))]
+fn pmtu_connection() -> PmtuConnection {
+    let local = Ipv6Address::new(0xfdbe, 0, 0, 0, 0, 0, 0, 1);
+    let remote = Ipv6Address::new(0xfdbe, 0, 0, 0, 0, 0, 0, 2);
+    let conn = PmtuConnection::new(local.into(), remote.into(), PMTU_DATA);
+    assert_eq!(conn.sent.len(), 3, "sends three full-size segments");
+    conn
+}
+
+/// An ICMPv6 "Packet Too Big" from a router to `conn`, that reports `mtu`
+/// and quotes as much of `packet` as fits in the IPv6 minimum MTU.
+#[cfg(all(feature = "medium-ip", feature = "socket-tcp"))]
+fn packet_too_big(conn: &PmtuConnection, packet: &[u8], mtu: u32) -> Vec<u8> {
+    let quoted = &packet[..packet.len().min(IPV6_MIN_MTU - 48)];
+    let mut icmp = vec![0u8; 8 + quoted.len()];
+    icmp[0] = 2; // Packet Too Big
+    icmp[4..8].copy_from_slice(&mtu.to_be_bytes());
+    icmp[8..].copy_from_slice(quoted);
+
+    let router = Ipv6Address::new(0xfdbe, 0, 0, 0, 0, 0, 0, 0xfe);
+    let IpAddress::Ipv6(local) = conn.local else {
+        unreachable!()
+    };
+    Icmpv6Packet::new_unchecked(&mut icmp[..]).fill_checksum(&router, &local);
+    let ip_repr = Ipv6Repr {
+        src_addr: router,
+        dst_addr: local,
+        next_header: IpProtocol::Icmpv6,
+        payload_len: icmp.len(),
+        hop_limit: 64,
+    };
+    let mut bytes = vec![0; ip_repr.buffer_len() + icmp.len()];
+    ip_repr.emit(&mut Ipv6Packet::new_unchecked(&mut bytes[..]));
+    bytes[ip_repr.buffer_len()..].copy_from_slice(&icmp);
+    bytes
+}
+
+#[test]
+#[cfg(all(feature = "medium-ip", feature = "socket-tcp"))]
+fn test_packet_too_big_lowers_mss_and_resends() {
+    let mut conn = pmtu_connection();
+    let sent = conn.sent.clone();
+
+    // The IPv6 minimum MTU leaves 1220 octets for data.
+    let resent = conn.deliver(packet_too_big(&conn, &sent[0], 1280));
+    conn.assert_resent(&resent, 1220, PMTU_DATA);
+
+    // The error for the second segment of the first flight reports the same
+    // MTU (the third fits), and one that reports less than the minimum MTU
+    // counts as the minimum.
+    assert!(
+        conn.deliver(packet_too_big(&conn, &sent[1], 1280))
+            .is_empty()
+    );
+    assert!(
+        conn.deliver(packet_too_big(&conn, &sent[0], 1000))
+            .is_empty()
+    );
+
+    let stats = conn.iface.path_mtu_stats();
+    let expected = PathMtuStats {
+        received: 3,
+        rejected: 0,
+        reductions: 1,
+    };
+    assert_eq!(stats, expected);
+}
+
+#[test]
+#[cfg(all(feature = "medium-ip", feature = "socket-tcp"))]
+fn test_packet_too_big_below_the_minimum_mtu_uses_it() {
+    let mut conn = pmtu_connection();
+    let sent = conn.sent[0].clone();
+
+    let resent = conn.deliver(packet_too_big(&conn, &sent, 576));
+    conn.assert_resent(&resent, 1220, PMTU_DATA);
+}
+
+#[test]
+#[cfg(all(feature = "medium-ip", feature = "socket-tcp"))]
+fn test_packet_too_big_ignores_sequence_not_in_flight() {
+    let mut conn = pmtu_connection();
+    let mut past = conn.sent[0].clone();
+    // The TCP sequence number, after the 40-octet IPv6 header.
+    let seq = conn.first + PMTU_DATA;
+    past[44..48].copy_from_slice(&seq.0.to_be_bytes());
+
+    assert!(conn.deliver(packet_too_big(&conn, &past, 1280)).is_empty());
+
+    let stats = conn.iface.path_mtu_stats();
+    let expected = PathMtuStats {
+        received: 1,
+        rejected: 1,
+        reductions: 0,
+    };
+    assert_eq!(stats, expected);
+}

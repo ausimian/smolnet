@@ -521,6 +521,10 @@ pub struct Socket<'a> {
     remote_has_sack: bool,
     /// The maximum number of data octets that the remote side may receive.
     remote_mss: usize,
+    /// The path MTU an ICMP "Fragmentation Needed" (RFC 1191) or "Packet Too
+    /// Big" (RFC 8201) error reported for this connection, if it was below the
+    /// interface's MTU. It only ever falls, and is forgotten with the connection.
+    path_mtu: Option<usize>,
     /// The timestamp of the last packet received.
     remote_last_ts: Option<Instant>,
     /// The sequence number of the last packet received, used for sACK
@@ -588,6 +592,35 @@ const DEFAULT_MSS: usize = 536;
 /// timestamps) so that every segment carries some payload.
 const MIN_REMOTE_MSS: usize = 48;
 
+/// The least path MTU an ICMP error can lower an IPv4 connection to: 576, the
+/// datagram every IPv4 host must accept (RFC 791, RFC 1122 3.3.2), whose MSS
+/// is TCP's default of 536 (RFC 9293 3.7.1). RFC 1191 allows 68, but every
+/// packet has Don't Fragment set, so a path narrower than this stays a black
+/// hole whatever the floor, and a forged error cannot shrink a connection's
+/// segments further. Linux's `min_pmtu` is 552, to the same end.
+#[cfg(feature = "proto-ipv4")]
+const IPV4_MIN_PATH_MTU: usize = 576;
+
+/// The least path MTU an ICMPv6 "Packet Too Big" can lower an IPv6 connection
+/// to: the IPv6 minimum link MTU (RFC 8200 5, RFC 8201 4).
+#[cfg(feature = "proto-ipv6")]
+const IPV6_MIN_PATH_MTU: usize = crate::wire::IPV6_MIN_MTU;
+
+/// What [`Socket::process_path_mtu`] made of an ICMP error.
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+pub(crate) enum PathMtuOutcome {
+    /// The error quotes a segment of another connection.
+    NotMatched,
+    /// The error is for this connection, but fails validation: it quotes a
+    /// sequence number that is not in flight (RFC 5927 4.1), or the
+    /// connection is not sending data.
+    Rejected,
+    /// The error is valid, but reports no less than the connection sends.
+    Unchanged,
+    /// The connection now sends smaller segments, starting with a resend.
+    Reduced,
+}
+
 impl<'a> Socket<'a> {
     #[allow(unused_comparisons)] // small usize platforms always pass rx_capacity check
     /// Create a socket using the given buffers.
@@ -631,6 +664,7 @@ impl<'a> Socket<'a> {
             remote_win_scale: None,
             remote_has_sack: false,
             remote_mss: DEFAULT_MSS,
+            path_mtu: None,
             remote_last_ts: None,
             local_rx_last_ack: None,
             local_rx_last_seq: None,
@@ -949,6 +983,7 @@ impl<'a> Socket<'a> {
         self.remote_win_scale = None;
         self.remote_win_shift = rx_cap_log2.saturating_sub(16) as u8;
         self.remote_mss = DEFAULT_MSS;
+        self.path_mtu = None;
         self.remote_last_ts = None;
         self.recover = None;
         self.scoreboard.clear();
@@ -1426,6 +1461,89 @@ impl<'a> Socket<'a> {
     /// Number of octets transmitted but not yet ACKed.
     fn flight_size(&self) -> usize {
         self.remote_last_seq - self.local_seq_no
+    }
+
+    /// The largest IP packet the connection sends: the interface's MTU, or
+    /// the path MTU if an ICMP error lowered it.
+    fn send_ip_mtu(&self, cx: &Context) -> usize {
+        let ip_mtu = cx.ip_mtu();
+        self.path_mtu
+            .map_or(ip_mtu, |path_mtu| path_mtu.min(ip_mtu))
+    }
+
+    /// Applies the MTU that an ICMP "Fragmentation Needed" (RFC 1191) or
+    /// "Packet Too Big" (RFC 8201) error reports, for the segment it quotes:
+    /// one sent from `local` to `remote`, with sequence number `seq`.
+    ///
+    /// An MTU below the family's floor counts as the floor, and one that is
+    /// not below what the connection sends changes nothing. A lower one must
+    /// be about data in flight, `SND.UNA <= seq < SND.NXT` (RFC 5927 4.1),
+    /// so that an error forged without seeing the connection cannot shrink
+    /// it. It then takes effect at once: every segment in flight larger than
+    /// the new MTU was dropped, so the unacknowledged data is sent again from
+    /// `SND.UNA` in segments that fit. The drop was not congestion, so the
+    /// congestion window is left as it was.
+    pub(crate) fn process_path_mtu(
+        &mut self,
+        cx: &Context,
+        local: IpEndpoint,
+        remote: IpEndpoint,
+        seq: TcpSeqNumber,
+        mtu: usize,
+    ) -> PathMtuOutcome {
+        if self.tuple != Some(Tuple { local, remote }) {
+            return PathMtuOutcome::NotMatched;
+        }
+
+        let (ip_header_len, min_path_mtu) = match local.addr {
+            #[cfg(feature = "proto-ipv4")]
+            IpAddress::Ipv4(_) => (crate::wire::IPV4_HEADER_LEN, IPV4_MIN_PATH_MTU),
+            #[cfg(feature = "proto-ipv6")]
+            IpAddress::Ipv6(_) => (crate::wire::IPV6_HEADER_LEN, IPV6_MIN_PATH_MTU),
+        };
+        let current = self.send_ip_mtu(cx);
+        let mtu = mtu.max(min_path_mtu);
+        if mtu >= current {
+            return PathMtuOutcome::Unchanged;
+        }
+
+        let sending = matches!(
+            self.state,
+            State::Established
+                | State::FinWait1
+                | State::CloseWait
+                | State::Closing
+                | State::LastAck
+        );
+        if !sending || seq < self.local_seq_no || seq >= self.remote_last_seq {
+            return PathMtuOutcome::Rejected;
+        }
+
+        let mss_at = |mtu: usize| (mtu - ip_header_len - TCP_HEADER_LEN).min(self.remote_mss);
+        let (old_mss, mss) = (mss_at(current), mss_at(mtu));
+        self.path_mtu = Some(mtu);
+        if mss >= old_mss {
+            // The remote's MSS keeps the segments within the path already.
+            return PathMtuOutcome::Unchanged;
+        }
+
+        net_debug!("path MTU {} lowers the MSS to {}, resending", mtu, mss);
+        self.congestion_controller.inner_mut().set_mss(mss);
+
+        // Resend from the last ACK, as a retransmission timeout does. That
+        // resends SACKed data too, and supersedes fast recovery.
+        self.remote_last_seq = self.local_seq_no;
+        self.pending_fast_retransmit = false;
+        self.recover = None;
+        self.recovery_rxt_end = None;
+        self.scoreboard.clear();
+        // The small segment in flight, if any, was dropped or is resent now:
+        // Nagle's algorithm must not hold back the tail of the resend for it.
+        self.nagle_small_segment_end = None;
+        // Karn's algorithm: no RTT sample from what is resent.
+        self.rtte.on_retransmit();
+
+        PathMtuOutcome::Reduced
     }
 
     /// Records the SACK blocks of an incoming ACK in the scoreboard, and
@@ -2481,7 +2599,7 @@ impl<'a> Socket<'a> {
             0
         };
 
-        let local_mss = cx.ip_mtu() - ip_header_len - TCP_HEADER_LEN;
+        let local_mss = self.send_ip_mtu(cx) - ip_header_len - TCP_HEADER_LEN;
         let effective_mss = local_mss.min(self.remote_mss).saturating_sub(options_len);
 
         // Have we sent data that hasn't been ACKed yet?
@@ -2818,7 +2936,7 @@ impl<'a> Socket<'a> {
                 // 3. MSS we can send, determined by our MTU.
                 // 4. Our congestion window
                 let options_len = repr.header_len() - TCP_HEADER_LEN;
-                let local_mss = cx.ip_mtu() - ip_repr.header_len() - TCP_HEADER_LEN;
+                let local_mss = self.send_ip_mtu(cx) - ip_repr.header_len() - TCP_HEADER_LEN;
                 let effective_mss = local_mss.min(self.remote_mss).saturating_sub(options_len);
 
                 let sack_retransmission = if self.pending_fast_retransmit {
@@ -6843,6 +6961,43 @@ mod test {
             ..RECV_TEMPL
         }), exact);
         recv_nothing!(s, time 1550);
+    }
+
+    #[test]
+    fn test_path_mtu_needs_a_connection_with_smaller_segments_to_send() {
+        // Not while connecting: there are no segments to size.
+        let mut s = socket_syn_sent();
+        let outcome = s
+            .socket
+            .process_path_mtu(&s.cx, LOCAL_END, REMOTE_END, LOCAL_SEQ, 1280);
+        assert_eq!(outcome, PathMtuOutcome::Rejected);
+
+        let mut s = socket_established();
+        s.send_slice(b"abcdef").unwrap();
+        recv!(
+            s,
+            [TcpRepr {
+                seq_number: LOCAL_SEQ + 1,
+                ack_number: Some(REMOTE_SEQ + 1),
+                payload: &b"abcdef"[..],
+                ..RECV_TEMPL
+            }]
+        );
+
+        // Nor for another connection.
+        let other = IpEndpoint::new(OTHER_ADDR.into(), REMOTE_PORT);
+        let outcome = s
+            .socket
+            .process_path_mtu(&s.cx, LOCAL_END, other, LOCAL_SEQ + 1, 1280);
+        assert_eq!(outcome, PathMtuOutcome::NotMatched);
+
+        // The remote's MSS of 536 already keeps the segments within the path.
+        let outcome = s
+            .socket
+            .process_path_mtu(&s.cx, LOCAL_END, REMOTE_END, LOCAL_SEQ + 1, 1280);
+        assert_eq!(outcome, PathMtuOutcome::Unchanged);
+        assert_eq!(s.path_mtu, Some(1280));
+        recv_nothing!(s);
     }
 
     #[test]
