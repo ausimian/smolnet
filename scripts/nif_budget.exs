@@ -167,7 +167,7 @@ defmodule SmolNet.NifBudget do
         {_keys, _references} = arm_waiters(resource, @native_socket_capacity, [:read, :write])
         resource
       end,
-      &Native.stack_shutdown/1,
+      &Native.stack_shutdown(&1, :closed),
       fn resource, {:ok, envelope} ->
         continue_native_work(resource, envelope, 0)
         drain_messages(@maximum_waiters)
@@ -228,7 +228,7 @@ defmodule SmolNet.NifBudget do
         _references = populate_maximum_waiter_state(resource, identities)
         resource
       end,
-      &Native.stack_shutdown/1,
+      &Native.stack_shutdown(&1, :closed),
       fn resource, {:ok, envelope} ->
         continue_native_work(resource, envelope, 0)
         drain_messages(@native_socket_capacity)
@@ -242,7 +242,7 @@ defmodule SmolNet.NifBudget do
         _references = populate_maximum_waiter_state(resource, identities)
         resource
       end,
-      &Native.stack_shutdown/1,
+      &Native.stack_shutdown(&1, :closed),
       fn resource, {:ok, envelope} ->
         continue_native_work(resource, envelope, 0)
         drain_messages(@native_socket_capacity)
@@ -256,7 +256,7 @@ defmodule SmolNet.NifBudget do
         _references = populate_maximum_waiter_state(resource, identities)
         resource
       end,
-      &Native.stack_shutdown/1,
+      &Native.stack_shutdown(&1, :closed),
       fn resource, {:ok, envelope} ->
         continue_native_work(resource, envelope, 0)
         drain_messages(@native_socket_capacity)

@@ -56,7 +56,12 @@ Each stack has one serialized link feeder. The link is responsible for
 transport-level buffering and backpressure. If a bounded native continuation
 still owns the ingress slot, a feeder can receive `{:error, :busy}` and should
 retry after yielding. The `:link_down` policy may be `:stop`, `:mark_down`, or
-`{:notify, pid}`.
+`{:notify, pid}`. Under `:stop`, the default, a stack whose link exits stops
+too, and `:gen_tcp` and `:gen_udp` calls pending on its sockets fail with
+`:enetdown`. Under `:mark_down` the stack keeps running without a link: it
+rejects ingress with `{:error, :link_down}` and drops egress, and its sockets
+stay open until they are closed or the stack is stopped. `{:notify, pid}` does
+the same and also sends `pid` `{:smol_stack, link_ref, :link_down, reason}`.
 
 A link cannot refuse an egress batch once it arrives. A link with a bounded
 queue should start its stack with egress credit and grant it back as it
@@ -254,7 +259,12 @@ end
 
 The message is only a retry hint; readiness can change before the retry. The
 select is one-shot, so each blocked retry returns a new select value. Closing
-the socket or stack can send the corresponding `:abort` message instead.
+the socket or stack can send the corresponding `:abort` message instead. Its
+`reason` is `:closed` when the socket closes, or when `SmolNet.stop_stack/1`
+or a supervisor's shutdown stops the stack. A stack that stops on its own
+aborts its waiters with `:link_down` when its link died under
+`link_down: :stop`, and with `:stack_down` when it failed. Blocking calls
+return `{:error, :closed}` whenever their stack stops.
 
 Stream operations retain partial progress in the caller:
 

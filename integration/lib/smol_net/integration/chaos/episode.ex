@@ -829,11 +829,22 @@ defmodule SmolNet.Integration.Chaos.Episode do
     fail(ep, :op_crashed, "#{label(op)} crashed: #{short(reason)}", [{label(op), reason}])
   end
 
-  # A stack that stops ends an active socket with a bare tcp_closed, as if
-  # the peer had closed it, so a stream it cuts short reads as complete but
-  # short. After stop_stack/1 that is the contract; after the link dies
-  # under :stop the owner should see tcp_error :enetdown first (#136).
-  # Either way it is recorded, not failed.
+  # stop_stack/1 ends an active socket with a bare tcp_closed, as if the
+  # peer had closed it, so a stream it cuts short reads as complete but
+  # short. That is the contract, so it is recorded, not failed. A stack
+  # lost with its link must give the owner tcp_error :enetdown first (#136).
+  defp judge(
+         %{done: {{:error, {:integrity, detail}}, at}, kind: :stream} = op,
+         %{stop_cause: :link_lost} = ep
+       )
+       when at >= ep.stopped_at do
+    summary =
+      "#{label(op)}: a bare tcp_closed after #{detail.bytes} of #{detail.expected} bytes " <>
+        "when the link died, not tcp_error :enetdown"
+
+    fail(ep, :wrong_error, summary, [{label(op), op_info(op)}])
+  end
+
   defp judge(%{done: {{:error, {:integrity, detail}}, at}, kind: :stream} = op, ep)
        when at >= ep.stopped_at do
     ep =
@@ -888,14 +899,15 @@ defmodule SmolNet.Integration.Chaos.Episode do
       loop?(op) ->
         ep
 
-      stopped_error?(result) ->
+      stopped_error?(result, ep.stop_cause) ->
         %{ep | returns: Map.put(ep.returns, op.kind, describe_return(result))}
 
       true ->
         ep = %{ep | returns: Map.put(ep.returns, op.kind, describe_return(result))}
 
         summary =
-          "#{label(op)} returned #{short(result)} when the stack stopped, not :closed or :enetdown"
+          "#{label(op)} returned #{short(result)} when the stack stopped, not " <>
+            Enum.map_join(stopped_errors(ep.stop_cause), " or ", &inspect/1)
 
         fail(ep, :wrong_error, summary, [{label(op), op_info(op)}])
     end
@@ -903,11 +915,17 @@ defmodule SmolNet.Integration.Chaos.Episode do
 
   # A send that had made progress reports what it did not send, as
   # {reason, remainder}.
-  defp stopped_error?({:error, {reason, rest}}) when is_binary(rest),
-    do: stopped_error?({:error, reason})
+  defp stopped_error?({:error, {reason, rest}}, cause) when is_binary(rest),
+    do: stopped_error?({:error, reason}, cause)
 
-  defp stopped_error?({:error, reason}), do: reason in [:closed, :enetdown]
-  defp stopped_error?(_result), do: false
+  defp stopped_error?({:error, reason}, cause), do: reason in stopped_errors(cause)
+  defp stopped_error?(_result, _cause), do: false
+
+  # A stack lost with its link fails what is pending as :enetdown (#136);
+  # one stopped with stop_stack/1 as :closed, or :enetdown where a call
+  # raced the stop.
+  defp stopped_errors(:link_lost), do: [:enetdown]
+  defp stopped_errors(_cause), do: [:closed, :enetdown]
 
   defp describe_return({:error, {reason, rest}}) when is_binary(rest),
     do: "{:error, {#{inspect(reason)}, <#{byte_size(rest)} bytes unsent>}}"

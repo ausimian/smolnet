@@ -568,7 +568,7 @@ defmodule SmolNet.Stack do
 
   def handle_call(:shutdown_waiters, _from, state) do
     state = state |> Map.put(:shutdown_requested, true) |> reject_pending_ingress(:closed)
-    reply = drain_native_shutdown(state)
+    reply = drain_native_shutdown(state, :closed)
 
     state =
       state
@@ -910,7 +910,7 @@ defmodule SmolNet.Stack do
   end
 
   @impl true
-  def terminate(_reason, state) do
+  def terminate(reason, state) do
     state = reject_pending_ingress(state, :closed)
 
     if state.timer do
@@ -918,11 +918,21 @@ defmodule SmolNet.Stack do
     end
 
     if state.native_module && state.native && !state.shutdown_drain_attempted do
-      _shutdown_result = drain_native_shutdown(state)
+      _shutdown_result = drain_native_shutdown(state, abort_reason(reason, state))
     end
 
     :ok
   end
+
+  # The reason the final drain gives the waiters it aborts. `stop_stack/1`,
+  # which drains through `shutdown_waiters` first, and an orderly shutdown
+  # from the supervisor close them. A stack that stops on its own, because
+  # its link died under `link_down: :stop` or because it failed, gives the
+  # loss, which the gen_tcp and gen_udp adapters report as `:enetdown`.
+  defp abort_reason(_reason, %{shutdown_requested: true}), do: :closed
+  defp abort_reason(reason, _state) when reason in [:normal, :shutdown], do: :closed
+  defp abort_reason({:shutdown, {:link_down, _reason}}, _state), do: :link_down
+  defp abort_reason(_reason, _state), do: :stack_down
 
   @spec default_limits() :: limits()
   def default_limits, do: @default_limits
@@ -1226,8 +1236,8 @@ defmodule SmolNet.Stack do
   defp timer_deadline(nil), do: nil
   defp timer_deadline(timer), do: timer.deadline
 
-  defp drain_native_shutdown(state) do
-    case state.native_module.stack_shutdown(state.native) do
+  defp drain_native_shutdown(state, reason) do
+    case state.native_module.stack_shutdown(state.native, reason) do
       {:ok, envelope} ->
         continue_native_shutdown(state, envelope, shutdown_continuation_limit(state.limits))
 

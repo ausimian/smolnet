@@ -36,8 +36,9 @@ defmodule SmolNet.Native do
   def stack_grant_egress(_stack, _packets, _bytes, _now),
     do: :erlang.nif_error(:nif_not_loaded)
 
-  @spec stack_shutdown(reference()) :: {:ok, map()} | {:error, atom()}
-  def stack_shutdown(_stack), do: :erlang.nif_error(:nif_not_loaded)
+  @spec stack_shutdown(reference(), :closed | :link_down | :stack_down) ::
+          {:ok, map()} | {:error, atom()}
+  def stack_shutdown(_stack, _reason), do: :erlang.nif_error(:nif_not_loaded)
 
   @spec socket_cancel(reference(), map(), atom(), reference()) ::
           {:ok, map()} | {:error, atom()}

@@ -19,7 +19,7 @@ use rustler::{
     Reference, ResourceArc, Term,
 };
 use socket_table::SocketError;
-use stack::{Envelope, ResourceCounts, StackConfig, StackError, StackResource};
+use stack::{AbortReason, Envelope, ResourceCounts, StackConfig, StackError, StackResource};
 use tcp::{ShutdownHow, TcpEndpoint};
 #[cfg(debug_assertions)]
 use waiter::{ArmPoint, Direction};
@@ -188,10 +188,14 @@ fn stack_grant_egress<'a>(
 }
 
 #[rustler::nif]
-fn stack_shutdown<'a>(env: Env<'a>, resource: ResourceArc<StackResource>) -> Term<'a> {
+fn stack_shutdown<'a>(
+    env: Env<'a>,
+    resource: ResourceArc<StackResource>,
+    reason: AbortReason,
+) -> Term<'a> {
     let result = catch_operation(|| {
         resource
-            .with_stack(|stack| stack.shutdown(env))
+            .with_stack(|stack| stack.shutdown(env, reason))
             .map_err(|_| atoms::ownership_invariant_violation())
     });
 

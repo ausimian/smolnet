@@ -816,8 +816,10 @@ defmodule SmolNet.Socket do
       {:"$smol_socket", {^id, ^generation}, :select, ^reference} ->
         :ready
 
+      # A blocking call reports a stack that stopped as closed, whether the
+      # stack's abort or its DOWN tells it so.
       {:"$smol_socket", {^id, ^generation}, :abort, ^reference, reason} ->
-        {:error, reason}
+        {:error, blocking_abort_reason(reason)}
 
       {:DOWN, ^monitor, :process, ^stack, _reason} ->
         {:error, :closed}
@@ -828,6 +830,9 @@ defmodule SmolNet.Socket do
         {:error, :timeout}
     end
   end
+
+  defp blocking_abort_reason(reason) when reason in [:link_down, :stack_down], do: :closed
+  defp blocking_abort_reason(reason), do: reason
 
   defp drain_select_message(%__MODULE__{id: id, generation: generation}, reference) do
     receive do
