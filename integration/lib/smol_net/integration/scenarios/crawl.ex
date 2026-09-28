@@ -212,6 +212,10 @@ defmodule SmolNet.Integration.Scenarios.Crawl do
   # The internet target
 
   defp internet(context, settings) do
+    # At rest, before the preflight's connections, which close first and
+    # so hold their slots through TIME-WAIT.
+    baseline = Soak.socket_count(context) || 0
+
     case Hosts.load(settings.list, settings.top, context.out_dir) do
       {:ok, hosts, info} ->
         Soak.record(context, :list, info)
@@ -231,7 +235,7 @@ defmodule SmolNet.Integration.Scenarios.Crawl do
 
           true ->
             sites = Enum.map(hosts, &%{host: &1, tls: :remote, targets: nil})
-            crawl(context, settings, sites, families)
+            crawl(context, settings, sites, families, baseline)
         end
 
       {:error, message} ->
@@ -330,7 +334,9 @@ defmodule SmolNet.Integration.Scenarios.Crawl do
     case Enum.find(servers, &match?({:error, _reason}, &1)) do
       nil ->
         sites = local_sites(Enum.map(servers, fn {:ok, server} -> server end))
-        crawl(context, settings, sites, context.families)
+        # With the servers' listeners, which in self-check are SmolNet's.
+        baseline = Soak.socket_count(context) || 0
+        crawl(context, settings, sites, context.families, baseline)
 
       {:error, reason} ->
         Soak.fail(context, :listen, "could not start the local servers", [{"reason", reason}])
@@ -480,9 +486,7 @@ defmodule SmolNet.Integration.Scenarios.Crawl do
 
   # The crawl
 
-  defp crawl(context, settings, sites, families) do
-    baseline = Soak.socket_count(context) || 0
-
+  defp crawl(context, settings, sites, families, baseline) do
     File.write!(
       csv_path(context),
       "round,family,host,address,client,class,stage,status,elapsed_ms,reason\n"
@@ -723,8 +727,11 @@ defmodule SmolNet.Integration.Scenarios.Crawl do
               reasons: Enum.take(Enum.uniq(record.reasons ++ [subject.reason]), 3)
           }
 
-        other ->
-          Map.update!(record, other, &(&1 + 1))
+        :kernel_only ->
+          %{record | kernel_only: record.kernel_only + 1}
+
+        :both_failed ->
+          %{record | both_failed: record.both_failed + 1}
       end
 
     :ets.insert(table, {key, record})
