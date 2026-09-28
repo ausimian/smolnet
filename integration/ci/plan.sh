@@ -68,8 +68,8 @@ duration_ms() {
   echo "$total"
 }
 
-# Whether ARGS (a JSON array) point the TLS scenario at a local target or
-# the helper's loopback, so that it does not reach the internet.
+# Whether ARGS (a JSON array) point the TLS or crawl scenario at a local
+# target or the helper's loopback, so that it does not reach the internet.
 offline() {
   jq -e 'index("--self-check") or index("--target=local")
     or (index("--target") as $i | $i != null and .[$i + 1] == "local")' <<<"$1" >/dev/null
@@ -88,7 +88,7 @@ run() {
 
   local args internet=false
   args=$(jq -cn '$ARGS.positional' --args -- "$@")
-  if [[ $scenario == tls ]] && ! offline "$args"; then internet=true; fi
+  if [[ $scenario == tls || $scenario == crawl ]] && ! offline "$args"; then internet=true; fi
 
   # The harness gives a workload a tenth of its duration, at least a
   # minute, to finish; the backstop adds 5 minutes to that for set-up and
@@ -164,6 +164,10 @@ plan() {
         --keepalive-probes 3
       # A cycle of every fault and policy takes about a minute.
       run chaos chaos 3m '' both --keep-going
+      # Local servers only, never the internet: a round of each outcome,
+      # and the socket ceiling pushed past, over both families.
+      run crawl-local crawl 2m '' both --target local --ceiling-step 5000 --round-pause 10000 \
+        --max-smolnet-only 0
       ;;
     *) die "no runs are planned for the event '${EVENT_NAME:-}'" ;;
   esac
@@ -189,6 +193,11 @@ scheduled() {
       # by keepalive after 2 h.
       run idle-4h idle 4h '' both --quiet 5m --idle-max 2h --outage-max 10m \
         --nat-timeout 30m --keepalive
+      # The Tranco top 1,000, weekly rather than nightly so that each site
+      # sees a dozen or so HEADs a week: about 8 rounds, 5 minutes apart,
+      # 16 in flight. Only a host SmolNet persistently fails to reach while
+      # the kernel reaches it is a fault; one that fails over both never is.
+      run crawl-1h crawl 1h '' both --max-smolnet-only 0
       ;;
     *) die "no runs are planned for the schedule '${SCHEDULE:-}'" ;;
   esac

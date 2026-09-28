@@ -16,6 +16,9 @@
 #                transfer or a DNS lookup, or, for a run that reaches the
 #                internet, one round of the kernel baseline to the same
 #                target, run straight after into <id>-recheck, failed too.
+#                The crawl needs no recheck: it visits each host over the
+#                kernel too, and a host that failed over both is never
+#                one of its failures.
 #   fault        anything else: SmolNet failed.
 #
 # It appends a report to $GITHUB_STEP_SUMMARY and annotates the run. It
@@ -118,6 +121,9 @@ elif [[ $(jq -r .mode "$verdict") == kernel ]]; then
 elif [[ $internet == true ]] && path_failures_only; then
   outcome=network
   reason="only the kernel's own transfers or DNS failed, so the path is to blame"
+elif [[ $internet == true && $scenario == crawl ]]; then
+  outcome=fault
+  reason="SmolNet failed where the kernel, on the same hosts, did not; see the failures"
 elif [[ $internet == true ]]; then
   recheck
   if [[ $recheck_status == 0 ]]; then
@@ -157,6 +163,15 @@ message=$(jq -r '
   (($v.counters // {}) | select(length > 0) |
     "counters: " + (to_entries | map("\(.key)=\(.value)") | join(", "))),
   (($v.failures // [])[:5][] | "failure \(.kind): \(.summary)"),
+  ($v.results.list // null | select(.id) | "Tranco list \(.id) of \(.created_on), top \(.top)"),
+  (($v.results.outcomes // {}) | to_entries[] | "\(.key): " +
+    (.value | to_entries | sort_by(-.value) | map("\(.key) \(.value)") | join(", "))),
+  ($v.results.comparison // null | select(.) |
+    "of \(.hosts) hosts, \(.smolnet_only) failed over SmolNet alone " +
+      "(\(.persistent_smolnet_only) persistently), \(.kernel_only) over the kernel alone, " +
+      "\(.both_failed) over both"),
+  (($v.results.causes // [])[:8][] |
+    "SmolNet alone, \(.cause): \(.hosts) hosts, such as \(.examples[:3] | join(", "))"),
   (($v.results.throughput // [])[] |
     "\(.family) \(.phase), \(.client) client to \(.server): \(.median_mbit_s) Mbit/s" +
       (if .ratio_to_kernel then " (\(.ratio_to_kernel)x the kernel)" else "" end) +
