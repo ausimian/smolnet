@@ -221,36 +221,17 @@ outstanding, is never timed out. There is no `TCP_USER_TIMEOUT` option.
 
 ## TLS with `:ssl`
 
-`:ssl` takes its transport through the `cb_info` option, and either callback
-module can be that transport. Pass the stack, and the family and address
-options, alongside the TLS options, as for `:gen_tcp`:
+`:ssl` runs over SmolNet, with either callback module as its transport. Name
+it in `:ssl`'s `cb_info` option, and pass the stack, and the family and
+address options, alongside the TLS options, as for `:gen_tcp`:
 
 ```elixir
 cb_info = {SmolNet.Inet.Tcp, :tcp, :tcp_closed, :tcp_error}
-transport = [:inet, {:cb_info, cb_info}, {:smolnet_stack, stack}]
-
-# A client.
-{:ok, tls} =
-  :ssl.connect({192, 0, 2, 1}, 443, transport ++ [verify: :verify_peer, cacerts: cacerts], 5_000)
-
-:ok = :ssl.send(tls, "request")
-{:ok, response} = :ssl.recv(tls, 0, 5_000)
-
-# A server.
-{:ok, listener} = :ssl.listen(443, transport ++ [cert: cert, key: key])
-{:ok, accepted} = :ssl.transport_accept(listener, 5_000)
-{:ok, tls} = :ssl.handshake(accepted, 5_000)
 ```
 
-Use `SmolNet.Inet6.Tcp` and `:inet6` for IPv6. A socket that is already
-connected, whether it was accepted or connected with `:gen_tcp`, can be
-upgraded too: `:ssl.handshake/3` for the server side and `:ssl.connect/3` for
-the client side, with the same `cb_info` in their options.
-
-`keepalive` goes with the transport options too. A connection that times
-out, by the user timeout or its keep-alive probes, gives `:ssl` the
-transport's `{:tcp_error, socket, :etimedout}`, and `:ssl` fails the TLS
-connection as it does for a reset: `:ssl.recv/3` returns `{:error, :closed}`.
+Use `SmolNet.Inet6.Tcp` and `:inet6` for IPv6. [Using `:ssl`](ssl.md) covers
+clients, servers, upgrading a connected socket, certificate verification,
+and how `:ssl` reports the errors this guide describes.
 
 `:ssl` uses three calls a plain `:gen_tcp` user rarely needs, and both modules
 provide them:
