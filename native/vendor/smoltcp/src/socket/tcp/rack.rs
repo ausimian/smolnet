@@ -259,6 +259,7 @@ impl SendLog {
                 && last.joins(&fresh)
             {
                 last.end = end;
+                last.last = send;
                 return;
             }
             if self.len < LOG_SIZE {
@@ -684,7 +685,8 @@ mod test {
     fn record_merges_what_is_sent_together() {
         let mut log = SendLog::new();
         log.record(seq(100), seq(100), seq(110), ms(1));
-        log.record(seq(100), seq(110), seq(120), ms(1));
+        log.record(seq(100), seq(110), seq(115), ms(1));
+        log.record(seq(100), seq(115), seq(120), ms(1));
         log.record(seq(100), seq(120), seq(130), ms(2));
         assert_eq!(
             ranges(&log),
@@ -693,6 +695,7 @@ mod test {
                 (120, 130, 2, false, false, false)
             ]
         );
+        assert_eq!((log.ranges[0].first, log.ranges[0].last), (1, 3));
         log.advance(seq(125));
         assert_eq!(ranges(&log), [(125, 130, 2, false, false, false)]);
         log.advance(seq(130));

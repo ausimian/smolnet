@@ -352,12 +352,13 @@ Hex packages are unaffected: they ship only precompiled NIFs and omit
     timer a reduction leaves running (#142) is unchanged. Neither a probe
     nor a RACK resend is anything heard from the peer, so the user
     timeout (#132) still aborts only a connection whose peer is silent.
-  - Nine socket tests cover a tail loss recovered through a probe, a probe
+  - Ten socket tests cover a tail loss recovered through a probe, a probe
     of new data, a lost retransmission resent before the timeout, the
     backoff reset by a sample during recovery, reordering within RACK's
-    window left alone, the reordering timer, limited transmit, a resent
-    probe's congestion response with and without a D-SACK, and a path MTU
-    reduction stopping the timers. Seven fail with RACK, the probes, the
+    window left alone, the reordering timer, recovery RACK starts under a
+    zero window, limited transmit, a resent probe's congestion response
+    with and without a D-SACK, and a path MTU reduction stopping the
+    timers. Eight fail with RACK, the probes, the
     new samples and limited transmit switched off; the other two guard
     against spurious resends and pick the probe's segment. Eleven unit tests
     cover the log and RACK's state, and one the scoreboard's new query.

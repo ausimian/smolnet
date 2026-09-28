@@ -1903,10 +1903,7 @@ impl<'a> Socket<'a> {
     fn poll_rack_timers(&mut self, now: Instant) {
         if self.rack.reo_timeout.is_some_and(|at| now >= at) {
             self.rack.reo_timeout = None;
-            if self.detect_losses(now)
-                && self.recover.is_none()
-                && !self.timer.is_zero_window_probe()
-            {
+            if self.detect_losses(now) && self.recover.is_none() {
                 net_debug!("RACK reordering timer deems data lost, starting fast retransmit");
                 self.start_recovery();
             }
@@ -2800,8 +2797,10 @@ impl<'a> Socket<'a> {
 
         // RFC 8985 6.2: data RACK deems lost starts recovery, as the third
         // duplicate ACK does. It may be a partial ACK, so this comes after the
-        // retransmission timer has been restarted for it.
-        if rack_lost && self.recover.is_none() && !self.timer.is_zero_window_probe() {
+        // retransmission timer has been restarted for it. As a fast
+        // retransmission does, it goes ahead whatever the peer's window: the
+        // loss is marked once, and nothing else would resend it.
+        if rack_lost && self.recover.is_none() {
             net_debug!("RACK deems data lost, starting fast retransmit");
             self.start_recovery();
         }
@@ -8531,6 +8530,25 @@ mod test {
         recv!(s, time 150, Ok(data_repr(3, b"aaa")));
         assert!(s.recover.is_some());
         recv_nothing!(s, time 150);
+    }
+
+    #[test]
+    fn test_rack_starts_recovery_under_a_zero_window() {
+        let mut s = socket_sack_rtt_50();
+        s.send_slice(b"aaaBBBcccDDD").unwrap();
+        for (i, payload) in [b"aaa", b"BBB", b"ccc", b"DDD"].iter().enumerate() {
+            recv!(s, time 100, Ok(data_repr(3 + 3 * i, &payload[..])));
+        }
+
+        // "BBB" is lost, and the ACK of the rest closes the window.
+        send!(s, time 150, sack_repr(6, 0, &[(9, 15)]));
+        assert!(s.timer.is_zero_window_probe());
+
+        // RACK's timer finds "BBB" lost, and recovery resends it as a fast
+        // retransmission would, window or no window: nothing else would.
+        recv_nothing!(s, time 162);
+        recv!(s, time 163, Ok(data_repr(6, b"BBB")));
+        assert!(s.recover.is_some());
     }
 
     #[test]
