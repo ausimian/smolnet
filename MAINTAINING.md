@@ -96,7 +96,10 @@ initial window of up to ten segments (#123), and RFC 6675's SACK-based loss
 recovery, which resends several lost segments per round trip (#119). A
 further patch, to the interface as well as the sender, adds path MTU
 discovery: ICMP "Fragmentation Needed" and "Packet Too Big" lower a
-connection's segment size, and it resends at once (#128). The commit that
+connection's segment size, and it resends at once (#128). Two more patch
+its timers: the timeout applies only while a connection has something
+outstanding, which makes it RFC 5482's user timeout (#132), and keep-alive
+has Linux's idle time, probe interval and probe count (#133). The commit that
 added the directory holds the crates.io package unmodified, so
 `git log -p -- native/vendor/smoltcp` after that commit is the complete set of
 SmolNet changes. Keep any further patch small, covered by tests in the
@@ -117,6 +120,25 @@ crates.io package from `~/.cargo/registry/src`, omitting `.cargo-ok` and
 `Cargo.lock`, and commit that on its own. Then reapply the patch, update the
 pinned version, and run `cargo update -p smoltcp` in both `native/` and
 `native/fuzz/`.
+
+## Fixed TCP timers, and the test-only override
+
+SmolNet's user timeout (924.6 s) and keep-alive timing (2 h, 75 s, 9
+probes) are Linux's defaults and fixed, with no user-facing options:
+`USER_TIMEOUT_MILLIS` and the `KEEPALIVE_*` constants in
+`native/smolnet_core/src/tcp.rs`. `SmolNet.Stack.Options` holds a copy, as
+does the idle scenario, so change all three together. The code takes
+them from a stack's `TcpTimers`, so that they can become options later.
+
+`SmolNet.start_stack(test_tcp_timers: %{...})` overrides them for one
+stack, with any of `:user_timeout`, `:keepalive_idle` and
+`:keepalive_interval`, in milliseconds up to a day, and
+`:keepalive_probes`, 1 to 255. It exists so that tests and the idle
+scenario's `--user-timeout` and `--keepalive-*` switches can see the timers
+work within a short run. It is not documented in `SmolNet.start_stack/1`
+and is not a supported option: do not rely on it outside tests. Unit tests
+that need the real timings move a stack's clock on instead, with
+`SmolNet.Test.ManualClock` and `SmolNet.Test.ClockedPair`.
 
 ## Native release assets
 

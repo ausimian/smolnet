@@ -48,6 +48,34 @@ defmodule SmolNet.Integration.IdleTest do
     assert [%{kind: :usage, summary: "--idle-min must not exceed --idle-max"}] = verdict.failures
   end
 
+  test "runs with keepalive and SmolNet's timers shortened", %{tmp_dir: dir} do
+    timers = ~w(--keepalive --keepalive-idle 5s --keepalive-interval 1s --user-timeout 5s)
+    argv = ~w(--self-check --connections 8 --out #{dir}) ++ timers ++ @short
+    assert {:pass, verdict} = run(argv)
+    assert verdict.counters.connections == 8
+    assert Enum.all?(verdict.results.working, &(&1.exchanges >= 2))
+  end
+
+  test "shortens SmolNet's timers only through their test-only stack option" do
+    stack = Keyword.fetch!(Idle.config(), :stack)
+    unset = %{user_timeout: nil, keepalive_idle: nil, keepalive_interval: nil}
+    unset = Map.put(unset, :keepalive_probes, nil)
+
+    assert stack.(unset) == [limits: %{sockets: 512}]
+
+    assert stack.(%{unset | user_timeout: "45s", keepalive_probes: 3}) ==
+             [
+               limits: %{sockets: 512},
+               test_tcp_timers: %{user_timeout: 45_000, keepalive_probes: 3}
+             ]
+  end
+
+  test "rejects a timer the stack cannot take", %{tmp_dir: dir} do
+    argv = ~w(--self-check --duration 0 --quiet 0 --user-timeout 2d --out #{dir})
+    assert {:fail, verdict} = run(argv)
+    assert [%{kind: :usage, summary: "--user-timeout must be at most a day"}] = verdict.failures
+  end
+
   test "blackholes a connection both ways on its interface" do
     ruleset = Blackhole.ruleset("tun0")
 

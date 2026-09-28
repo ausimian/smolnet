@@ -162,7 +162,10 @@ UDP size of 1232 or less, as DNS Flag Day 2020 recommends.
 The signs:
 
 - Connections open, and small exchanges succeed.
-- Larger transfers hang with no error, in one direction or both.
+- Larger transfers hang with no error, in one direction or both. A
+  connection whose peer then sends it nothing at all fails with
+  `:etimedout` after 924.6 s, SmolNet's user timeout, as a Linux
+  connection does.
 
 In a capture on SmolNet's side of the link, the sign is SmolNet resending
 the same full-size segment, backing off each time, with nothing from the

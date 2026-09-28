@@ -153,9 +153,15 @@ plan() {
       run tls-internet tls 1m '' both
       # The whole matrix, which ends on its own in a few minutes.
       run pmtu pmtu 15m '' both
-      # Long enough for a reboot's path to return and be detected.
-      run idle idle 3m '' both --quiet 30s --idle-max 1m --trickle-max 10s \
-        --outage-max 20s --nat-timeout 20s
+      # Long enough for a reboot's path to return and be detected, and,
+      # with the timers shortened, for every other vanished peer to be
+      # detected too. The first keep-alive probes come after the quiet
+      # window. Its bursts use memory for most of the run, which is all
+      # warm-up.
+      run idle idle 4m '' both --quiet 30s --idle-max 1m --trickle-max 10s \
+        --outage-max 20s --nat-timeout 20s --warmup 2m --keepalive \
+        --user-timeout 45s --keepalive-idle 50s --keepalive-interval 2s \
+        --keepalive-probes 3
       # A cycle of every fault and policy takes about a minute.
       run chaos chaos 3m '' both --keep-going
       ;;
@@ -178,9 +184,11 @@ scheduled() {
       run smoke-1h smoke 1h '' both
       run tls-local-4h tls 4h '' both --target local
       run tls-internet-4h tls 4h '' both --round-pause 300000
-      # Idles of seconds to hours, and NAT timeouts of half an hour.
+      # Idles of seconds to hours, and NAT timeouts of half an hour, with
+      # SmolNet's own timers: every vanished peer is detected, silent ones
+      # by keepalive after 2 h.
       run idle-4h idle 4h '' both --quiet 5m --idle-max 2h --outage-max 10m \
-        --nat-timeout 30m
+        --nat-timeout 30m --keepalive
       ;;
     *) die "no runs are planned for the schedule '${SCHEDULE:-}'" ;;
   esac

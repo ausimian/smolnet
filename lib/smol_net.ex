@@ -43,6 +43,14 @@ defmodule SmolNet do
   `:connection_timeout`, `:already_connected`, `:not_bound`,
   `:not_connected`, `:busy`, `:closed`, `:invalid_socket`, and
   `:invalid_socket_state`.
+
+  An established connection fails with `:connection_timeout` when its peer
+  answers nothing for 924.6 s while it has data or a FIN outstanding, or
+  data a zero window holds back, as Linux gives up by default; or when its
+  keep-alive probes go unanswered (see `setopt/3`). A pending `recv/3` or
+  `send/3` fails with it at once, and later calls return it too. An idle
+  connection, with nothing outstanding, never times out without keep-alive.
+  The timeout is fixed.
   """
 
   alias SmolNet.Socket
@@ -351,30 +359,39 @@ defmodule SmolNet do
   @doc """
   Sets a socket option on a TCP socket.
 
-  The one option is `{:tcp, :nodelay}`, as in `:socket.setopt/3`: `true`
-  disables Nagle's algorithm, so a small write is sent while an earlier one
-  is still unacknowledged, and `false`, the default, enables it again.
-  Disabling it sends a segment it was holding back at once.
+  The options are, as in `:socket.setopt/3`:
 
-  Set it before connecting, or at any time after. On a listener it applies
+    * `{:tcp, :nodelay}`: `true` disables Nagle's algorithm, so a small
+      write is sent while an earlier one is still unacknowledged, and
+      `false`, the default, enables it again. Disabling it sends a segment
+      it was holding back at once.
+    * `{:socket, :keepalive}`: `true` sends keep-alive probes on a
+      connection that has received nothing for 2 hours, one every 75 s, and
+      fails it with `:connection_timeout` once 9 have gone unanswered, as
+      Linux does by default; `false`, the default, sends none. The timing is
+      fixed.
+
+  Set them before connecting, or at any time after. On a listener they apply
   to the children `accept/2` returns from then on, which each take the
-  listener's setting as they are returned; changing it on a child afterwards
-  does not affect the listener.
+  listener's settings as they are returned; changing one on a child
+  afterwards does not affect the listener.
 
   A UDP socket returns `{:error, :invalid_socket_state}`, and any other
   option or value `{:error, :invalid_options}`.
   """
-  @spec setopt(Socket.t(), {:tcp, :nodelay}, boolean()) :: :ok | {:error, atom()}
+  @spec setopt(Socket.t(), {:tcp, :nodelay} | {:socket, :keepalive}, boolean()) ::
+          :ok | {:error, atom()}
   defdelegate setopt(socket, option, value), to: Socket
 
   @doc """
   Returns a TCP socket option set with `setopt/3`.
 
   `{:tcp, :nodelay}` returns `{:ok, true}` when Nagle's algorithm is
-  disabled; on a listener, whether the children it accepts will have it
-  disabled.
+  disabled, and `{:socket, :keepalive}` when keep-alive is on; on a
+  listener, whether the children it accepts will have it so.
   """
-  @spec getopt(Socket.t(), {:tcp, :nodelay}) :: {:ok, boolean()} | {:error, atom()}
+  @spec getopt(Socket.t(), {:tcp, :nodelay} | {:socket, :keepalive}) ::
+          {:ok, boolean()} | {:error, atom()}
   defdelegate getopt(socket, option), to: Socket
 
   @doc "Closes a socket and permanently invalidates its public handle."

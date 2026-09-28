@@ -24,6 +24,7 @@ defmodule SmolNet.InetBackend.Options do
             send_timeout: :infinity,
             send_timeout_close: false,
             nodelay: false,
+            keepalive: false,
             bind_address: nil,
             bind_port: 0,
             bind_scope_id: 0,
@@ -45,6 +46,7 @@ defmodule SmolNet.InetBackend.Options do
           send_timeout: timeout(),
           send_timeout_close: boolean(),
           nodelay: boolean(),
+          keepalive: boolean(),
           bind_address: :inet.ip_address() | nil,
           bind_port: :inet.port_number(),
           bind_scope_id: non_neg_integer(),
@@ -267,6 +269,11 @@ defmodule SmolNet.InetBackend.Options do
     {:ok, %{options | nodelay: nodelay}}
   end
 
+  defp put_option(options, {:keepalive, keepalive}, context)
+       when context in [:connect, :listen, :runtime] and is_boolean(keepalive) do
+    {:ok, %{options | keepalive: keepalive}}
+  end
+
   defp put_option(options, {:recbuf, size}, context)
        when context in [:udp_open, :udp_runtime] and is_integer(size) and
               size in 1..@max_buffer do
@@ -435,6 +442,7 @@ defmodule SmolNet.InetBackend.Options do
   defp option_value(options, :send_timeout), do: {:ok, {:send_timeout, options.send_timeout}}
   defp option_value(options, :backlog), do: {:ok, {:backlog, options.backlog}}
   defp option_value(options, :nodelay), do: {:ok, {:nodelay, options.nodelay}}
+  defp option_value(options, :keepalive), do: {:ok, {:keepalive, options.keepalive}}
 
   defp option_value(options, :send_timeout_close),
     do: {:ok, {:send_timeout_close, options.send_timeout_close}}

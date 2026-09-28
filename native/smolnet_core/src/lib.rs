@@ -83,6 +83,7 @@ mod atoms {
         not_found,
         egress_credit,
         egress_credit_disabled,
+        tcp_timers,
         smol_socket = "$smol_socket"
     }
 }
@@ -454,6 +455,41 @@ fn tcp_nodelay<'a>(
     let result = catch_operation(|| {
         resource
             .with_stack(|stack| stack.tcp_nodelay(env, identity))
+            .map_err(|_| atoms::ownership_invariant_violation())?
+            .map_err(socket_error_atom)
+    });
+
+    encode_envelope_result(env, result)
+}
+
+#[rustler::nif]
+fn tcp_set_keepalive<'a>(
+    env: Env<'a>,
+    resource: ResourceArc<StackResource>,
+    identity: SocketIdentity,
+    keepalive: bool,
+    now_millis: i64,
+) -> Term<'a> {
+    let result = catch_operation(|| {
+        let now = time::instant_from_millis(now_millis).map_err(|_| atoms::time_overflow())?;
+        resource
+            .with_stack(|stack| stack.tcp_set_keepalive(env, identity, keepalive, now))
+            .map_err(|_| atoms::ownership_invariant_violation())?
+            .map_err(socket_error_atom)
+    });
+
+    encode_envelope_result(env, result)
+}
+
+#[rustler::nif]
+fn tcp_keepalive<'a>(
+    env: Env<'a>,
+    resource: ResourceArc<StackResource>,
+    identity: SocketIdentity,
+) -> Term<'a> {
+    let result = catch_operation(|| {
+        resource
+            .with_stack(|stack| stack.tcp_keepalive(env, identity))
             .map_err(|_| atoms::ownership_invariant_violation())?
             .map_err(socket_error_atom)
     });

@@ -28,7 +28,8 @@ use crate::socket_table::{
 };
 use crate::tcp::{
     self as tcp_support, AddressFamily, ConnectFailure, ConnectPhase, EncodedEndpoint,
-    ListenerRecord, ShutdownHow, TcpBufferSizes, TcpEndpoint, TcpRecord, ValidatedEndpoint,
+    ListenerRecord, ShutdownHow, TcpBufferSizes, TcpEndpoint, TcpRecord, TcpTimers,
+    ValidatedEndpoint,
 };
 use crate::udp::{self as udp_support, UdpRecord};
 #[cfg(debug_assertions)]
@@ -158,6 +159,7 @@ pub struct NativeStack {
     lifecycle: Lifecycle,
     limits: Limits,
     mtu: usize,
+    tcp_timers: TcpTimers,
     route_prefixes: Vec<IpCidr>,
     call_budget: CallBudget,
     next_forced_budget_checkpoints: Option<usize>,
@@ -234,6 +236,7 @@ impl NativeStack {
             lifecycle: Lifecycle::Running,
             limits,
             mtu: stack_config.mtu,
+            tcp_timers: stack_config.tcp_timers,
             route_prefixes,
             call_budget: CallBudget::start(None),
             next_forced_budget_checkpoints: None,
@@ -692,10 +695,9 @@ impl NativeStack {
             }
         }
 
-        let nodelay = !self
-            .sockets
-            .get::<tcp::Socket<'static>>(record.handle)
-            .nagle_enabled();
+        let socket = self.sockets.get::<tcp::Socket<'static>>(record.handle);
+        let nodelay = !socket.nagle_enabled();
+        let keepalive = socket.keep_alive_config().is_some();
         let mut listener = ListenerRecord::new(
             identity,
             endpoint,
@@ -709,6 +711,7 @@ impl NativeStack {
             },
         );
         listener.nodelay = nodelay;
+        listener.keepalive = keepalive;
 
         self.remove_tcp_record(record);
         self.tcp_listeners.insert(identity.id, listener);
@@ -759,13 +762,16 @@ impl NativeStack {
 
         let result = if let Some(child) = accepted {
             let record = *self.tcp_record(child)?;
-            let nodelay = self
+            let (nodelay, keepalive) = self
                 .tcp_listeners
                 .get(&identity.id)
-                .is_some_and(|listener| listener.nodelay);
-            self.sockets
-                .get_mut::<tcp::Socket<'static>>(record.handle)
-                .set_nagle_enabled(!nodelay);
+                .map_or((false, false), |listener| {
+                    (listener.nodelay, listener.keepalive)
+                });
+            let keep_alive = self.tcp_timers.keep_alive(keepalive);
+            let socket = self.sockets.get_mut::<tcp::Socket<'static>>(record.handle);
+            socket.set_nagle_enabled(!nodelay);
+            socket.set_keep_alive_config(keep_alive);
             (crate::atoms::ok(), child, record.family).encode(env)
         } else {
             self.arm_listener_waiter(env, identity, pid, reference)?;
@@ -960,6 +966,72 @@ impl NativeStack {
         };
 
         Ok(self.finish_call(env, nodelay, Effects::empty(), Vec::new()))
+    }
+
+    /// Turns keep-alive on or off on a TCP socket, with the stack's fixed
+    /// timing. On a listener it sets what the children it accepts from now on
+    /// get, as `tcp_set_nodelay` does. Turning it on counts the idle time from
+    /// the last packet received, and setting what is already set changes
+    /// nothing, so a probe already sent keeps its count.
+    pub fn tcp_set_keepalive(
+        &mut self,
+        env: Env<'_>,
+        identity: SocketIdentity,
+        keepalive: bool,
+        now: Instant,
+    ) -> Result<Envelope<Atom>, SocketError> {
+        self.ensure_running()?;
+        self.socket_table.validate(identity, SocketKind::Tcp)?;
+
+        if let Some(listener) = self
+            .tcp_listeners
+            .get_mut(&identity.id)
+            .filter(|listener| listener.identity == identity)
+        {
+            listener.keepalive = keepalive;
+        } else {
+            let record = *self.tcp_record(identity)?;
+            let keep_alive = self.tcp_timers.keep_alive(keepalive);
+            let socket = self.sockets.get_mut::<tcp::Socket<'static>>(record.handle);
+
+            if socket.keep_alive_config().is_some() != keepalive {
+                socket.set_keep_alive_config(keep_alive);
+            }
+        }
+
+        // The first probe may now be due before the stack's next poll.
+        let effects = self
+            .drive(now, None)
+            .expect("TCP keepalive change without ingress cannot fail");
+        Ok(self.finish_call(env, crate::atoms::ok(), effects, Vec::new()))
+    }
+
+    /// Whether keep-alive is on for a TCP socket, or for the children a
+    /// listener accepts.
+    pub fn tcp_keepalive(
+        &mut self,
+        env: Env<'_>,
+        identity: SocketIdentity,
+    ) -> Result<Envelope<bool>, SocketError> {
+        self.ensure_running()?;
+        self.socket_table.validate(identity, SocketKind::Tcp)?;
+
+        let keepalive = match self
+            .tcp_listeners
+            .get(&identity.id)
+            .filter(|listener| listener.identity == identity)
+        {
+            Some(listener) => listener.keepalive,
+            None => {
+                let record = self.tcp_record(identity)?;
+                self.sockets
+                    .get::<tcp::Socket<'static>>(record.handle)
+                    .keep_alive_config()
+                    .is_some()
+            }
+        };
+
+        Ok(self.finish_call(env, keepalive, Effects::empty(), Vec::new()))
     }
 
     pub fn tcp_peername(
@@ -2261,7 +2333,7 @@ impl NativeStack {
             tcp::State::Established => {
                 self.sockets
                     .get_mut::<tcp::Socket<'static>>(record.handle)
-                    .set_timeout(None);
+                    .set_timeout(Some(self.tcp_timers.user_timeout()));
                 self.tcp_record_mut(identity)?.phase = ConnectPhase::Connected;
                 let result = crate::atoms::ok().encode(env);
                 let effects = self.current_effects(now);
@@ -2467,6 +2539,18 @@ impl NativeStack {
 
     fn ensure_connected(&self, record: TcpRecord) -> Result<(), SocketError> {
         match record.phase {
+            // smoltcp aborted it: the peer answered nothing for the user
+            // timeout while something was outstanding, or no keep-alive probe.
+            // A pending call was woken by the abort, and fails here as it
+            // retries, as for a reset.
+            ConnectPhase::Connected
+                if self
+                    .sockets
+                    .get::<tcp::Socket<'static>>(record.handle)
+                    .aborted_by_timeout() =>
+            {
+                Err(ConnectFailure::TimedOut.socket_error())
+            }
             ConnectPhase::Connected => Ok(()),
             ConnectPhase::Failed(failure) => Err(failure.socket_error()),
             ConnectPhase::Open | ConnectPhase::Bound | ConnectPhase::Connecting => {
@@ -2705,7 +2789,7 @@ impl NativeStack {
                 Ok(Some(child)) => {
                     self.sockets
                         .get_mut::<tcp::Socket<'static>>(key.handle)
-                        .set_timeout(None);
+                        .set_timeout(Some(self.tcp_timers.user_timeout()));
                     let record = TcpRecord::accepted(
                         child,
                         key.handle,
@@ -3632,6 +3716,7 @@ pub(crate) fn fuzz_config_and_endpoints(data: &[u8]) {
             gateway: route_gateway,
         }],
         egress_credit: None,
+        tcp_timers: TcpTimers::default(),
     };
     let _stack_result = NativeStack::new(limits, config, Instant::ZERO);
 
@@ -3754,6 +3839,7 @@ fn fuzz_stack_config() -> StackConfig {
             },
         ],
         egress_credit: None,
+        tcp_timers: TcpTimers::default(),
     }
 }
 
@@ -4100,6 +4186,7 @@ pub struct StackConfig {
     addresses: Vec<AddressConfig>,
     routes: Vec<RouteConfig>,
     egress_credit: Option<EgressCredit>,
+    tcp_timers: TcpTimers,
 }
 
 impl<'a> Decoder<'a> for StackConfig {
@@ -4109,12 +4196,18 @@ impl<'a> Decoder<'a> for StackConfig {
             Ok(value) => value.decode()?,
             Err(_) => None,
         };
+        // Absent or nil gives the fixed defaults. Only tests set it.
+        let tcp_timers = match term.map_get(crate::atoms::tcp_timers()) {
+            Ok(value) => value.decode::<Option<TcpTimers>>()?.unwrap_or_default(),
+            Err(_) => TcpTimers::default(),
+        };
 
         Ok(Self {
             mtu: term.map_get(crate::atoms::mtu())?.decode()?,
             addresses: decode_bounded_list(term.map_get(crate::atoms::addresses())?, 8)?,
             routes: decode_bounded_list(term.map_get(crate::atoms::routes())?, 4)?,
             egress_credit,
+            tcp_timers,
         })
     }
 }
@@ -4127,6 +4220,7 @@ impl StackConfig {
             || self.routes.len() > 4
             || self.addresses.iter().any(|address| !address.valid())
             || self.routes.iter().any(|route| !route.valid())
+            || !self.tcp_timers.valid()
         {
             return Err(StackError::InvalidStackConfig);
         }
@@ -4548,6 +4642,7 @@ mod tests {
 
     use super::{NativeStack, StackConfig, StackResource};
     use crate::limits::Limits;
+    use crate::tcp::TcpTimers;
 
     const LIMITS: Limits = Limits {
         bytes_copied: 1_280,
@@ -4564,6 +4659,7 @@ mod tests {
             addresses: Vec::new(),
             routes: Vec::new(),
             egress_credit: None,
+            tcp_timers: TcpTimers::default(),
         }
     }
 

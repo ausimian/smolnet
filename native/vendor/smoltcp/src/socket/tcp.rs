@@ -362,9 +362,9 @@ impl Timer {
         }
     }
 
-    fn set_for_idle(&mut self, timestamp: Instant, interval: Option<Duration>) {
+    fn set_for_idle(&mut self, timestamp: Instant, keep_alive: Option<KeepAlive>) {
         *self = Timer::Idle {
-            keep_alive_at: interval.map(|interval| timestamp + interval),
+            keep_alive_at: keep_alive.map(|keep_alive| timestamp + keep_alive.idle),
         }
     }
 
@@ -376,9 +376,15 @@ impl Timer {
         }
     }
 
-    fn rewind_keep_alive(&mut self, timestamp: Instant, interval: Option<Duration>) {
+    fn rewind_keep_alive(&mut self, timestamp: Instant, keep_alive: Option<KeepAlive>) {
         if let Timer::Idle { keep_alive_at } = self {
-            *keep_alive_at = interval.map(|interval| timestamp + interval)
+            *keep_alive_at = keep_alive.map(|keep_alive| timestamp + keep_alive.interval)
+        }
+    }
+
+    fn arm_keep_alive(&mut self, at: Option<Instant>) {
+        if let Timer::Idle { keep_alive_at } = self {
+            *keep_alive_at = at
         }
     }
 
@@ -436,6 +442,23 @@ impl Timer {
     }
 }
 
+/// Keep-alive timing, as Linux's `TCP_KEEPIDLE`, `TCP_KEEPINTVL` and
+/// `TCP_KEEPCNT` set it.
+///
+/// See [set_keep_alive_config](Socket::set_keep_alive_config).
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub struct KeepAlive {
+    /// How long the connection receives nothing before the first probe.
+    pub idle: Duration,
+    /// How long a probe waits for an answer before the next one is sent.
+    pub interval: Duration,
+    /// How many unanswered probes abort the connection, when the next one
+    /// falls due. `None` probes without end, and leaves the abort to the
+    /// [timeout](Socket::set_timeout), as upstream smoltcp's keep-alive does.
+    pub probes: Option<u8>,
+}
+
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 enum AckDelayTimer {
     Idle,
@@ -484,10 +507,15 @@ pub struct Socket<'a> {
     rx_buffer: SocketBuffer<'a>,
     rx_fin_received: bool,
     tx_buffer: SocketBuffer<'a>,
-    /// Interval after which, if no inbound packets are received, the connection is aborted.
+    /// Interval after which, if no inbound packets are received while the connection
+    /// waits on the remote, the connection is aborted.
     timeout: Option<Duration>,
-    /// Interval at which keep-alive packets will be sent.
-    keep_alive: Option<Duration>,
+    /// When keep-alive packets are sent, and how many may go unanswered.
+    keep_alive: Option<KeepAlive>,
+    /// The keep-alive packets sent since a packet was last received.
+    keep_alive_probes: u8,
+    /// Whether the connection was aborted because the remote stopped answering.
+    timeout_abort: bool,
     /// The time-to-live (IPv4) or hop limit (IPv6) value used in outgoing packets.
     hop_limit: Option<u8>,
     /// Address passed to listen(). Listen address is set when listen() is called and
@@ -651,6 +679,8 @@ impl<'a> Socket<'a> {
             rx_fin_received: false,
             timeout: None,
             keep_alive: None,
+            keep_alive_probes: 0,
+            timeout_abort: false,
             hop_limit: None,
             listen_endpoint: IpListenEndpoint::default(),
             tuple: None,
@@ -851,10 +881,17 @@ impl<'a> Socket<'a> {
     ///
     ///   * After a [connect](#method.connect) call, the remote endpoint does not respond within
     ///     the specified duration;
-    ///   * After establishing a connection, there is data in the transmit buffer and the remote
-    ///     endpoint exceeds the specified duration between any two packets it sends;
-    ///   * After enabling [keep-alive](#method.set_keep_alive), the remote endpoint exceeds
-    ///     the specified duration between any two packets it sends.
+    ///   * After establishing a connection, there is data in the transmit buffer or an
+    ///     unacknowledged FIN, and the remote endpoint exceeds the specified duration between
+    ///     any two packets it sends, or since the first of them was sent;
+    ///   * After enabling [keep-alive](#method.set_keep_alive) with no limit on its probes, the
+    ///     remote endpoint exceeds the specified duration between any two packets it sends.
+    ///
+    /// An idle connection, with nothing to send and nothing unacknowledged, is not aborted
+    /// however long the remote endpoint stays quiet: that is what keep-alive probes are for.
+    /// Used this way the timeout is the user timeout of RFC 5482, which Linux sets with
+    /// `TCP_USER_TIMEOUT`, and it bounds zero-window probing too, since an endpoint that
+    /// answers the probes keeps the connection open.
     pub fn set_timeout(&mut self, duration: Option<Duration>) {
         self.timeout = duration
     }
@@ -886,7 +923,7 @@ impl<'a> Socket<'a> {
     ///
     /// See also the [set_keep_alive](#method.set_keep_alive) method.
     pub fn keep_alive(&self) -> Option<Duration> {
-        self.keep_alive
+        self.keep_alive.map(|keep_alive| keep_alive.interval)
     }
 
     /// Set the keep-alive interval.
@@ -902,12 +939,51 @@ impl<'a> Socket<'a> {
     /// The keep-alive functionality together with the timeout functionality allows to react
     /// to these error conditions.
     pub fn set_keep_alive(&mut self, interval: Option<Duration>) {
-        self.keep_alive = interval;
+        self.keep_alive = interval.map(|interval| KeepAlive {
+            idle: interval,
+            interval,
+            probes: None,
+        });
+        self.keep_alive_probes = 0;
         if self.keep_alive.is_some() {
             // If the connection is idle and we've just set the option, it would not take effect
             // until the next packet, unless we wind up the timer explicitly.
             self.timer.set_keep_alive();
         }
+    }
+
+    /// Return the keep-alive timing.
+    ///
+    /// See also the [set_keep_alive_config](#method.set_keep_alive_config) method.
+    pub fn keep_alive_config(&self) -> Option<KeepAlive> {
+        self.keep_alive
+    }
+
+    /// Set the keep-alive timing, with an idle time, a probe interval and a probe count, as
+    /// Linux has them.
+    ///
+    /// A connection with keep-alive set that has received nothing for `idle`, and has nothing
+    /// to send or unacknowledged, sends a "keep-alive ACK" packet, and another every `interval`
+    /// while none is answered. Any packet received answers them, and the next probe is then
+    /// `idle` after it. Once `probes` of them have gone unanswered, the connection is aborted
+    /// when the next falls due, as [aborted_by_timeout](#method.aborted_by_timeout) reports.
+    ///
+    /// Unlike [set_keep_alive](#method.set_keep_alive), setting it on an idle connection sends
+    /// no probe at once: the first is due `idle` after the last packet received.
+    pub fn set_keep_alive_config(&mut self, keep_alive: Option<KeepAlive>) {
+        self.keep_alive = keep_alive;
+        self.keep_alive_probes = 0;
+        let last = self.remote_last_ts.unwrap_or(Instant::ZERO);
+        self.timer
+            .arm_keep_alive(keep_alive.map(|keep_alive| last + keep_alive.idle));
+    }
+
+    /// Return whether the connection was aborted because the remote endpoint stopped
+    /// answering: the [timeout](#method.set_timeout) expired, or the
+    /// [keep-alive probes](#method.set_keep_alive_config) all went unanswered. It stays set
+    /// once the socket is closed, until the socket is reused.
+    pub fn aborted_by_timeout(&self) -> bool {
+        self.timeout_abort
     }
 
     /// Return the time-to-live (IPv4) or hop limit (IPv6) value used in outgoing packets.
@@ -985,6 +1061,8 @@ impl<'a> Socket<'a> {
         self.remote_mss = DEFAULT_MSS;
         self.path_mtu = None;
         self.remote_last_ts = None;
+        self.keep_alive_probes = 0;
+        self.timeout_abort = false;
         self.recover = None;
         self.scoreboard.clear();
         self.recovery_rxt_end = None;
@@ -1155,8 +1233,14 @@ impl<'a> Socket<'a> {
             State::SynSent => self.set_state(State::Closed),
             // In the SYN-RECEIVED, ESTABLISHED and CLOSE-WAIT states the transmit half
             // of the connection is open, and needs to be explicitly closed with a FIN.
-            State::SynReceived | State::Established => self.set_state(State::FinWait1),
-            State::CloseWait => self.set_state(State::LastAck),
+            State::SynReceived | State::Established => {
+                self.restart_timeout_if_idle();
+                self.set_state(State::FinWait1)
+            }
+            State::CloseWait => {
+                self.restart_timeout_if_idle();
+                self.set_state(State::LastAck)
+            }
             // In the FIN-WAIT-1, FIN-WAIT-2, CLOSING, LAST-ACK, TIME-WAIT and CLOSED states,
             // the transmit half of the connection is already closed, and no further
             // action is needed.
@@ -1166,6 +1250,16 @@ impl<'a> Socket<'a> {
             | State::TimeWait
             | State::LastAck
             | State::Closed => (),
+        }
+    }
+
+    // A FIN queued on an idle connection is outstanding from now on, and the timeout counts
+    // from when it is sent, not from the last packet received, which may be long ago. Queued
+    // data restarts the count in send_impl() the same way.
+    fn restart_timeout_if_idle(&mut self) {
+        if self.tx_buffer.is_empty() {
+            self.remote_last_ts = None;
+            self.keep_alive_probes = 0;
         }
     }
 
@@ -1315,7 +1409,8 @@ impl<'a> Socket<'a> {
             // would be far in the past. Unless we clear it here, we'll abort the connection
             // down over in dispatch() by erroneously detecting it as timed out.
             if old_length == 0 {
-                self.remote_last_ts = None
+                self.remote_last_ts = None;
+                self.keep_alive_probes = 0;
             }
 
             // if remote win is zero and we go from having no data to some data pending to
@@ -2285,8 +2380,9 @@ impl<'a> Socket<'a> {
             }
         }
 
-        // Update remote state.
+        // Update remote state. Any packet answers the keep-alive probes.
         self.remote_last_ts = Some(cx.now());
+        self.keep_alive_probes = 0;
 
         // RFC 1323: The window field (SEG.WND) in the header of every incoming segment, with the
         // exception of SYN segments, is left-shifted by Snd.Wind.Scale bits before updating SND.WND.
@@ -2574,9 +2670,38 @@ impl<'a> Socket<'a> {
 
     fn timed_out(&self, timestamp: Instant) -> bool {
         match (self.remote_last_ts, self.timeout) {
-            (Some(remote_last_ts), Some(timeout)) => timestamp >= remote_last_ts + timeout,
+            (Some(remote_last_ts), Some(timeout)) => {
+                self.awaits_remote() && timestamp >= remote_last_ts + timeout
+            }
             (_, _) => false,
         }
+    }
+
+    // Whether the connection is waiting on the remote endpoint, which is when the timeout
+    // applies: during the handshake, while it has data or a FIN that is unacknowledged or
+    // not yet sent, including data a zero window holds back, and while it sends keep-alive
+    // probes that have no limit of their own. An idle connection is not.
+    fn awaits_remote(&self) -> bool {
+        match self.state {
+            State::Closed | State::Listen | State::TimeWait => false,
+            State::SynSent
+            | State::SynReceived
+            | State::FinWait1
+            | State::Closing
+            | State::LastAck => true,
+            State::Established | State::FinWait2 | State::CloseWait => {
+                !self.tx_buffer.is_empty()
+                    || matches!(self.keep_alive, Some(KeepAlive { probes: None, .. }))
+            }
+        }
+    }
+
+    // Whether every keep-alive probe allowed has gone unanswered, and the next is due.
+    fn keep_alive_exhausted(&self, timestamp: Instant) -> bool {
+        matches!(
+            self.keep_alive,
+            Some(KeepAlive { probes: Some(probes), .. }) if self.keep_alive_probes >= probes
+        ) && self.timer.should_keep_alive(timestamp)
     }
 
     fn seq_to_transmit(&self, cx: &mut Context) -> bool {
@@ -2766,9 +2891,11 @@ impl<'a> Socket<'a> {
             .pre_transmit(cx.now());
 
         // Check if any state needs to be changed because of a timer.
-        if self.timed_out(cx.now()) {
-            // If a timeout expires, we should abort the connection.
+        if self.timed_out(cx.now()) || self.keep_alive_exhausted(cx.now()) {
+            // If a timeout expires, or no keep-alive probe was answered, we should abort the
+            // connection.
             net_debug!("timeout exceeded");
+            self.timeout_abort = true;
             self.set_state(State::Closed);
         } else if self.timer.should_retransmit(cx.now()) {
             if let Timer::Retransmit { .. } = self.timer {
@@ -3132,9 +3259,13 @@ impl<'a> Socket<'a> {
             self.rtte.on_retransmit();
         }
 
-        // We've sent something, whether useful data or a keep-alive packet, so rewind
-        // the keep-alive timer.
-        self.timer.rewind_keep_alive(cx.now(), self.keep_alive);
+        // A keep-alive packet waits `interval` for an answer before the next. Other packets
+        // leave the timer alone: it counts from the last packet received, as on Linux, and
+        // the next probe is `idle` after that.
+        if is_keep_alive {
+            self.keep_alive_probes = self.keep_alive_probes.saturating_add(1);
+            self.timer.rewind_keep_alive(cx.now(), self.keep_alive);
+        }
 
         // Reset delayed-ack timer
         match self.ack_delay_timer {
@@ -3237,7 +3368,9 @@ impl<'a> Socket<'a> {
             let timeout_poll_at = match (self.remote_last_ts, self.timeout) {
                 // If we're transmitting or retransmitting data, we need to poll at the moment
                 // when the timeout would expire.
-                (Some(remote_last_ts), Some(timeout)) => PollAt::Time(remote_last_ts + timeout),
+                (Some(remote_last_ts), Some(timeout)) if self.awaits_remote() => {
+                    PollAt::Time(remote_last_ts + timeout)
+                }
                 // Otherwise we have no timeout.
                 (_, _) => PollAt::Ingress,
             };
@@ -9396,10 +9529,8 @@ mod test {
         let mut s = socket_established();
         s.set_timeout(Some(Duration::from_millis(2000)));
         recv_nothing!(s, time 250);
-        assert_eq!(
-            s.socket.poll_at(&mut s.cx),
-            PollAt::Time(Instant::from_millis(2250))
-        );
+        // Idle, the connection is not waiting on the remote, so it has no timeout.
+        assert_eq!(s.socket.poll_at(&mut s.cx), PollAt::Ingress);
         s.send_slice(b"abcdef").unwrap();
         assert_eq!(s.socket.poll_at(&mut s.cx), PollAt::Now);
         recv!(s, time 255, Ok(TcpRepr {
@@ -9517,6 +9648,118 @@ mod test {
     }
 
     #[test]
+    fn test_user_timeout_aborts_unacked_data_to_silent_remote() {
+        let mut s = socket_established();
+        s.set_timeout(Some(USER_TIMEOUT));
+        send!(s, time 1_000, REMOTE_ACK);
+        assert_eq!(s.socket.poll_at(&mut s.cx), PollAt::Ingress);
+
+        // After a long idle, the timeout counts from the first transmission.
+        s.cx.set_now(Instant::from_secs(5_000));
+        s.send_slice(b"abcdef").unwrap();
+        let sent = poll_silently(&mut s, 100_000_000);
+        let (last, retransmissions) = sent.split_last().unwrap();
+
+        assert_eq!(*last, (5_900_000, TcpControl::Rst, 0));
+        assert!(retransmissions.len() > 10);
+        assert!(
+            retransmissions
+                .iter()
+                .all(|&(at, control, len)| at < 5_900_000
+                    && control == TcpControl::None
+                    && len == 6)
+        );
+        assert_eq!(s.state, State::Closed);
+        assert!(s.aborted_by_timeout());
+    }
+
+    #[test]
+    fn test_user_timeout_spares_idle_connection() {
+        let mut s = socket_established();
+        s.set_timeout(Some(USER_TIMEOUT));
+        send!(s, time 1_000, REMOTE_ACK);
+        assert_eq!(s.socket.poll_at(&mut s.cx), PollAt::Ingress);
+
+        // A day later it has sent nothing and is still open, and sends as usual.
+        recv_nothing!(s, time 86_400_000);
+        assert_eq!(s.state, State::Established);
+        assert!(!s.aborted_by_timeout());
+        s.send_slice(b"abcdef").unwrap();
+        recv!(s, time 86_400_000, Ok(TcpRepr {
+            seq_number: LOCAL_SEQ + 1,
+            ack_number: Some(REMOTE_SEQ + 1),
+            payload:    &b"abcdef"[..],
+            ..RECV_TEMPL
+        }));
+    }
+
+    #[test]
+    fn test_user_timeout_counts_fin_from_when_sent() {
+        let mut s = socket_established();
+        s.set_timeout(Some(USER_TIMEOUT));
+        send!(s, time 1_000, REMOTE_ACK);
+
+        // Closing long after the last packet received sends a FIN, not a RST.
+        s.close();
+        recv!(s, time 5_000_000, Ok(TcpRepr {
+            control:    TcpControl::Fin,
+            seq_number: LOCAL_SEQ + 1,
+            ack_number: Some(REMOTE_SEQ + 1),
+            ..RECV_TEMPL
+        }));
+        let sent = poll_silently(&mut s, 100_000_000);
+        assert_eq!(sent.last(), Some(&(5_900_000, TcpControl::Rst, 0)));
+        assert!(s.aborted_by_timeout());
+    }
+
+    #[test]
+    fn test_user_timeout_bounds_zero_window_probing() {
+        let mut s = socket_established();
+        s.set_timeout(Some(USER_TIMEOUT));
+        let closed = TcpRepr {
+            window_len: 0,
+            ..REMOTE_ACK
+        };
+        send!(s, time 1_000, closed);
+        s.cx.set_now(Instant::from_millis(2_000));
+        s.send_slice(b"abcdef").unwrap();
+
+        // A remote that answers the probes keeps the connection open.
+        let mut answered_at = 0;
+        let mut probes = 0;
+        loop {
+            let at = match s.socket.poll_at(&mut s.cx) {
+                PollAt::Now => s.cx.now(),
+                PollAt::Time(at) => at,
+                PollAt::Ingress => panic!("the zero-window probes stopped"),
+            };
+            if at.total_millis() > 2_000_000 {
+                break;
+            }
+            s.cx.set_now(at);
+            let mut probed = false;
+            let _: Result<(), ()> = s.socket.dispatch(&mut s.cx, |_, _, (_, repr)| {
+                probed = repr.payload.len() == 1;
+                Ok(())
+            });
+            if probed {
+                probes += 1;
+                answered_at = at.total_millis();
+                send(&mut s, at, &closed);
+            }
+        }
+        assert!(probes > 30);
+        assert_eq!(s.state, State::Established);
+
+        // One that stops answering is given up on a timeout after its last answer.
+        let sent = poll_silently(&mut s, 100_000_000);
+        let (last, probes) = sent.split_last().unwrap();
+        assert_eq!(*last, (answered_at + 900_000, TcpControl::Rst, 0));
+        assert!(probes.iter().all(|&(_, _, len)| len == 1));
+        assert!(s.aborted_by_timeout());
+    }
+
+    #[test]
     fn test_closed_timeout() {
         let mut s = socket_established();
         s.set_timeout(Some(Duration::from_millis(200)));
@@ -9535,6 +9778,116 @@ mod test {
     // =========================================================================================//
     // Tests for keep-alive.
     // =========================================================================================//
+
+    // Polls the socket whenever it asks to be, until `until` ms or until it has nothing
+    // left to send, with the remote answering nothing. Returns when each packet went out,
+    // its control and its payload length.
+    fn poll_silently(s: &mut TestSocket, until: i64) -> Vec<(i64, TcpControl, usize)> {
+        let mut sent = Vec::new();
+
+        for _ in 0..10_000 {
+            let at = match s.socket.poll_at(&mut s.cx) {
+                PollAt::Now => s.cx.now(),
+                PollAt::Time(at) => at,
+                PollAt::Ingress => return sent,
+            };
+            if at.total_millis() > until {
+                return sent;
+            }
+
+            s.cx.set_now(at);
+            let now = at.total_millis();
+            let _: Result<(), ()> = s.socket.dispatch(&mut s.cx, |_, _, (_, repr)| {
+                sent.push((now, repr.control.quash_psh(), repr.payload.len()));
+                Ok(())
+            });
+        }
+
+        panic!("the socket kept asking to be polled")
+    }
+
+    // SmolNet's keep-alive timing, which is Linux's default.
+    const LINUX_KEEP_ALIVE: KeepAlive = KeepAlive {
+        idle: Duration::from_secs(7_200),
+        interval: Duration::from_secs(75),
+        probes: Some(9),
+    };
+
+    const USER_TIMEOUT: Duration = Duration::from_secs(900);
+
+    const REMOTE_ACK: TcpRepr<'static> = TcpRepr {
+        seq_number: TcpSeqNumber(REMOTE_SEQ.0 + 1),
+        ack_number: Some(TcpSeqNumber(LOCAL_SEQ.0 + 1)),
+        ..SEND_TEMPL
+    };
+
+    #[test]
+    fn test_keep_alive_probes_then_aborts() {
+        let mut s = socket_established();
+        s.set_timeout(Some(USER_TIMEOUT));
+        send!(s, time 1_000, REMOTE_ACK);
+
+        // The first probe is due `idle` after the last packet received, not at once.
+        s.set_keep_alive_config(Some(LINUX_KEEP_ALIVE));
+        assert_eq!(
+            s.socket.poll_at(&mut s.cx),
+            PollAt::Time(Instant::from_millis(7_201_000))
+        );
+
+        // Nine go unanswered, `interval` apart, and the abort is due when a tenth would
+        // be. The timeout, much shorter, does not end the idle connection first.
+        let sent = poll_silently(&mut s, 100_000_000);
+        let (last, probes) = sent.split_last().unwrap();
+        let expected: Vec<_> = (0..9)
+            .map(|n| (7_201_000 + n * 75_000, TcpControl::None, 1))
+            .collect();
+        assert_eq!(probes, &expected[..]);
+        assert_eq!(*last, (7_876_000, TcpControl::Rst, 0));
+        assert!(s.aborted_by_timeout());
+    }
+
+    #[test]
+    fn test_keep_alive_answer_resets_probes() {
+        let mut s = socket_established();
+        send!(s, time 1_000, REMOTE_ACK);
+        s.set_keep_alive_config(Some(LINUX_KEEP_ALIVE));
+
+        let sent = poll_silently(&mut s, 7_501_000);
+        assert_eq!(sent.len(), 5);
+
+        // An answer to the fifth: the next probe is `idle` later, with nine to go.
+        send!(s, time 7_501_500, REMOTE_ACK);
+        let sent = poll_silently(&mut s, 100_000_000);
+        assert_eq!(sent.len(), 10);
+        assert_eq!(sent[0], (14_701_500, TcpControl::None, 1));
+        assert_eq!(sent[8], (14_701_500 + 8 * 75_000, TcpControl::None, 1));
+        assert_eq!(sent[9], (14_701_500 + 9 * 75_000, TcpControl::Rst, 0));
+    }
+
+    #[test]
+    fn test_keep_alive_leaves_unacked_data_to_timeout() {
+        let mut s = socket_established();
+        s.set_timeout(Some(USER_TIMEOUT));
+        s.set_keep_alive_config(Some(LINUX_KEEP_ALIVE));
+        send!(s, time 1_000, REMOTE_ACK);
+
+        s.cx.set_now(Instant::from_secs(5_000));
+        s.send_slice(b"abcdef").unwrap();
+        let sent = poll_silently(&mut s, 100_000_000);
+        let (last, retransmissions) = sent.split_last().unwrap();
+        assert_eq!(*last, (5_900_000, TcpControl::Rst, 0));
+        assert!(retransmissions.iter().all(|&(_, _, len)| len == 6));
+    }
+
+    #[test]
+    fn test_keep_alive_off_after_on_sends_no_probe() {
+        let mut s = socket_established();
+        send!(s, time 1_000, REMOTE_ACK);
+        s.set_keep_alive_config(Some(LINUX_KEEP_ALIVE));
+        s.set_keep_alive_config(None);
+        assert_eq!(s.socket.poll_at(&mut s.cx), PollAt::Ingress);
+        recv_nothing!(s, time 100_000_000);
+    }
 
     #[test]
     fn test_responds_to_keep_alive() {

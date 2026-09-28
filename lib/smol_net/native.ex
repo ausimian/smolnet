@@ -102,6 +102,14 @@ defmodule SmolNet.Native do
   @spec tcp_nodelay(reference(), map()) :: {:ok, map()} | {:error, atom()}
   def tcp_nodelay(_stack, _identity), do: :erlang.nif_error(:nif_not_loaded)
 
+  @spec tcp_set_keepalive(reference(), map(), boolean(), integer()) ::
+          {:ok, map()} | {:error, atom()}
+  def tcp_set_keepalive(_stack, _identity, _keepalive, _now),
+    do: :erlang.nif_error(:nif_not_loaded)
+
+  @spec tcp_keepalive(reference(), map()) :: {:ok, map()} | {:error, atom()}
+  def tcp_keepalive(_stack, _identity), do: :erlang.nif_error(:nif_not_loaded)
+
   @spec tcp_close(reference(), map(), integer()) :: {:ok, map()} | {:error, atom()}
   def tcp_close(_stack, _identity, _now), do: :erlang.nif_error(:nif_not_loaded)
 

@@ -12,7 +12,26 @@ defmodule SmolNet.Stack.Options do
     maintenance_work: 128,
     sockets: 512
   }
-  @allowed [:egress, :egress_credit, :mtu, :addresses, :routes, :limits, :link_down]
+  # SmolNet's fixed TCP timers, in milliseconds, as native/smolnet_core/src/tcp.rs
+  # has them. `:test_tcp_timers` overrides them for tests and the integration
+  # harness only: it is not a supported option (see MAINTAINING.md).
+  @tcp_timers %{
+    user_timeout: 924_600,
+    keepalive_idle: 7_200_000,
+    keepalive_interval: 75_000,
+    keepalive_probes: 9
+  }
+  @max_timer_ms 86_400_000
+  @allowed [
+    :egress,
+    :egress_credit,
+    :mtu,
+    :addresses,
+    :routes,
+    :limits,
+    :link_down,
+    :test_tcp_timers
+  ]
 
   @spec parse(keyword()) :: {:ok, map()} | {:error, atom()}
   def parse(options) when is_list(options) do
@@ -23,7 +42,8 @@ defmodule SmolNet.Stack.Options do
          {:ok, addresses} <- addresses(Keyword.get(options, :addresses, [])),
          {:ok, routes} <- routes(Keyword.get(options, :routes, [])),
          {:ok, limits} <- limits(Keyword.get(options, :limits, %{}), mtu),
-         {:ok, link_down} <- link_down(Keyword.get(options, :link_down, :stop)) do
+         {:ok, link_down} <- link_down(Keyword.get(options, :link_down, :stop)),
+         {:ok, tcp_timers} <- tcp_timers(Keyword.get(options, :test_tcp_timers)) do
       {:ok,
        %{
          egress: egress,
@@ -33,7 +53,8 @@ defmodule SmolNet.Stack.Options do
            mtu: mtu,
            addresses: addresses,
            routes: routes,
-           egress_credit: egress_credit
+           egress_credit: egress_credit,
+           tcp_timers: tcp_timers
          }
        }}
     end
@@ -181,6 +202,24 @@ defmodule SmolNet.Stack.Options do
   defp link_down(:mark_down), do: {:ok, :mark_down}
   defp link_down({:notify, pid}) when is_pid(pid), do: {:ok, {:notify, pid}}
   defp link_down(_policy), do: {:error, :invalid_link_down_policy}
+
+  defp tcp_timers(nil), do: {:ok, nil}
+
+  defp tcp_timers(overrides) when is_map(overrides) do
+    timers = Map.merge(@tcp_timers, overrides)
+
+    if map_size(timers) == map_size(@tcp_timers) and
+         Enum.all?(timers, fn
+           {:keepalive_probes, probes} -> is_integer(probes) and probes in 1..255
+           {_name, ms} -> is_integer(ms) and ms in 1..@max_timer_ms
+         end) do
+      {:ok, timers}
+    else
+      {:error, :invalid_options}
+    end
+  end
+
+  defp tcp_timers(_overrides), do: {:error, :invalid_options}
 
   defp map_while(values, mapper, error) do
     Enum.reduce_while(values, {:ok, []}, fn value, {:ok, acc} ->

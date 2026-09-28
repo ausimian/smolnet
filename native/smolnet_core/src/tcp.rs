@@ -3,7 +3,7 @@ use std::collections::{BTreeSet, VecDeque};
 use rustler::{NifMap, NifUnitEnum};
 use smoltcp::iface::SocketHandle;
 use smoltcp::socket::tcp;
-use smoltcp::time::Instant;
+use smoltcp::time::{Duration, Instant};
 use smoltcp::wire::{IpAddress, IpEndpoint, IpListenEndpoint, Ipv4Address, Ipv6Address};
 
 use crate::socket_table::SocketError;
@@ -14,6 +14,22 @@ pub const MIN_BUFFER_BYTES: usize = 1024;
 pub const MAX_BUFFER_BYTES: usize = 1024 * 1024;
 pub const CONNECT_TIMEOUT_MILLIS: u64 = 30_000;
 pub const CLOSE_TIMEOUT_MILLIS: u64 = 30_000;
+/// RFC 5482's user timeout, fixed: how long a connection with data or a FIN
+/// outstanding, or data a zero window holds back, may hear nothing from its
+/// peer before it is aborted with `ETIMEDOUT`. It is how long Linux takes to
+/// give up by default, as `tcp_model_timeout` computes it for
+/// `tcp_retries2 = 15` retransmissions with its RTO bounds of 200 ms and
+/// 120 s: `(2^10 - 1) * 200 ms + (15 - 9) * 120 s`. RFC 1122 (4.2.3.5) asks
+/// for at least 100 s. An idle connection has nothing outstanding and is
+/// never aborted by it.
+pub const USER_TIMEOUT_MILLIS: u64 = 924_600;
+/// Linux's keep-alive defaults, `TCP_KEEPIDLE`, `TCP_KEEPINTVL` and
+/// `TCP_KEEPCNT`, fixed: the first probe after 2 h without a packet from the
+/// peer, then one every 75 s, and an abort with `ETIMEDOUT` once 9 have gone
+/// unanswered.
+pub const KEEPALIVE_IDLE_MILLIS: u64 = 7_200_000;
+pub const KEEPALIVE_INTERVAL_MILLIS: u64 = 75_000;
+pub const KEEPALIVE_PROBES: u8 = 9;
 pub const EPHEMERAL_PORT_FIRST: u16 = 49_152;
 pub const EPHEMERAL_PORT_LAST: u16 = 50_175;
 pub const LISTENER_POOL_MAX: usize = 4;
@@ -183,6 +199,54 @@ impl ConnectFailure {
     }
 }
 
+/// The timers a stack gives its TCP connections, in milliseconds: the fixed
+/// defaults above, or shorter ones that a test sets through the stack's
+/// test-only `tcp_timers` config.
+#[derive(Clone, Copy, Debug, Eq, NifMap, PartialEq)]
+pub struct TcpTimers {
+    pub user_timeout: u64,
+    pub keepalive_idle: u64,
+    pub keepalive_interval: u64,
+    pub keepalive_probes: u8,
+}
+
+impl Default for TcpTimers {
+    fn default() -> Self {
+        Self {
+            user_timeout: USER_TIMEOUT_MILLIS,
+            keepalive_idle: KEEPALIVE_IDLE_MILLIS,
+            keepalive_interval: KEEPALIVE_INTERVAL_MILLIS,
+            keepalive_probes: KEEPALIVE_PROBES,
+        }
+    }
+}
+
+impl TcpTimers {
+    /// The longest any of them may be: a day.
+    pub const MAX_MILLIS: u64 = 86_400_000;
+
+    pub fn valid(self) -> bool {
+        let range = 1..=Self::MAX_MILLIS;
+
+        range.contains(&self.user_timeout)
+            && range.contains(&self.keepalive_idle)
+            && range.contains(&self.keepalive_interval)
+            && self.keepalive_probes > 0
+    }
+
+    pub fn user_timeout(self) -> Duration {
+        Duration::from_millis(self.user_timeout)
+    }
+
+    pub fn keep_alive(self, enabled: bool) -> Option<tcp::KeepAlive> {
+        enabled.then(|| tcp::KeepAlive {
+            idle: Duration::from_millis(self.keepalive_idle),
+            interval: Duration::from_millis(self.keepalive_interval),
+            probes: Some(self.keepalive_probes),
+        })
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct TcpBufferSizes {
     pub rcvbuf: usize,
@@ -223,6 +287,9 @@ pub struct ListenerRecord {
     /// It is applied when `accept` returns the child, so the child takes the
     /// listener's setting as it is at that moment.
     pub nodelay: bool,
+    /// Whether a child the listener accepts has keep-alive on, applied as
+    /// `nodelay` is.
+    pub keepalive: bool,
 }
 
 impl ListenerRecord {
@@ -247,6 +314,7 @@ impl ListenerRecord {
             rcvbuf: buffer_sizes.rcvbuf,
             sndbuf: buffer_sizes.sndbuf,
             nodelay: false,
+            keepalive: false,
         }
     }
 }
@@ -360,9 +428,45 @@ mod tests {
 
     use super::{
         DEFAULT_BUFFER_BYTES, EPHEMERAL_PORT_FIRST, EPHEMERAL_PORT_LAST, MAX_BUFFER_BYTES,
-        MIN_BUFFER_BYTES, TcpEndpoint, allocate_ephemeral, socket,
+        MIN_BUFFER_BYTES, TcpEndpoint, TcpTimers, allocate_ephemeral, socket,
     };
     use crate::socket_table::SocketError;
+    use smoltcp::socket::tcp::KeepAlive;
+    use smoltcp::time::Duration;
+
+    #[test]
+    fn tcp_timers_default_to_linux_and_bound_overrides() {
+        let timers = TcpTimers::default();
+        assert!(timers.valid());
+        assert_eq!(timers.user_timeout(), Duration::from_millis(924_600));
+        assert!(timers.user_timeout() >= Duration::from_secs(100));
+        assert_eq!(timers.keep_alive(false), None);
+        assert_eq!(
+            timers.keep_alive(true),
+            Some(KeepAlive {
+                idle: Duration::from_secs(7_200),
+                interval: Duration::from_secs(75),
+                probes: Some(9),
+            })
+        );
+
+        for invalid in [
+            TcpTimers {
+                user_timeout: 0,
+                ..timers
+            },
+            TcpTimers {
+                keepalive_idle: TcpTimers::MAX_MILLIS + 1,
+                ..timers
+            },
+            TcpTimers {
+                keepalive_probes: 0,
+                ..timers
+            },
+        ] {
+            assert!(!invalid.valid());
+        }
+    }
 
     #[test]
     fn tcp_buffers_have_configurable_bounded_capacity() {

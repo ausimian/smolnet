@@ -162,6 +162,24 @@ sends a segment it was holding at once:
 {:ok, true} = SmolNet.getopt(socket, {:tcp, :nodelay})
 ```
 
+Keep-alive is off by default. `{:socket, :keepalive}` turns it on, as
+`SO_KEEPALIVE` does, with Linux's default timing, which is fixed: a probe
+after 2 hours in which nothing arrives, then one every 75 s, and
+`{:error, :connection_timeout}` once 9 have gone unanswered. Set later, the
+2 hours count from the last packet received:
+
+```elixir
+:ok = SmolNet.setopt(socket, {:socket, :keepalive}, true)
+{:ok, true} = SmolNet.getopt(socket, {:socket, :keepalive})
+```
+
+A connection with data or a FIN unacknowledged, or data a zero window holds
+back, that hears nothing from its peer for 924.6 s fails with
+`:connection_timeout` too: the user timeout of RFC 5482, fixed at how long
+Linux gives up after by default. A pending `recv` or `send` returns it at
+once, and so does every later call but `close`. An idle connection, with
+nothing outstanding, never times out without keep-alive.
+
 `recv(socket, 0, timeout)` returns one bounded currently available chunk. A
 positive synchronous length accumulates bounded reads until it has exactly
 that many bytes, the operation fails, or the peer reaches EOF. EOF returns
@@ -191,8 +209,8 @@ A bound stream socket becomes a listener with a backlog from 1 through 128:
 ```
 
 Each accepted child has a new public identity and becomes independent of its
-listener. It takes the listener's `{:tcp, :nodelay}` setting as `accept`
-returns it. A listener maintains up to four native listening sockets and an
+listener. It takes the listener's `{:tcp, :nodelay}` and
+`{:socket, :keepalive}` settings as `accept` returns it. A listener maintains up to four native listening sockets and an
 accepted queue no larger than its requested backlog. Closing the listener
 aborts a pending accept and releases queued children; children already returned
 to callers remain usable.
