@@ -81,6 +81,15 @@
   delivers its `:DOWN`, that nothing of the stack is left running, and
   that a fresh stack works. Its schedule of faults comes from `--seed`, so
   a run can be replayed.
+- A crawl integration script, `sudo mix run integration/crawl.exs`, that
+  sends TLS `HEAD /` requests to the top 1,000 sites of the day's Tranco
+  list, over SmolNet and over the kernel, host by host, round after round,
+  at a polite rate. It lists the hosts that fail over SmolNet but not over
+  the kernel, grouped by cause, with packets and TCP options cut from the
+  capture, and checks that the stack's sockets return to their baseline
+  after every round. Before the first round it pushes the stack past its
+  socket ceiling against a listener on the host, and checks that opens
+  past it fail promptly with `:system_limit` and that the stack recovers.
 
 ### Changed
 

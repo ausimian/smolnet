@@ -33,7 +33,7 @@ on:
       scenario:
         description: The scenario, integration/<scenario>.exs
         type: choice
-        options: [tls, smoke, pmtu, idle, chaos]
+        options: [tls, smoke, pmtu, idle, chaos, crawl]
         default: tls
       duration:
         description: How long to run, such as 90s, 10m or 1h30m; at most 5h

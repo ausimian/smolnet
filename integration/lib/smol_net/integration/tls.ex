@@ -40,6 +40,20 @@ defmodule SmolNet.Integration.Tls do
   end
 
   @doc """
+  Starts TLS as a client on `socket`, a connected, passive TCP socket of
+  `role` for `family`, with `tls_options`, within `timeout` milliseconds.
+
+  Connecting over TCP first, and then upgrading, tells a TCP connect's
+  failure from a TLS handshake's, which `connect/6` does not.
+  """
+  @spec upgrade(Context.t(), Network.role(), term(), Network.family(), list(), timeout()) ::
+          {:ok, :ssl.sslsocket()} | {:error, term()}
+  def upgrade(context, role, socket, family, tls_options, timeout) do
+    transport = if Network.smolnet?(context, role), do: [cb_info: cb_info(family)], else: []
+    :ssl.connect(socket, transport ++ tls_options, timeout)
+  end
+
+  @doc """
   Listens for TLS on `role`'s address for `family`, on an ephemeral port,
   with `tls_options` and the transport options for `role`.
 
