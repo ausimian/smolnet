@@ -166,7 +166,8 @@ plan() {
       run chaos chaos 3m '' both --keep-going
       # Local servers only, never the internet: a round of each outcome,
       # and the socket ceiling pushed past, over both families.
-      run crawl-local crawl 2m '' both --target local --ceiling-step 5000 --round-pause 10000
+      run crawl-local crawl 2m '' both --target local --ceiling-step 5000 --round-pause 10000 \
+        --max-smolnet-only 0
       ;;
     *) die "no runs are planned for the event '${EVENT_NAME:-}'" ;;
   esac
@@ -192,6 +193,11 @@ scheduled() {
       # by keepalive after 2 h.
       run idle-4h idle 4h '' both --quiet 5m --idle-max 2h --outage-max 10m \
         --nat-timeout 30m --keepalive
+      # The Tranco top 1,000, weekly rather than nightly so that each site
+      # sees a dozen or so HEADs a week: about 8 rounds, 5 minutes apart,
+      # 16 in flight. Only a host SmolNet persistently fails to reach while
+      # the kernel reaches it is a fault; one that fails over both never is.
+      run crawl-1h crawl 1h '' both --max-smolnet-only 0
       ;;
     *) die "no runs are planned for the schedule '${SCHEDULE:-}'" ;;
   esac

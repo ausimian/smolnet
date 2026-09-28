@@ -122,6 +122,30 @@ defmodule SmolNet.Integration.CrawlTest do
     end
   end
 
+  test "visits only global addresses" do
+    for address <- [
+          {127, 0, 0, 1},
+          {10, 1, 2, 3},
+          {172, 20, 0, 1},
+          {192, 168, 1, 1},
+          {0, 0, 0, 0}
+        ] do
+      refute Crawl.global?(address), inspect(address)
+    end
+
+    for address <- [{169, 254, 1, 1}, {100, 64, 0, 1}, {224, 0, 0, 1}, {0, 0, 0, 0, 0, 0, 0, 1}] do
+      refute Crawl.global?(address), inspect(address)
+    end
+
+    for address <- [{0xFD00, 0x77, 0, 0, 0, 0, 0, 1}, {0xFE80, 0, 0, 0, 0, 0, 0, 1}] do
+      refute Crawl.global?(address), inspect(address)
+    end
+
+    assert Crawl.global?({142, 250, 207, 14})
+    assert Crawl.global?({172, 32, 0, 1})
+    assert Crawl.global?({0x2606, 0x4700, 0, 0, 0, 0, 0, 0x1111})
+  end
+
   test "compares SmolNet's outcome of a visit with the kernel's" do
     ok = %{class: :ok}
     failed = %{class: :reset}

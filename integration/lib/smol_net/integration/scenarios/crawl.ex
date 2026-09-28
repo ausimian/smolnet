@@ -33,8 +33,9 @@ defmodule SmolNet.Integration.Scenarios.Crawl do
   `--target local` crawls servers on the peer instead, made to succeed,
   stay silent, hang up and refuse, which needs no internet and runs in
   every mode. The run fails on a deadline, a socket leak, a ceiling that
-  misbehaves, or more than `--max-smolnet-only` hosts that failed over
-  SmolNet in every round the kernel reached them.
+  misbehaves, or more than `--max-smolnet-only` hosts that SmolNet never
+  reached though the kernel did in at least two rounds and half of them:
+  hosts that fail over SmolNet persistently, not a flaky one.
   """
 
   alias SmolNet.Integration.Crawl.Ceiling
@@ -56,6 +57,25 @@ defmodule SmolNet.Integration.Scenarios.Crawl do
   @local_kinds [:ok, :silent, :hangup, :refused]
   @accept_poll 250
   @max_listed 200
+  # Unspecified, private, shared, loopback, link-local, benchmarking and
+  # multicast or reserved IPv4; unspecified, loopback, IPv4-mapped, unique
+  # local, link-local and multicast IPv6.
+  @not_global [
+    {{0, 0, 0, 0}, 8},
+    {{10, 0, 0, 0}, 8},
+    {{100, 64, 0, 0}, 10},
+    {{127, 0, 0, 0}, 8},
+    {{169, 254, 0, 0}, 16},
+    {{172, 16, 0, 0}, 12},
+    {{192, 168, 0, 0}, 16},
+    {{198, 18, 0, 0}, 15},
+    {{224, 0, 0, 0}, 3},
+    {{0, 0, 0, 0, 0, 0, 0, 0}, 127},
+    {{0, 0, 0, 0, 0, 0xFFFF, 0, 0}, 96},
+    {{0xFC00, 0, 0, 0, 0, 0, 0, 0}, 7},
+    {{0xFE80, 0, 0, 0, 0, 0, 0, 0}, 10},
+    {{0xFF00, 0, 0, 0, 0, 0, 0, 0}, 8}
+  ]
 
   @doc "Returns the scenario's runner config."
   @spec config() :: keyword()
@@ -122,8 +142,9 @@ defmodule SmolNet.Integration.Scenarios.Crawl do
                               its default of 262144 (default 0)
         --evidence N          how many hosts that fail over SmolNet alone to cut captures
                               for (default 25)
-        --max-smolnet-only N  fail if more hosts than this failed over SmolNet in every
-                              round the kernel reached them, or -1 never to (default -1)
+        --max-smolnet-only N  fail if more hosts than this failed over SmolNet persistently:
+                              never reached by SmolNet, and by the kernel in at least two
+                              rounds and half of them; -1 never to fail (default -1)
 
       --concurrency sets how many hosts are visited at once, at most 32 for the
       internet (default 16).
@@ -272,6 +293,7 @@ defmodule SmolNet.Integration.Scenarios.Crawl do
 
   defp reach(context, [host | rest], family, _reason) do
     with {:ok, address} <- :inet.getaddr(String.to_charlist(host), family, @dns_timeout),
+         true <- global?(address) || {:error, :not_global},
          {:ok, socket} <-
            :gen_tcp.connect(address, @https_port, [family], @preflight_timeout) do
       :gen_tcp.close(socket)
@@ -523,7 +545,14 @@ defmodule SmolNet.Integration.Scenarios.Crawl do
     )
   end
 
+  # The loop calls for a round at least once, and once more after a pause
+  # the run's end cut short; that one is not a round.
   defp crawl_round(context, settings, sites, families, baseline) do
+    if Soak.count(context, :rounds, 0) == 0 or Soak.running?(context),
+      do: run_round(context, settings, sites, families, baseline)
+  end
+
+  defp run_round(context, settings, sites, families, baseline) do
     round = Soak.count(context, :rounds)
     started = System.monotonic_time(:millisecond)
     clients = clients(settings, round)
@@ -579,11 +608,19 @@ defmodule SmolNet.Integration.Scenarios.Crawl do
   end
 
   # Resolution is the host's, not SmolNet's, and both stacks visit the
-  # address it gives, so that they meet the same server.
+  # address it gives, so that they meet the same server. Some names
+  # resolve to loopback or private addresses, which are not internet
+  # peers: the kernel would visit this host or its network, and SmolNet's
+  # packets would be dropped as martians, so neither visits them.
   defp resolve(%{targets: nil, host: host}, family) do
     case :inet.getaddr(String.to_charlist(host), family, @dns_timeout) do
-      {:ok, address} -> {:ok, address, @https_port}
-      {:error, _reason} = error -> error
+      {:ok, address} ->
+        if global?(address),
+          do: {:ok, address, @https_port},
+          else: {:error, {:not_global, to_string(:inet.ntoa(address))}}
+
+      {:error, _reason} = error ->
+        error
     end
   end
 
@@ -593,6 +630,24 @@ defmodule SmolNet.Integration.Scenarios.Crawl do
       :error -> {:error, :nxdomain}
     end
   end
+
+  @doc false
+  # Whether `address` is a global unicast address, one an internet host
+  # may have.
+  @spec global?(:inet.ip_address()) :: boolean()
+  def global?(address) do
+    size = if tuple_size(address) == 4, do: 32, else: 128
+    value = :binary.decode_unsigned(bits(address))
+
+    not Enum.any?(@not_global, fn {prefix, length} ->
+      tuple_size(prefix) == tuple_size(address) and
+        Bitwise.bsr(value, size - length) ==
+          Bitwise.bsr(:binary.decode_unsigned(bits(prefix)), size - length)
+    end)
+  end
+
+  defp bits({a, b, c, d}), do: <<a, b, c, d>>
+  defp bits(address), do: for(word <- Tuple.to_list(address), into: <<>>, do: <<word::16>>)
 
   defp attempt(context, settings, role, site, address, port) do
     family = if tuple_size(address) == 4, do: :inet, else: :inet6
@@ -857,7 +912,7 @@ defmodule SmolNet.Integration.Scenarios.Crawl do
     Soak.note(
       context,
       "of #{comparison.hosts} hosts, #{comparison.smolnet_only} failed over SmolNet alone " <>
-        "(#{persistent} in every round the kernel reached them), #{comparison.kernel_only} " <>
+        "(#{persistent} persistently), #{comparison.kernel_only} " <>
         "over the kernel alone, and #{comparison.both_failed} over both"
     )
 
@@ -878,9 +933,12 @@ defmodule SmolNet.Integration.Scenarios.Crawl do
     end)
   end
 
-  # A host SmolNet never reached, in every round the kernel did.
+  # A host SmolNet never reached, though the kernel reached it in at least
+  # two rounds and at least half of them: one the kernel reached only now
+  # and then is flaky, whatever SmolNet made of it.
   defp persistent?(record) do
-    Map.get(record.smolnet, :ok, 0) == 0 and record.smolnet_only == Map.get(record.kernel, :ok, 0)
+    kernel_ok = Map.get(record.kernel, :ok, 0)
+    Map.get(record.smolnet, :ok, 0) == 0 and kernel_ok >= 2 and 2 * kernel_ok >= record.rounds
   end
 
   defp causes(listed) do
@@ -907,7 +965,7 @@ defmodule SmolNet.Integration.Scenarios.Crawl do
     Soak.fail(
       context,
       :smolnet_only,
-      "#{persistent} hosts failed over SmolNet in every round the kernel reached them, " <>
+      "#{persistent} hosts failed over SmolNet persistently, while the kernel reached them, " <>
         "more than --max-smolnet-only #{max}",
       [{"causes", causes}]
     )

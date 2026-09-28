@@ -1,6 +1,6 @@
 # A small host list for trying the crawl out, in Tranco's rank,host form:
 #
-#     sudo mix run integration/crawl.exs --list fixture --duration 0
+#     sudo mix run integration/crawl.exs --list fixture --duration 0 --no-ceiling
 #
 # Real runs fetch the Tranco list when they start; see
 # SmolNet.Integration.Crawl.Hosts.

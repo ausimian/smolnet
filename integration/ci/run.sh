@@ -168,7 +168,7 @@ message=$(jq -r '
     (.value | to_entries | sort_by(-.value) | map("\(.key) \(.value)") | join(", "))),
   ($v.results.comparison // null | select(.) |
     "of \(.hosts) hosts, \(.smolnet_only) failed over SmolNet alone " +
-      "(\(.persistent_smolnet_only) every round), \(.kernel_only) over the kernel alone, " +
+      "(\(.persistent_smolnet_only) persistently), \(.kernel_only) over the kernel alone, " +
       "\(.both_failed) over both"),
   (($v.results.causes // [])[:8][] |
     "SmolNet alone, \(.cause): \(.hosts) hosts, such as \(.examples[:3] | join(", "))"),

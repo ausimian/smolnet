@@ -10,7 +10,8 @@ name: Integration
 #   schedule           nightly, 10 minutes each of smoke, TLS to a local
 #                      target and TLS to speed.cloudflare.com; weekly, 4 h
 #                      soaks of both TLS targets and of idle connections,
-#                      and 1 h of smoke. A hosted job may take 6 h, so the
+#                      and 1 h each of smoke and of the crawl of the
+#                      Tranco top 1,000. A hosted job may take 6 h, so the
 #                      long soak is 4 h, not 6 h.
 #   workflow_dispatch  one run, from the inputs. It never files issues.
 #   pull_request       a minute or two of each kind, netem included, when
