@@ -373,7 +373,18 @@ defmodule SmolNet.Integration.Scenarios.Idle do
 
   defp listen_all(context, settings, plan) do
     keys = plan |> Enum.map(&{&1.family, &1.transport, &1.profile}) |> Enum.uniq()
-    listen_each(context, settings, keys, Tls.local_options(), %{})
+    listen_each(context, settings, keys, hibernating(Tls.local_options()), %{})
+  end
+
+  # `:ssl`'s processes, at both ends of a TLS connection, would otherwise
+  # keep what the last exchange left on their heaps for as long as the
+  # connection idles, as SmolNet's own sockets did before #135, and
+  # metrics.csv would show that as binary memory rising.
+  defp hibernating(%{server: server, client: client}) do
+    %{
+      server: [hibernate_after: @collect_after] ++ server,
+      client: [hibernate_after: @collect_after] ++ client
+    }
   end
 
   defp listen_each(_context, _settings, [], _tls, listeners), do: {:ok, listeners}

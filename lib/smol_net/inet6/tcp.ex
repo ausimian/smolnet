@@ -267,8 +267,15 @@ defmodule SmolNet.Inet6.Tcp do
     }
   end
 
+  # An idle socket's process does no work, so it never collects garbage and
+  # keeps the binaries of its last transfer alive (#135). Hibernating after
+  # this much idle time compacts the heap and drops them. It is well above
+  # the gaps inside an exchange, so a busy connection never pays for it.
+  @hibernate_after 5_000
+
   @spec start_link(map()) :: :gen_statem.start_ret()
-  def start_link(config), do: :gen_statem.start_link(__MODULE__, config, [])
+  def start_link(config),
+    do: :gen_statem.start_link(__MODULE__, config, hibernate_after: @hibernate_after)
 
   @impl true
   def callback_mode, do: :handle_event_function

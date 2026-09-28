@@ -154,3 +154,14 @@
   SmolNet counted an ACK as a duplicate only if its window was unchanged,
   so none of Linux's duplicate ACKs counted. An ACK whose SACK blocks
   report new data is now a duplicate whatever its window.
+- An idle `:gen_tcp` or `:gen_udp` socket on SmolNet no longer holds the
+  memory of its last transfer. Each socket is a process, and one that does
+  no work never collects its garbage, so it kept the binaries of the data
+  it last sent or received alive, up to about the size of that transfer,
+  for as long as it stayed idle. A `SmolNet.Loopback` link did the same
+  with the packets it last forwarded. These processes now hibernate after
+  5 seconds with nothing to do, which frees that memory; a connection busy
+  with an exchange never waits that long, so never pays for it. `:ssl`'s
+  own connection processes over a SmolNet socket behave as they do over
+  any other, keeping their last exchange until they hibernate, which
+  their `hibernate_after` option controls.

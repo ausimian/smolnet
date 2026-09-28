@@ -198,8 +198,13 @@ defmodule SmolNet.Inet6.Udp do
     }
   end
 
+  # Hibernate an idle socket so it drops the binaries of its last datagrams,
+  # as `SmolNet.Inet6.Tcp` does.
+  @hibernate_after 5_000
+
   @spec start_link(map()) :: :gen_statem.start_ret()
-  def start_link(config), do: :gen_statem.start_link(__MODULE__, config, [])
+  def start_link(config),
+    do: :gen_statem.start_link(__MODULE__, config, hibernate_after: @hibernate_after)
 
   @impl true
   def callback_mode, do: :handle_event_function
