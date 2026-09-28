@@ -458,10 +458,6 @@ pub(super) struct Rack {
     rtt: Duration,
     /// `RACK.min_RTT`, over first transmissions.
     min_rtt: Option<Duration>,
-    /// `RACK.fack`: the highest end of a segment delivered.
-    fack: Option<TcpSeqNumber>,
-    /// `RACK.reord`: whether a segment has been delivered out of order.
-    reordering: bool,
     /// `RACK.reo_wnd_mult`, raised once a round trip by D-SACKs.
     reo_wnd_mult: u32,
     /// `RACK.reo_wnd_persist`: how many more recoveries keep the raised
@@ -493,8 +489,6 @@ impl Rack {
             xmit: None,
             rtt: Duration::ZERO,
             min_rtt: None,
-            fack: None,
-            reordering: false,
             reo_wnd_mult: 1,
             reo_wnd_persist: 0,
             dsack_round: None,
@@ -524,9 +518,8 @@ impl Rack {
 
     /// RFC 8985 6.2 steps 1 to 3, for an ACK that acknowledges `[una, ack)`
     /// cumulatively and SACKs `blocks`, with `board` as it stood before the
-    /// ACK: updates the latest segment delivered, `RACK.rtt`, `RACK.min_RTT`
-    /// and whether reordering has been seen, from the octets that the ACK
-    /// newly reports delivered.
+    /// ACK: updates the latest segment delivered, `RACK.rtt` and
+    /// `RACK.min_RTT` from the octets that the ACK newly reports delivered.
     ///
     /// Returns a round trip sample that Karn's algorithm allows, from the
     /// earliest sent of those octets that were sent only once, as Linux
@@ -540,7 +533,7 @@ impl Rack {
         (una, ack): (TcpSeqNumber, TcpSeqNumber),
         blocks: &[(TcpSeqNumber, TcpSeqNumber)],
     ) -> Option<Duration> {
-        let (fack, min_rtt) = (self.fack, self.min_rtt);
+        let min_rtt = self.min_rtt;
         let mut latest: Option<Xmit> = None;
         let (mut cumulative_sample, mut sack_sample) = (None::<Duration>, None::<Duration>);
         let mut cumulative_retransmission = false;
@@ -567,16 +560,11 @@ impl Rack {
                     };
                     *sample = Some(sample.map_or(rtt, |sample| sample.max(rtt)));
                     self.min_rtt = Some(self.min_rtt.map_or(rtt, |min| min.min(rtt)));
-                    // Step 3: delivered below the highest delivered before.
-                    if fack.is_some_and(|fack| b < fack) {
-                        self.reordering = true;
-                    }
                 }
                 let delivered = sent.delivered(b);
                 if latest.is_none_or(|latest| delivered.after(&latest)) {
                     latest = Some(delivered);
                 }
-                self.fack = Some(self.fack.map_or(b, |fack| fack.max(b)));
             }
         }
         if let Some(latest) = latest {
@@ -611,15 +599,23 @@ impl Rack {
         }
     }
 
-    /// `RACK.reo_wnd` (RFC 8985 6.2 step 4). Until reordering has been seen,
-    /// it is zero during loss recovery, or once `DupThresh` segments are
-    /// SACKed, as `recovering_or_sacked` says; otherwise a quarter of the
-    /// minimum round trip, times the multiplier, and at most `srtt`.
-    fn reo_wnd(&self, recovering_or_sacked: bool, srtt: Option<Duration>) -> Duration {
-        if !self.reordering && recovering_or_sacked {
-            return Duration::ZERO;
-        }
-        let wnd = self.min_rtt.unwrap_or(Duration::ZERO) / 4 * self.reo_wnd_mult;
+    /// The reordering window: a quarter of `srtt`, or of the minimum round
+    /// trip before there is one, times the multiplier, and at most `srtt`.
+    ///
+    /// RFC 8985 6.2 step 4 takes a quarter of the minimum round trip, and
+    /// none at all during recovery, or once three segments are SACKed,
+    /// until reordering has been seen, since RACK stands alone there. Here
+    /// RFC 6675's `IsLost` still marks the losses that duplicate ACKs show,
+    /// and RACK only adds what they cannot, so it can afford a margin from
+    /// the start. Without one, a path that holds packets back for a delay
+    /// had RACK resend hundreds of segments needlessly in a connection's
+    /// first round trips, before any sign of reordering, each one D-SACKed,
+    /// and cut the window each time; smoltcp has no undo. The minimum is no
+    /// base on such a path either: the packets it lets through first drag it
+    /// down.
+    fn reo_wnd(&self, srtt: Option<Duration>) -> Duration {
+        let base = srtt.or(self.min_rtt).unwrap_or(Duration::ZERO);
+        let wnd = base / 4 * self.reo_wnd_mult;
         srtt.map_or(wnd, |srtt| wnd.min(srtt))
     }
 
@@ -630,14 +626,17 @@ impl Rack {
         &mut self,
         board: &Scoreboard,
         now: Instant,
-        recovering_or_sacked: bool,
         srtt: Option<Duration>,
     ) -> bool {
         let Some(xmit) = self.xmit else {
             self.reo_timeout = None;
             return false;
         };
-        let wait = self.rtt + self.reo_wnd(recovering_or_sacked, srtt);
+        // A reordered ACK can make `RACK.rtt` far shorter than the round
+        // trip of the segments it judges, so the wait is at least SRTT, plus
+        // the window.
+        let rtt = srtt.map_or(self.rtt, |srtt| self.rtt.max(srtt));
+        let wait = rtt + self.reo_wnd(srtt);
         let (newly_lost, next) = self.log.detect(board, now, xmit, wait);
         self.reo_timeout = next;
         newly_lost
@@ -874,12 +873,11 @@ mod test {
 
         // An ACK of the resent [0, 10) and of [10, 20) takes no sample: the
         // resend may be what arrived, and [10, 20) may have arrived long
-        // before. [10, 20) was delivered below [20, 30): reordering.
+        // before.
         let mut board = Scoreboard::new();
         board.add(seq(20), seq(30));
         let sample = rack.on_ack(ms(170), &board, (seq(0), seq(20)), &[]);
         assert_eq!(sample, None);
-        assert!(rack.reordering);
         assert_eq!(latest(&rack), Some((ms(130), seq(10))));
         assert_eq!(rack.rtt, Duration::from_millis(40));
     }
@@ -901,24 +899,22 @@ mod test {
     }
 
     #[test]
-    fn reo_wnd_follows_reordering_and_dsacks() {
+    fn reo_wnd_follows_srtt_and_dsacks() {
         let mut rack = Rack::new();
         rack.min_rtt = Some(Duration::from_millis(40));
+        assert_eq!(rack.reo_wnd(None), Duration::from_millis(10));
         let srtt = Some(Duration::from_millis(50));
-        assert_eq!(rack.reo_wnd(false, srtt), Duration::from_millis(10));
-        assert_eq!(rack.reo_wnd(true, srtt), Duration::ZERO);
-        rack.reordering = true;
-        assert_eq!(rack.reo_wnd(true, srtt), Duration::from_millis(10));
+        assert_eq!(rack.reo_wnd(srtt), Duration::from_micros(12_500));
 
         // A D-SACK raises the multiplier once a round trip, up to SRTT.
         rack.on_dsack(seq(0), seq(100));
         rack.on_dsack(seq(50), seq(150));
-        assert_eq!(rack.reo_wnd(false, srtt), Duration::from_millis(20));
+        assert_eq!(rack.reo_wnd(srtt), Duration::from_millis(25));
         rack.on_dsack(seq(100), seq(200));
         rack.on_dsack(seq(200), seq(300));
         rack.on_dsack(seq(300), seq(400));
         rack.on_dsack(seq(400), seq(500));
-        assert_eq!(rack.reo_wnd(false, srtt), Duration::from_millis(50));
+        assert_eq!(rack.reo_wnd(srtt), Duration::from_millis(50));
 
         // Sixteen recoveries without one restore it.
         for _ in 0..15 {
@@ -926,6 +922,6 @@ mod test {
         }
         assert_eq!(rack.reo_wnd_mult, 6);
         rack.on_recovery_end();
-        assert_eq!(rack.reo_wnd(false, srtt), Duration::from_millis(10));
+        assert_eq!(rack.reo_wnd(srtt), Duration::from_micros(12_500));
     }
 }

@@ -23,7 +23,7 @@ mod rack;
 mod scoreboard;
 
 use rack::{Probe, Rack};
-use scoreboard::{DUP_THRESH, Scoreboard};
+use scoreboard::Scoreboard;
 
 macro_rules! tcp_trace {
     ($($arg:expr),*) => (net_log!(trace, $($arg),*));
@@ -1765,15 +1765,8 @@ impl<'a> Socket<'a> {
         if let Some(boundary) = self.scoreboard.lost_below(self.remote_mss) {
             self.rack.log.mark_lost_below(boundary);
         }
-        let sacked = self
-            .scoreboard
-            .sacked_between(self.local_seq_no, self.remote_last_seq);
-        let recovering_or_sacked = self.recover.is_some()
-            || self.rack.log.recovering()
-            || sacked >= DUP_THRESH * self.remote_mss;
         let srtt = self.rtte.srtt();
-        self.rack
-            .detect(&self.scoreboard, now, recovering_or_sacked, srtt)
+        self.rack.detect(&self.scoreboard, now, srtt)
     }
 
     /// Enters fast recovery, with a fast retransmission of the first
@@ -8452,9 +8445,11 @@ mod test {
         // but the resent "ccc" is lost again. RFC 6675 alone resends a hole
         // once, and waits for the timeout; RACK sees that "ccc" was sent
         // before data now delivered, a round trip ago.
+        // The wait is SRTT, 50 ms, plus a quarter of it.
         send!(s, time 1100, sack_repr(6, 256, &[(9, 30)]));
-        recv!(s, time 1100, Ok(data_repr(6, b"ccc")));
-        recv_nothing!(s, time 1100);
+        recv_nothing!(s, time 1112);
+        recv!(s, time 1113, Ok(data_repr(6, b"ccc")));
+        recv_nothing!(s, time 1113);
         send!(s, time 1150, ack_repr(30));
         assert_eq!(s.recover, None);
     }
@@ -8474,14 +8469,16 @@ mod test {
         recv!(s, time 300, Ok(data_repr(9, b"ccc")));
         assert_eq!(s.rtte.retransmission_timeout(), Duration::from_millis(400));
 
-        // The resent "aaa" is lost again. The timer's own round trip sample
-        // waits for it to be acknowledged, and a sample from "aaa" itself
-        // would break Karn's algorithm. "ccc", sent once, is SACKed during
-        // the recovery RACK starts, and its sample ends the backoff.
+        // The resent "aaa" is lost again, and RACK starts recovery for it.
+        // The timer's own round trip sample waits for it to be acknowledged,
+        // and a sample from "aaa" itself would break Karn's algorithm. "ccc",
+        // sent once, is SACKed during recovery, and its sample ends the
+        // backoff.
         send!(s, time 350, sack_repr(3, 256, &[(6, 9)]));
-        send!(s, time 351, sack_repr(3, 256, &[(6, 12)]));
+        recv!(s, time 363, Ok(data_repr(3, b"aaa")));
+        assert_eq!(s.rtte.retransmission_timeout(), Duration::from_millis(400));
+        send!(s, time 364, sack_repr(3, 256, &[(6, 12)]));
         assert_eq!(s.rtte.retransmission_timeout(), Duration::from_millis(200));
-        recv!(s, time 351, Ok(data_repr(3, b"aaa")));
     }
 
     // Sends "aaa", "BBB" and "ccc" at 100 after a 40 ms round trip, so that

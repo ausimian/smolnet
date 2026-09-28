@@ -9,7 +9,7 @@ use crate::wire::TcpSeqNumber;
 const SCOREBOARD_SIZE: usize = 32;
 
 /// RFC 6675 `DupThresh`.
-pub(super) const DUP_THRESH: usize = 3;
+const DUP_THRESH: usize = 3;
 
 #[derive(Debug, Clone, Copy)]
 pub(super) struct Scoreboard {

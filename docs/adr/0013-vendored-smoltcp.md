@@ -300,13 +300,23 @@ Hex packages are unaffected: they ship only precompiled NIFs and omit
     `RACK.rtt`. A retransmission acknowledged sooner than the minimum
     round trip is passed over, since its first transmission may be what
     arrived. A range sent before the latest delivered, and not SACKed, is
-    lost once `RACK.rtt` plus the reordering window has passed since it
-    was sent. Sent before means in an earlier send, or earlier in the
-    same run. The window is a quarter of the minimum round trip, at
-    most SRTT, and zero during recovery or once three segments' worth are
-    SACKed, until a segment sent once is delivered below one delivered
-    earlier (reordering). A round trip with a D-SACK raises its multiplier
-    for the next 16 recoveries. A reordering timer rechecks when the next
+    lost once `RACK.rtt`, but at least SRTT, plus the reordering window
+    has passed since it was sent. Sent before means in an earlier send, or
+    earlier in the same run. The window is a quarter of SRTT, times a
+    multiplier that a round trip with a D-SACK raises for the next 16
+    recoveries, and at most SRTT. This departs from RFC 8985 6.2, whose
+    window is a quarter of the minimum round trip, and zero during
+    recovery or with three segments SACKed until reordering is seen,
+    because RACK stands alone there. Here `IsLost` still marks what
+    duplicate ACKs show, so RACK can keep a margin. With the RFC's window,
+    under netem `delay 20ms reorder 10%` a single stream fell from 44 to
+    9 Mbit/s: in the connection's first second RACK resent 140 to 730
+    segments that had only been held back, every one D-SACKed, before any
+    sign of reordering, and each recovery cut CUBIC's window, which
+    smoltcp has no undo for. The minimum round trip is no base on such a
+    path, since the packets let through first drag it down, and a
+    reordered ACK can make `RACK.rtt` as short. A reordering timer
+    rechecks when the next
     range would be lost. Data RACK deems lost starts fast recovery as the
     third duplicate ACK does, with the controller's usual reduction.
   - Tail loss probes (RFC 8985 7): to a peer that SACKs, with no
