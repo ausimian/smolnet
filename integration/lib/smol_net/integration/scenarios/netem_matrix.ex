@@ -17,6 +17,14 @@ defmodule SmolNet.Integration.Scenarios.NetemMatrix do
     * `kernel` - the kernel here sends to the kernel in `netem-peer`,
       across the veth: the baseline.
 
+  `--thin-acks N` reproduces the stretch ACKs of a real server, whose NIC
+  coalesces what it receives (GRO, LRO), so that it acknowledges several
+  segments at once (#126). `netem-topology.sh up --thin-acks N` has the
+  kernel in `netem-peer` send only one in N of its pure ACKs, and forwards
+  between the device and the veth. That kernel is then the kernel end of
+  `send` and `receive` too, so that every flow crosses the veth, which
+  alone the profile impairs.
+
   SmolNet is the client of every connection over the device, and this
   namespace's kernel of every one across the veth. A transfer carries
   `--bytes` in all, split evenly over each of `--streams` connections at
@@ -147,7 +155,8 @@ defmodule SmolNet.Integration.Scenarios.NetemMatrix do
         stall_rtos: :integer,
         transfer_timeout: :integer,
         gap: :float,
-        buffer: :integer
+        buffer: :integer,
+        thin_acks: :integer
       ],
       defaults: [
         profiles: Enum.join(["none" | Netem.profiles()], ","),
@@ -159,7 +168,8 @@ defmodule SmolNet.Integration.Scenarios.NetemMatrix do
         stall_rtos: 5,
         transfer_timeout: 600_000,
         gap: 0.5,
-        buffer: nil
+        buffer: nil,
+        thin_acks: nil
       ],
       counters: [:transfers, :intact, :stalled],
       stack: [limits: %{sockets: 256}],
@@ -186,6 +196,9 @@ defmodule SmolNet.Integration.Scenarios.NetemMatrix do
         --gap R               the share of the kernel's throughput below which a
                               case is noted as a gap (default 0.5)
         --buffer N            SmolNet's recbuf and sndbuf (default: the stack's)
+        --thin-acks N         stretch ACKs: the kernel in netem-peer sends one in N
+                              of its pure ACKs, and is the kernel end of every
+                              flow; the profile impairs the veth alone
 
       Run it in a network namespace of its own:
 
@@ -203,7 +216,7 @@ defmodule SmolNet.Integration.Scenarios.NetemMatrix do
   def run(context) do
     with {:ok, settings} <- settings(context),
          :ok <- check_mode(context),
-         :ok <- topology(context, ["up"]) do
+         :ok <- topology(context, ["up" | thin_arguments(settings)]) do
       try do
         run_matrix(context, settings)
       after
@@ -243,7 +256,8 @@ defmodule SmolNet.Integration.Scenarios.NetemMatrix do
          :ok <- positive(:transfer_timeout, extra.transfer_timeout),
          :ok <- enough_bytes(extra.bytes, streams),
          :ok <- gap(extra.gap),
-         :ok <- buffer(extra.buffer) do
+         :ok <- buffer(extra.buffer),
+         :ok <- thin_acks(extra.thin_acks) do
       {:ok,
        %{
          profiles: profiles,
@@ -255,7 +269,9 @@ defmodule SmolNet.Integration.Scenarios.NetemMatrix do
          stall_rtos: extra.stall_rtos,
          transfer_timeout: extra.transfer_timeout,
          gap: extra.gap,
-         buffer: extra.buffer
+         buffer: extra.buffer,
+         thin_acks: extra.thin_acks,
+         impaired: if(extra.thin_acks, do: [@veth], else: [context.device, @veth])
        }}
     end
   end
@@ -323,6 +339,10 @@ defmodule SmolNet.Integration.Scenarios.NetemMatrix do
 
   defp buffer(nil), do: :ok
   defp buffer(bytes), do: positive(:buffer, bytes)
+
+  defp thin_acks(nil), do: :ok
+  defp thin_acks(n) when is_integer(n) and n >= 2, do: :ok
+  defp thin_acks(n), do: {:error, "--thin-acks must be 2 or more, got #{n}"}
 
   defp dashed(name), do: name |> to_string() |> String.replace("_", "-")
 
@@ -396,6 +416,9 @@ defmodule SmolNet.Integration.Scenarios.NetemMatrix do
     |> Enum.map(fn {issue, why} -> %{issue: issue, why: why} end)
   end
 
+  defp thin_arguments(%{thin_acks: nil}), do: []
+  defp thin_arguments(%{thin_acks: n}), do: ["--thin-acks", Integer.to_string(n)]
+
   defp topology(context, arguments) do
     case System.cmd(@topology, arguments,
            stderr_to_stdout: true,
@@ -444,7 +467,7 @@ defmodule SmolNet.Integration.Scenarios.NetemMatrix do
 
   defp run_cases(context, settings, [test_case | rest] = remaining, profile, results) do
     with true <- Soak.running?(context),
-         :ok <- switch(context, profile, test_case.profile) do
+         :ok <- switch(context, settings, profile, test_case.profile) do
       results = [run_case(context, settings, test_case) | results]
       Soak.record(context, :transfers, Enum.reverse(results))
       run_cases(context, settings, rest, test_case.profile, results)
@@ -459,10 +482,10 @@ defmodule SmolNet.Integration.Scenarios.NetemMatrix do
   end
 
   # Both paths take the same profile together, each way.
-  defp switch(_context, profile, profile), do: :ok
+  defp switch(_context, _settings, profile, profile), do: :ok
 
-  defp switch(context, _previous, profile) do
-    devices = [context.device, @veth]
+  defp switch(context, settings, _previous, profile) do
+    devices = settings.impaired
     Enum.each(devices, &Netem.clear/1)
 
     if profile == "none" do
@@ -564,7 +587,10 @@ defmodule SmolNet.Integration.Scenarios.NetemMatrix do
       if settings.buffer, do: [recbuf: settings.buffer, sndbuf: settings.buffer], else: []
 
     smolnet = Network.tcp_options(context, :subject, family) ++ buffers
-    {[family], Network.host_address(family), smolnet}
+
+    if settings.thin_acks,
+      do: {[family, netns: @peer_netns], Map.fetch!(@peer, family), smolnet},
+      else: {[family], Network.host_address(family), smolnet}
   end
 
   defp roles(:receive), do: {:receiver, :sender}
