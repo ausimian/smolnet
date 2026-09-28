@@ -56,6 +56,11 @@ defmodule SmolNet.Loopback do
 
   @link_ref :loopback
 
+  # An idle link keeps the last packets it forwarded until it collects
+  # garbage; hibernating after this much idle time drops them, as the
+  # socket processes do (#135).
+  @hibernate_after 5_000
+
   @doc """
   Starts a loopback link and the stack it loops.
 
@@ -70,8 +75,14 @@ defmodule SmolNet.Loopback do
 
     result =
       case name do
-        nil -> GenServer.start_link(__MODULE__, stack_options)
-        name -> GenServer.start_link(__MODULE__, stack_options, name: name)
+        nil ->
+          GenServer.start_link(__MODULE__, stack_options, hibernate_after: @hibernate_after)
+
+        name ->
+          GenServer.start_link(__MODULE__, stack_options,
+            name: name,
+            hibernate_after: @hibernate_after
+          )
       end
 
     case result do
