@@ -98,6 +98,81 @@ with its plan, timeline and snapshots, and keeps its capture in
 `link_restart` result records, for #43, what a link that could be
 replaced would have saved under `:mark_down` and `:notify`.
 
+The crawl scenario, `crawl.exs`, sends TLS `HEAD /` to the top 1,000
+sites of the day's [Tranco list](https://tranco-list.eu), over SmolNet
+and over the kernel, host by host, round after round, to meet the TCP
+peers nothing else in the harness does: every MSS, window scale, SACK
+and timestamp choice, every way of closing and resetting, and the
+middleboxes in front of them (see `SmolNet.Integration.Scenarios.Crawl`).
+Before the first round it pushes the stack past its socket ceiling, 256
+TCP sockets at the default buffers, against a listener on the host:
+
+```console
+sudo mix run integration/crawl.exs --duration 1h
+sudo mix run integration/crawl.exs --duration 0 --list fixture --no-ceiling  # one round of a committed list
+sudo mix run integration/crawl.exs --duration 2m --target local  # servers on this host, no internet
+```
+
+It is meant to be polite to the sites it visits:
+
+- one visit per host per stack per round, never retried, with
+  `--round-pause` (5 min) between rounds;
+- at most `--concurrency` (16, and never more than 32) visits in flight
+  across all hosts;
+- every stage of a visit (connect, handshake, response) within
+  `--host-timeout` (10 s);
+- a `user-agent` of `smolnet-integration (+https://github.com/ausimian/smolnet)`;
+- the top 1,000 unless `--top` asks for more, up to 10,000;
+- and the socket ceiling pushed only against the local listener.
+
+The list is fetched from tranco-list.eu when the run starts, with two
+requests (the API allows one a second), and saved with the artifacts as
+`tranco-<ID>-top<N>.csv`, rather than kept in the repository;
+`--list tranco:<ID>` fetches the same list again, and `--list <file>`
+reads one. Tranco is free for research use and asks to be cited
+(Le Pochat et al., NDSS 2019) with the list's ID, which `verdict.json`
+records under `results.list`; the rankings it combines come under their
+own terms, Cloudflare Radar's under CC BY-NC 4.0, so the list is only
+used, never republished.
+
+A host that fails over both stacks is down or flaky and never counts
+against SmolNet. One that fails over SmolNet alone is listed in
+`results.smolnet_only`, with its outcomes over each stack, its reasons,
+and, the first time, `diag/<host>-<family>.pcap` and `.txt` cut from the
+capture, with the TCP options of its SYN-ACK. `results.causes` groups
+those hosts by what failed them, and `hosts.csv` holds every visit. The
+run fails on a deadline, a socket count that does not return to its
+baseline after a round, a ceiling that fails other than with
+`:system_limit` or does not recover, or more than `--max-smolnet-only`
+hosts that failed over SmolNet persistently: that SmolNet never reached,
+though the kernel did in at least two rounds and half of them. A host
+the kernel reaches only now and then is flaky, whatever SmolNet made of
+it. Names that resolve to loopback or private addresses, as a few in the
+list do, are not visited.
+
+```console
+jq '.results | {list: .list.id, outcomes, comparison, causes}' <out>/verdict.json
+jq '.results.smolnet_only[] | {host, family, smolnet, kernel, reasons, evidence}' <out>/verdict.json
+```
+
+The netem matrix, `netem_matrix.exs`, runs bulk TCP transfers under every
+profile of `SmolNet.Integration.Soak.Netem`: SmolNet sending and
+receiving through the device, and, as the baseline, the kernel sending to
+a kernel in another namespace across a veth that `netem-topology.sh`
+builds and the matrix impairs with the same profile. It too runs under
+`isolate`, with the capture off so that tcpdump does not share the CPU:
+
+```console
+integration/netem-topology.sh isolate mix run integration/netem_matrix.exs --no-pcap
+integration/netem-topology.sh isolate mix run integration/netem_matrix.exs --no-pcap \
+  --profiles loss-burst --flows send,kernel --streams 1 --repeats 9 --family inet
+```
+
+It fails when a transfer loses integrity or SmolNet stalls for longer
+than `--stall-rtos` retransmission timeouts, and records throughput and
+completion time beside the kernel's, each gap tagged with the issue that
+tracks it. `netem.md` has the latest matrix and how to read it.
+
 Each script's `--help` lists its options. `--self-check` runs a scenario
 over the TUN helper's loopback with no device and no root, and `--baseline`
 over the kernel's stack alone. Use `MIX_ENV=prod` for measurements: the
@@ -126,13 +201,14 @@ which is not a failure. IPv6 over the device, to the host, works.
 | trigger | runs | files issues |
 | --- | --- | --- |
 | nightly, 03:17 UTC | 10 min each of `smoke`, `tls --target local` and `tls` to speed.cloudflare.com | yes |
-| weekly, Sunday 04:43 UTC | 1 h of `smoke`; 4 h each of `tls --target local`, `tls` to the internet (5 min between rounds) and `idle` (idles of up to 2 h, with keepalive) | yes |
+| weekly, Sunday 04:43 UTC | 1 h of `smoke`; 4 h each of `tls --target local`, `tls` to the internet (5 min between rounds) and `idle` (idles of up to 2 h, with keepalive); 1 h of `crawl` of the Tranco top 1,000 | yes |
 | `workflow_dispatch` | one run from the inputs below | no |
-| pull request changing `integration/**` or the workflow | 1 to 2 min each of `smoke`, `smoke` under netem `delay`, `tls --target local` and `tls` to the internet, the whole `pmtu` matrix, 4 min of `idle`, with its timers shortened so that every vanished peer is detected, and 3 min of `chaos` | no |
+| pull request changing `integration/**` or the workflow | 1 to 2 min each of `smoke`, `smoke` under netem `delay`, `tls --target local` and `tls` to the internet, the whole `pmtu` matrix, 4 min of `idle`, with its timers shortened so that every vanished peer is detected, 3 min of `chaos`, 2 min of `crawl --target local`, ceiling included, and one pass of `netem_matrix` with 2 MiB transfers under every profile but `loss-burst` | no |
 
 `integration/ci/plan.sh` holds the schedule, and `integration/ci/run.sh`
-runs `pmtu` and `chaos` under `pmtu-topology.sh isolate`, so that their
-routers and flaps never touch the runner's own network. A hosted job may run 6 h,
+runs `pmtu`, `netem_matrix` and `chaos` under `pmtu-topology.sh isolate`,
+so that their routers, veths and flaps never touch the runner's own
+network. A hosted job may run 6 h,
 so the long soak is 4 h rather than 6 h, and a dispatched run at most 5 h.
 GitHub disables scheduled workflows after 60 days without a commit to the
 repository; re-enable it from the Actions tab.
@@ -150,7 +226,7 @@ gh workflow run integration.yml --repo ausimian/smolnet --ref <branch> \
 
 | input | values | default |
 | --- | --- | --- |
-| `scenario` | `tls`, `smoke`, `pmtu`, `idle`, `chaos`: runs `integration/<scenario>.exs` | `tls` |
+| `scenario` | `tls`, `smoke`, `pmtu`, `idle`, `chaos`, `crawl`, `netem_matrix`: runs `integration/<scenario>.exs` | `tls` |
 | `duration` | `90s`, `10m`, `1h30m`: at most `5h` | `10m` |
 | `netem` | `none` or a profile of `SmolNet.Integration.Soak.Netem` | `none` |
 | `family` | `both`, `inet`, `inet6` | `both` |
@@ -159,8 +235,9 @@ gh workflow run integration.yml --repo ausimian/smolnet --ref <branch> \
 `extra_args` may hold only letters, digits, spaces and `. _ : = / + , -`,
 and not the options the workflow sets itself (`--duration`, `--family`,
 `--netem`, `--out`, `--device`). Without `--target local`, the TLS scenario
-goes to speed.cloudflare.com; keep internet runs short and at the default
-rates. The run is built with the release NIF.
+goes to speed.cloudflare.com, and the crawl to the Tranco list; keep
+internet runs short and at the default rates. The run is built with the
+release NIF.
 
 ### Reading the results
 
@@ -199,6 +276,11 @@ jq '{outcome, reason, verdict: .verdict.verdict, throughput: .verdict.results.th
 | `environment` | exit 2: the host was unfit or the arguments bad | passes, with a warning | no |
 | `network` | the run failed, but it was the kernel baseline (`--baseline`), or every failure was a kernel transfer or DNS; or it reaches the internet and one round of the kernel baseline to the same target, run straight after, failed too | passes, with a warning | no |
 | `fault` | any other failure, a crash, or a run past its time | fails | if scheduled |
+
+The crawl is never rechecked: it visits every host over the kernel too,
+and a host that failed over both is never one of its failures, so a
+failed crawl is a `fault` unless its only failures were the kernel's own
+deadlines.
 
 The TLS scenario already checks that the host reaches its target before it
 starts, and abandons the run (exit 2) if SmolNet cannot while the host

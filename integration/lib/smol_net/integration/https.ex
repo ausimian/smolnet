@@ -6,8 +6,8 @@ defmodule SmolNet.Integration.Https do
 
   Reads are passive (`:ssl.recv/3`) or active (`{:ssl, socket, data}`
   messages, with `{:active, N}`), so that transfers exercise both of
-  `:ssl`'s receive paths. Neither side times out: a caller bounds the whole
-  exchange with `SmolNet.Integration.Soak.within/4`.
+  `:ssl`'s receive paths. Neither side times out, except `head/4`: a
+  caller bounds the whole exchange with `SmolNet.Integration.Soak.within/4`.
 
   The server answers two requests:
 
@@ -37,10 +37,32 @@ defmodule SmolNet.Integration.Https do
   @spec get(:ssl.sslsocket(), String.t(), String.t(), mode()) ::
           {:ok, response()} | {:error, term()}
   def get(socket, host, path, mode) do
-    with :ok <- :ssl.send(socket, head("GET", host, path, [])) do
+    with :ok <- :ssl.send(socket, request("GET", host, path, [])) do
       read_response(socket, mode)
     end
   end
+
+  @doc """
+  Sends a `HEAD` for `path` on `host` and reads the response's status and
+  headers, passively. A `HEAD` response has no body, whatever its
+  `content-length` says. Returns `{:error, :timeout}` if the response is
+  not all there within `timeout` milliseconds of the call.
+  """
+  @spec head(:ssl.sslsocket(), String.t(), String.t(), timeout()) ::
+          {:ok, %{status: non_neg_integer(), headers: %{String.t() => String.t()}}}
+          | {:error, term()}
+  def head(socket, host, path, timeout) do
+    reader = reader(socket, :passive, deadline(timeout))
+
+    with :ok <- :ssl.send(socket, request("HEAD", host, path, [])),
+         {:ok, status, headers, _reader} <- read_head(reader, :http_response) do
+      {:ok, %{status: status, headers: headers}}
+    end
+  end
+
+  @doc "Returns the `user-agent` every request sends, which links to the repository."
+  @spec user_agent() :: String.t()
+  def user_agent, do: @user_agent
 
   @doc """
   Sends a `POST` of `body` to `path` on `host` and reads the whole
@@ -54,7 +76,7 @@ defmodule SmolNet.Integration.Https do
       {"content-length", Integer.to_string(byte_size(body))}
     ]
 
-    with :ok <- :ssl.send(socket, head("POST", host, path, headers)),
+    with :ok <- :ssl.send(socket, request("POST", host, path, headers)),
          :ok <- send_body(socket, body) do
       read_response(socket, mode)
     end
@@ -122,7 +144,7 @@ defmodule SmolNet.Integration.Https do
   defp reason(400), do: "Bad Request"
   defp reason(404), do: "Not Found"
 
-  defp head(method, host, path, headers) do
+  defp request(method, host, path, headers) do
     headers =
       [{"host", host}, {"user-agent", @user_agent}, {"accept", "*/*"}] ++
         headers ++ [{"connection", "close"}]
@@ -149,15 +171,27 @@ defmodule SmolNet.Integration.Https do
     end
   end
 
-  # The reader: the socket, its receive mode, and the bytes read but not yet
-  # consumed.
+  # The reader: the socket, its receive mode, the bytes read but not yet
+  # consumed, and the monotonic time in milliseconds by which reads must
+  # be done, or :infinity.
 
-  defp reader(socket, :active) do
+  defp reader(socket, mode, deadline \\ :infinity)
+
+  defp reader(socket, :active, deadline) do
     :ok = :ssl.setopts(socket, active: @active_n)
-    %{socket: socket, mode: :active, buffer: <<>>}
+    %{socket: socket, mode: :active, buffer: <<>>, deadline: deadline}
   end
 
-  defp reader(socket, :passive), do: %{socket: socket, mode: :passive, buffer: <<>>}
+  defp reader(socket, :passive, deadline),
+    do: %{socket: socket, mode: :passive, buffer: <<>>, deadline: deadline}
+
+  defp deadline(:infinity), do: :infinity
+  defp deadline(timeout), do: System.monotonic_time(:millisecond) + timeout
+
+  defp remaining(%{deadline: :infinity}), do: :infinity
+
+  defp remaining(%{deadline: deadline}),
+    do: max(0, deadline - System.monotonic_time(:millisecond))
 
   defp fill(%{buffer: buffer} = reader) do
     with {:ok, data} <- receive_data(reader) do
@@ -165,7 +199,8 @@ defmodule SmolNet.Integration.Https do
     end
   end
 
-  defp receive_data(%{mode: :passive, socket: socket}), do: :ssl.recv(socket, 0, :infinity)
+  defp receive_data(%{mode: :passive, socket: socket} = reader),
+    do: :ssl.recv(socket, 0, remaining(reader))
 
   defp receive_data(%{mode: :active, socket: socket} = reader) do
     receive do
@@ -180,6 +215,8 @@ defmodule SmolNet.Integration.Https do
 
       {:ssl_error, ^socket, reason} ->
         {:error, reason}
+    after
+      remaining(reader) -> {:error, :timeout}
     end
   end
 

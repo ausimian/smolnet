@@ -1,0 +1,16 @@
+# A small host list for trying the crawl out, in Tranco's rank,host form:
+#
+#     sudo mix run integration/crawl.exs --list fixture --duration 0 --no-ceiling
+#
+# Real runs fetch the Tranco list when they start; see
+# SmolNet.Integration.Crawl.Hosts.
+1,google.com
+2,cloudflare.com
+3,wikipedia.org
+4,github.com
+5,mozilla.org
+6,apple.com
+7,microsoft.com
+8,amazon.com
+9,fastly.com
+10,akamai.com

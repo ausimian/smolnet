@@ -81,6 +81,24 @@
   delivers its `:DOWN`, that nothing of the stack is left running, and
   that a fresh stack works. Its schedule of faults comes from `--seed`, so
   a run can be replayed.
+- A crawl integration script, `sudo mix run integration/crawl.exs`, that
+  sends TLS `HEAD /` requests to the top 1,000 sites of the day's Tranco
+  list, over SmolNet and over the kernel, host by host, round after round,
+  at a polite rate. It lists the hosts that fail over SmolNet but not over
+  the kernel, grouped by cause, with packets and TCP options cut from the
+  capture, and checks that the stack's sockets return to their baseline
+  after every round. Before the first round it pushes the stack past its
+  socket ceiling against a listener on the host, and checks that opens
+  past it fail promptly with `:system_limit` and that the stack recovers.
+- A netem matrix integration script, run as
+  `integration/netem-topology.sh isolate mix run integration/netem_matrix.exs`.
+  It runs bulk TCP transfers under every `tc netem` profile, with SmolNet
+  sending and receiving, beside two kernel stacks on a veth impaired the
+  same way, and fails on any transfer that is not delivered intact or any
+  SmolNet stall longer than a set number of retransmission timeouts.
+  Throughput and completion time are recorded next to the kernel's, and
+  `integration/netem.md` holds the latest results, with each gap linked
+  to the issue that tracks it.
 
 ### Changed
 
