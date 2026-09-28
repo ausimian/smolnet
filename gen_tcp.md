@@ -197,6 +197,28 @@ it off, at connect or listen or later with `:inet.setopts/2`; turning it off
 sends a write it was holding at once. A socket accepted from a listener takes
 the listener's `nodelay` as `:gen_tcp.accept/2` returns it.
 
+`keepalive` is as for `:gen_tcp`, with Linux's default timing: a connection
+that has received nothing for 2 hours sends a probe, then one every 75 s
+while none is answered, and fails with `:etimedout` once 9 have gone
+unanswered. Anything the peer sends answers them. It defaults to `false`,
+which sends none, so an idle connection whose peer has gone is never
+noticed, as on Linux without `SO_KEEPALIVE`. Set it at connect or listen or
+later with `:inet.setopts/2`; set later, the 2 hours count from the last
+packet received. A socket accepted from a listener takes the listener's
+`keepalive` as `nodelay`. The timing is fixed, with no options for
+`TCP_KEEPIDLE`, `TCP_KEEPINTVL` or `TCP_KEEPCNT`.
+
+A connection that has data unacknowledged, a FIN unacknowledged, or data
+that its peer's zero window holds back, and hears nothing from its peer for
+924.6 s, fails with `:etimedout`: RFC 5482's user timeout, fixed at how long
+Linux takes to give up by default (`tcp_retries2`). Probing a zero window is
+bounded the same way, since a peer that answers the probes keeps the
+connection open. A pending `:gen_tcp.recv/3` or `:gen_tcp.send/2` returns
+`{:error, :etimedout}`, an active socket's owner receives
+`{:tcp_error, socket, :etimedout}` and then `{:tcp_closed, socket}`, and the
+socket closes, as for `:econnreset`. An idle connection, with nothing
+outstanding, is never timed out. There is no `TCP_USER_TIMEOUT` option.
+
 ## TLS with `:ssl`
 
 `:ssl` takes its transport through the `cb_info` option, and either callback
@@ -224,6 +246,11 @@ Use `SmolNet.Inet6.Tcp` and `:inet6` for IPv6. A socket that is already
 connected, whether it was accepted or connected with `:gen_tcp`, can be
 upgraded too: `:ssl.handshake/3` for the server side and `:ssl.connect/3` for
 the client side, with the same `cb_info` in their options.
+
+`keepalive` goes with the transport options too. A connection that times
+out, by the user timeout or its keep-alive probes, gives `:ssl` the
+transport's `{:tcp_error, socket, :etimedout}`, and `:ssl` fails the TLS
+connection as it does for a reset: `:ssl.recv/3` returns `{:error, :closed}`.
 
 `:ssl` uses three calls a plain `:gen_tcp` user rarely needs, and both modules
 provide them:
@@ -258,6 +285,7 @@ The inet option surface is deliberately finite:
 | `:buffer` | `1..1048576` | supported |
 | `:recbuf` / `:sndbuf` | `1024..1048576` | fixed |
 | `:nodelay` | `true` or `false` (default) | supported |
+| `:keepalive` | `true` or `false` (default) | supported |
 | `:send_timeout` / `:send_timeout_close` | supported | supported |
 | `:ip` / `:ifaddr` / `:port` | supported | fixed |
 | `:backlog` | listen only, `1..128` | fixed |

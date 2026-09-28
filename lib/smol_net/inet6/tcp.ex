@@ -298,6 +298,7 @@ defmodule SmolNet.Inet6.Tcp do
            ),
          :ok <- Stack.socket_watch_owner(socket, self()),
          :ok <- open_nodelay(socket, options.nodelay),
+         :ok <- open_keepalive(socket, options.keepalive),
          :ok <- SmolNet.bind(socket, listener_endpoint(options)),
          :ok <- SmolNet.listen(socket, options.backlog) do
       {:ok, :listening, %{data | low_socket: socket}}
@@ -402,7 +403,8 @@ defmodule SmolNet.Inet6.Tcp do
 
   def handle_event({:call, from}, {:setopts, options}, :listening, data) do
     with {:ok, updated} <- Options.update(data.options, options),
-         :ok <- update_nodelay(data, updated) do
+         :ok <- update_nodelay(data, updated),
+         :ok <- update_keepalive(data, updated) do
       {:keep_state, %{data | options: updated}, [{:reply, from, :ok}]}
     else
       {:error, reason} -> {:keep_state_and_data, [{:reply, from, {:error, reason}}]}
@@ -825,6 +827,7 @@ defmodule SmolNet.Inet6.Tcp do
 
         with :ok <- Stack.socket_watch_owner(socket, self()),
              :ok <- open_nodelay(socket, data.options.nodelay),
+             :ok <- open_keepalive(socket, data.options.keepalive),
              :ok <- maybe_bind(socket, Options.local_endpoint(data.options)) do
           attempt_connect(data)
         else
@@ -847,6 +850,20 @@ defmodule SmolNet.Inet6.Tcp do
 
   defp update_nodelay(data, %Options{nodelay: nodelay}) do
     case SmolNet.setopt(data.low_socket, {:tcp, :nodelay}, nodelay) do
+      :ok -> :ok
+      {:error, reason} -> {:error, translate_reason(reason)}
+    end
+  end
+
+  # A new native socket has keep-alive off, gen_tcp's `keepalive: false`.
+  defp open_keepalive(_socket, false), do: :ok
+  defp open_keepalive(socket, true), do: SmolNet.setopt(socket, {:socket, :keepalive}, true)
+
+  defp update_keepalive(%{options: %{keepalive: keepalive}}, %Options{keepalive: keepalive}),
+    do: :ok
+
+  defp update_keepalive(data, %Options{keepalive: keepalive}) do
+    case SmolNet.setopt(data.low_socket, {:socket, :keepalive}, keepalive) do
       :ok -> :ok
       {:error, reason} -> {:error, translate_reason(reason)}
     end
@@ -1044,7 +1061,9 @@ defmodule SmolNet.Inet6.Tcp do
   end
 
   defp write_failure(%{write: nil} = data, _reason), do: {:keep, data}
-  defp write_failure(data, :econnreset), do: terminal_connection_failure(data, :econnreset)
+
+  defp write_failure(data, reason) when reason in [:econnreset, :etimedout],
+    do: terminal_connection_failure(data, reason)
 
   defp write_failure(data, reason) do
     write = cancel_op_timer(data.write)
@@ -1274,7 +1293,9 @@ defmodule SmolNet.Inet6.Tcp do
   defp passive_eof_reply(_data), do: {{:error, :closed}, <<>>}
 
   defp read_failure(%{read: nil} = data, _reason), do: {:keep, data}
-  defp read_failure(data, :econnreset), do: terminal_connection_failure(data, :econnreset)
+
+  defp read_failure(data, reason) when reason in [:econnreset, :etimedout],
+    do: terminal_connection_failure(data, reason)
 
   defp read_failure(%{read: %{kind: :passive} = read} = data, reason) do
     read = cancel_op_timer(read)
@@ -1400,7 +1421,8 @@ defmodule SmolNet.Inet6.Tcp do
   defp set_options(from, options, data) do
     with {:ok, updated} <- Options.update(data.options, options),
          :ok <- option_change_allowed(data, updated),
-         :ok <- update_nodelay(data, updated) do
+         :ok <- update_nodelay(data, updated),
+         :ok <- update_keepalive(data, updated) do
       data = apply_active_change(data, updated)
       {:keep_state, data, [{:reply, from, :ok}]}
     else

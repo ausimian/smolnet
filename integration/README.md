@@ -45,9 +45,27 @@ PATH=/usr/sbin:/sbin:$PATH unshare -rnm sh -c 'mount -t tmpfs tmpfs /run &&
   integration/setup.sh --no-nat && mix run integration/idle.exs --duration 30m'
 ```
 
-The detection times in its notes are measurements, not verdicts. The
-first runs, of 200 connections for 30 min with 40 peers vanishing,
-found:
+A run fails unless SmolNet detects every vanished peer it can: those
+with data outstanding, by its user timeout of 924.6 s, and with
+`--keepalive` the idle ones too. Each peer vanishes early enough for
+that, or is skipped; `--no-require-detection` only records the times.
+`--user-timeout` and the `--keepalive-*` switches shorten SmolNet's fixed
+timers, through a test-only stack option, so that a run of minutes can see
+them. Runs of 100 connections for 40 min, 40 peers vanishing, found (#132,
+#133):
+
+| a peer that vanished | SmolNet before #132 | SmolNet | with `--keepalive --keepalive-idle 10m` |
+| --- | --- | --- | --- |
+| with nothing outstanding (`silent`) | never noticed | never noticed, as TCP cannot | `:etimedout` after 844 to 1135 s: 10 min idle and 9 probes 75 s apart |
+| with data unacknowledged (`unacked`, `nat`) | never noticed, after up to 2,249 s | `:etimedout` after 924.6 s | the same |
+| while its zero window was being probed (TCP `zero_window`) | never noticed, after up to 2,267 s | `:etimedout` 922.7 s after, 924.6 s after its last answer | the same |
+| and came back as a host that answers with a RST (`reboot`) | 0.2 to 44 s after the path returned | 12.6 to 51 s after it vanished | 0.5 to 6 s after the path returned |
+
+Over TLS the connection fails too, and `:ssl.recv/3` returns `:closed`. A
+paused TLS peer's `:ssl` reads on, megabytes ahead, so a TLS `zero_window`
+connection's window never closes, and it is `silent` in effect. The first
+runs, of 200 connections for 30 min, found Linux (`--baseline`) failing
+`unacked` and `nat` with `ETIMEDOUT` after about 940 s.
 
 | a peer that vanished | SmolNet | Linux (`--baseline`) |
 | --- | --- | --- |
@@ -56,9 +74,8 @@ found:
 | while its zero window was being probed (`zero_window`) | never noticed (#132) | not within 970 s |
 | and came back as a host that answers with a RST (`reboot`) | 2 to 53 s after the path returned | 1 to 15 s after |
 
-SmolNet does not accept `keepalive` (#133). While all 200 connections
-were idle, the stack did not poll once in 120 s, and the VM used 0.24% of
-a core.
+While all 100 connections were idle, the stack did not poll once in
+60 s, and the VM used 0.23% of a core.
 
 The chaos scenario, `chaos.exs`, injects faults into a stack while it
 carries TLS transfers, connection churn and calls that block for good:
@@ -109,9 +126,9 @@ which is not a failure. IPv6 over the device, to the host, works.
 | trigger | runs | files issues |
 | --- | --- | --- |
 | nightly, 03:17 UTC | 10 min each of `smoke`, `tls --target local` and `tls` to speed.cloudflare.com | yes |
-| weekly, Sunday 04:43 UTC | 1 h of `smoke`; 4 h each of `tls --target local`, `tls` to the internet (5 min between rounds) and `idle` (idles of up to 2 h) | yes |
+| weekly, Sunday 04:43 UTC | 1 h of `smoke`; 4 h each of `tls --target local`, `tls` to the internet (5 min between rounds) and `idle` (idles of up to 2 h, with keepalive) | yes |
 | `workflow_dispatch` | one run from the inputs below | no |
-| pull request changing `integration/**` or the workflow | 1 to 2 min each of `smoke`, `smoke` under netem `delay`, `tls --target local` and `tls` to the internet, the whole `pmtu` matrix, and 3 min each of `idle` and `chaos` | no |
+| pull request changing `integration/**` or the workflow | 1 to 2 min each of `smoke`, `smoke` under netem `delay`, `tls --target local` and `tls` to the internet, the whole `pmtu` matrix, 4 min of `idle`, with its timers shortened so that every vanished peer is detected, and 3 min of `chaos` | no |
 
 `integration/ci/plan.sh` holds the schedule, and `integration/ci/run.sh`
 runs `pmtu` and `chaos` under `pmtu-topology.sh isolate`, so that their

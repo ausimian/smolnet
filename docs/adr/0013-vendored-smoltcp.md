@@ -229,6 +229,46 @@ Hex packages are unaffected: they ship only precompiled NIFs and omit
     test cover the resend at the new size, errors quoting data not
     in flight, never raising, both floors, the plateaus, and implausible or
     corrupt errors. They fail without the patch, which dropped the errors.
+- #132: upstream's `timeout` aborted a connection once the remote had
+  sent nothing for that long, whether or not anything was outstanding,
+  so it also ended healthy idle connections, and SmolNet cleared it once a
+  connection was established. Nothing then bounded a connection with data
+  outstanding: the RTO backs off to 60 s and nothing counts retries, and
+  `rewind_zero_window_probe` backs the persist timer off to the same cap,
+  so a vanished peer was retransmitted to forever. `timed_out` and
+  `poll_at` now apply the timeout only while the connection waits on the
+  remote (`awaits_remote`): in SYN-SENT and SYN-RECEIVED, with a FIN
+  unacknowledged (FIN-WAIT-1, CLOSING, LAST-ACK), with the send buffer not
+  empty, which covers unacknowledged data and data a zero window holds
+  back, or with keep-alive that has no probe limit, as upstream's
+  documentation of `set_timeout` describes. That is RFC 5482's user
+  timeout, as Linux's `TCP_USER_TIMEOUT`, and bounds persist probing
+  without more: a remote that answers the probes refreshes
+  `remote_last_ts`, one that has gone does not. `close()` on a connection
+  with nothing to send restarts the count, as `send_impl` already did for
+  data, so a FIN after a long idle is not aborted at once. A socket
+  aborted by it, or by keep-alive, reports `aborted_by_timeout()` until it
+  is reused, from which SmolNet reports `:etimedout`.
+- #133: upstream's keep-alive had one interval, for the first probe and
+  every later one, and no count: the abort was the timeout's. `KeepAlive`
+  now has Linux's three: `idle`, how long nothing arrives before the first
+  probe; `interval`, between unanswered probes; and `probes`, how many go
+  unanswered before the connection is aborted, when the next falls due.
+  `set_keep_alive_config` sets them, and arms the first probe `idle` after
+  the last packet received, not at once; any packet received resets the
+  count, and the next probe is `idle` after it. A probe is sent only while
+  the timer is idle, so never while data is outstanding, which the user
+  timeout covers. The keep-alive timer is no longer rewound by packets
+  other than probes, so the idle time counts from the last packet
+  received, as on Linux. `set_keep_alive(interval)` keeps upstream's
+  meaning, `idle` and `interval` both `interval` and no limit, so the
+  timeout still ends it. Unit tests cover the abort after the user timeout
+  and not before, with the retransmissions between, an idle connection a
+  day later, a FIN after an idle, a zero window answered for 2000 s and
+  then given up on, Linux's timing of nine probes and the abort, an answer
+  that resets them, unacknowledged data left to the user timeout with
+  keep-alive on, and keep-alive turned off. `test_established_timeout`
+  now expects no timeout while the connection is idle.
 
 ## Later configuration
 

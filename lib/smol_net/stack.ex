@@ -279,6 +279,22 @@ defmodule SmolNet.Stack do
   end
 
   @doc false
+  @spec socket_set_keepalive(Socket.t(), boolean()) :: :ok | {:error, atom()}
+  def socket_set_keepalive(%Socket{stack: stack, id: id, generation: generation}, keepalive) do
+    GenServer.call(stack, {:socket_set_keepalive, id, generation, keepalive})
+  catch
+    :exit, _reason -> {:error, :closed}
+  end
+
+  @doc false
+  @spec socket_keepalive(Socket.t()) :: {:ok, boolean()} | {:error, atom()}
+  def socket_keepalive(%Socket{stack: stack, id: id, generation: generation}) do
+    GenServer.call(stack, {:socket_keepalive, id, generation})
+  catch
+    :exit, _reason -> {:error, :closed}
+  end
+
+  @doc false
   @spec socket_peername(Socket.t()) ::
           {:ok, Socket.sockaddr_in() | Socket.sockaddr_in6()} | {:error, atom()}
   def socket_peername(%Socket{stack: stack, id: id, generation: generation, kind: kind}) do
@@ -794,6 +810,21 @@ defmodule SmolNet.Stack do
 
   def handle_call({:socket_nodelay, id, generation}, _from, state) do
     state.native_module.tcp_nodelay(state.native, %{id: id, generation: generation})
+    |> reply_native(state, &{:ok, &1}, :preserve_timer)
+  end
+
+  def handle_call({:socket_set_keepalive, id, generation, keepalive}, _from, state) do
+    state.native_module.tcp_set_keepalive(
+      state.native,
+      %{id: id, generation: generation},
+      keepalive,
+      state.clock.now()
+    )
+    |> reply_native(state)
+  end
+
+  def handle_call({:socket_keepalive, id, generation}, _from, state) do
+    state.native_module.tcp_keepalive(state.native, %{id: id, generation: generation})
     |> reply_native(state, &{:ok, &1}, :preserve_timer)
   end
 

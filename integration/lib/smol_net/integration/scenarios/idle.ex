@@ -30,11 +30,13 @@ defmodule SmolNet.Integration.Scenarios.Idle do
   from the peer, not even a FIN or RST. Each vanishes one of these ways:
 
     * `silent` - with nothing outstanding. Without keepalive, TCP cannot
-      notice this, so SmolNet correctly never does;
+      notice this, so SmolNet correctly never does; with `--keepalive`, its
+      unanswered probes end the connection;
     * `unacked` - SmolNet then sends data, which it retransmits and which is
       never acknowledged;
     * `zero_window` - the peer stopped reading first and closed its window,
-      so SmolNet was probing it;
+      so SmolNet was probing it. A TLS peer's `:ssl` reads on, megabytes
+      ahead, so over TLS its window stays open and this is `silent`;
     * `reboot` - SmolNet sends data, the peer's socket is closed too (its FIN
       or RST is dropped), and after an outage of up to `--outage-max` the
       path returns, so that SmolNet's next retransmission reaches a host
@@ -49,10 +51,19 @@ defmodule SmolNet.Integration.Scenarios.Idle do
   how long that took, or that it did not happen, is recorded in the
   `detection` results and noted. A `reboot` must be detected within 65 s of
   the path returning, since SmolNet's retransmission timeout backs off to
-  at most 60 s, or the run fails. The others may go undetected, since
-  SmolNet has no keepalive and no limit on retransmissions;
-  `--require-detection` fails the run unless it detects `unacked`,
-  `zero_window` and `nat` too.
+  at most 60 s, or the run fails. `unacked`, `nat` and TCP `zero_window`
+  must be detected too, with `:etimedout`, by SmolNet's user timeout:
+  924.6 s without an answer while it has data outstanding. With
+  `--keepalive`, `silent` and TLS `zero_window` must be, after 2 h and 9
+  probes 75 s apart. Each vanishes early
+  enough for that to happen before the run ends, or is skipped if the run
+  is too short. `--no-require-detection` only records them.
+
+  The timer switches, such as `--user-timeout 45s` or `--keepalive-idle
+  40s`, shorten SmolNet's fixed timers through its test-only
+  `:test_tcp_timers` stack option, so that a short run can see them. They
+  do not apply to `--baseline`, where the kernel's own, the same Linux
+  defaults, do.
 
   Once every connection is open, and before any behaviour starts, all of
   them are idle for `--quiet`. The stack's timer polls and native calls,
@@ -136,6 +147,11 @@ defmodule SmolNet.Integration.Scenarios.Idle do
         op_timeout: :string,
         socket_buffer: :integer,
         require_detection: :boolean,
+        keepalive: :boolean,
+        user_timeout: :string,
+        keepalive_idle: :string,
+        keepalive_interval: :string,
+        keepalive_probes: :integer,
         seed: :integer
       ],
       defaults: [
@@ -152,13 +168,18 @@ defmodule SmolNet.Integration.Scenarios.Idle do
         quiet_poll_limit: 1.0,
         op_timeout: "30s",
         socket_buffer: 65_536,
-        require_detection: false,
+        require_detection: true,
+        keepalive: false,
+        user_timeout: nil,
+        keepalive_idle: nil,
+        keepalive_interval: nil,
+        keepalive_probes: nil,
         seed: nil
       ],
       counters: [:connections, :exchanges, :bytes_echoed, :vanished, :detected | @sampled],
       # Each connection is one socket, or two over the helper's loopback,
       # where SmolNet is the peer too.
-      stack: [limits: %{sockets: 512}],
+      stack: &stack_options/1,
       usage: """
 
       idle options:
@@ -177,12 +198,20 @@ defmodule SmolNet.Integration.Scenarios.Idle do
         --quiet-poll-limit R  the most stack polls a second while quiet (default 1.0)
         --op-timeout D        each exchange's deadline, beyond any stall (default 30s)
         --socket-buffer N     SmolNet's receive and send buffers, in bytes (default 65536)
-        --require-detection   fail unless SmolNet detects every vanished peer that
-                              it has data outstanding to
+        --no-require-detection  do not fail when SmolNet misses a vanished peer that
+                              it has data outstanding to, or with --keepalive any
+                              vanished peer (by default it fails)
+        --keepalive           turn keepalive on for SmolNet's connections
+        --user-timeout D      shorten SmolNet's fixed user timeout (default 924.6s),
+                              through a test-only stack option
+        --keepalive-idle D    shorten its fixed keep-alive idle time (default 2h)
+        --keepalive-interval D  and its probe interval (default 75s)
+        --keepalive-probes N  and its probe count (default 9)
         --seed N              the random seed, to repeat a run's plan (default random)
 
       Idle intervals are capped by the run: a connection whose next idle would
-      outlast it idles until its last exchange instead.
+      outlast it idles until its last exchange instead. A peer vanishes early
+      enough to be detected before the run ends, or is skipped.
       """
     ]
   end
@@ -218,9 +247,12 @@ defmodule SmolNet.Integration.Scenarios.Idle do
          :ok <- in_range(:vanish, extra.vanish, 0..100),
          :ok <- in_range(:burst_bytes, extra.burst_bytes, 1..67_108_864),
          :ok <- in_range(:socket_buffer, extra.socket_buffer, 1_024..1_048_576),
-         :ok <- positive(:quiet_poll_limit, extra.quiet_poll_limit) do
+         :ok <- positive(:quiet_poll_limit, extra.quiet_poll_limit),
+         {:ok, overrides} <- timer_overrides(extra) do
       {:ok,
        %{
+         keepalive: extra.keepalive,
+         timers: timers(context, overrides),
          connections: extra.connections,
          idle: {idle_min, idle_max},
          trickle: {trickle_min, trickle_max},
@@ -237,6 +269,62 @@ defmodule SmolNet.Integration.Scenarios.Idle do
        }}
     end
   end
+
+  # SmolNet's fixed TCP timers, which are Linux's defaults, and so the
+  # kernel's under --baseline too.
+  @tcp_timers %{
+    user_timeout: 924_600,
+    keepalive_idle: 7_200_000,
+    keepalive_interval: 75_000,
+    keepalive_probes: 9
+  }
+  @max_timer 86_400_000
+
+  # The stack the runner starts: room for every socket, and the timer
+  # switches' overrides, through SmolNet's test-only `:test_tcp_timers`.
+  # settings/1 reports invalid switches.
+  defp stack_options(extra) do
+    case timer_overrides(extra) do
+      {:ok, overrides} when map_size(overrides) > 0 ->
+        [limits: %{sockets: 512}, test_tcp_timers: overrides]
+
+      _none ->
+        [limits: %{sockets: 512}]
+    end
+  end
+
+  defp timer_overrides(extra) do
+    with {:ok, user_timeout} <- timer(:user_timeout, extra.user_timeout),
+         {:ok, idle} <- timer(:keepalive_idle, extra.keepalive_idle),
+         {:ok, interval} <- timer(:keepalive_interval, extra.keepalive_interval),
+         :ok <- probes(extra.keepalive_probes) do
+      {:ok,
+       %{
+         user_timeout: user_timeout,
+         keepalive_idle: idle,
+         keepalive_interval: interval,
+         keepalive_probes: extra.keepalive_probes
+       }
+       |> Map.reject(fn {_name, value} -> value == nil end)}
+    end
+  end
+
+  defp timer(_name, nil), do: {:ok, nil}
+
+  defp timer(name, text) do
+    case duration(name, text) do
+      {:ok, ms} when ms <= @max_timer -> {:ok, ms}
+      {:ok, _ms} -> {:error, "--#{dasherize(name)} must be at most a day"}
+      error -> error
+    end
+  end
+
+  defp probes(nil), do: :ok
+  defp probes(count), do: in_range(:keepalive_probes, count, 1..255)
+
+  # The timers the run's connections have: the kernel keeps its own.
+  defp timers(%{mode: :kernel}, _overrides), do: @tcp_timers
+  defp timers(_context, overrides), do: Map.merge(@tcp_timers, overrides)
 
   defp duration(name, text, least \\ 1) do
     case Options.parse_duration(text) do
@@ -543,13 +631,16 @@ defmodule SmolNet.Integration.Scenarios.Idle do
   defp connect(context, settings, %{transport: :tcp} = spec, address, listener) do
     options =
       Network.tcp_options(context, :subject, spec.family) ++
-        Tls.buffer_options(context, :subject, settings.socket_buffer) ++ [:binary, active: false]
+        Tls.buffer_options(context, :subject, settings.socket_buffer) ++
+        [:binary, active: false, keepalive: settings.keepalive]
 
     :gen_tcp.connect(address, listener.port, options, @connect_timeout)
   end
 
   defp connect(context, settings, %{transport: :tls}, address, listener) do
-    Tls.connect(context, :subject, address, listener.port, listener.tls,
+    options = listener.tls ++ [keepalive: settings.keepalive]
+
+    Tls.connect(context, :subject, address, listener.port, options,
       timeout: @connect_timeout,
       buffer: settings.socket_buffer
     )
@@ -702,13 +793,18 @@ defmodule SmolNet.Integration.Scenarios.Idle do
     %{active_start: start, work_until: until} = state.timeline
     expired_at = max(start, state.connected_at + state.settings.nat_timeout + @nat_margin)
 
-    window = until - @nat_margin - expired_at
+    window = div(until - @nat_margin - expired_at, 2)
 
-    if window > 0 do
-      at = expired_at + trunc(:rand.uniform() * div(window, 2))
-      {:ok, %{prepare_at: at, vanish_at: at}}
-    else
-      {:skip, "the run is too short for the NAT's timeout to pass"}
+    case detectable(state, expired_at, window) do
+      {:ok, window} when window > 0 ->
+        at = expired_at + trunc(:rand.uniform() * window)
+        {:ok, %{prepare_at: at, vanish_at: at}}
+
+      {:ok, _window} ->
+        {:skip, "the run is too short for the NAT's timeout to pass"}
+
+      :too_short ->
+        {:skip, "the run is too short to detect it"}
     end
   end
 
@@ -717,13 +813,53 @@ defmodule SmolNet.Integration.Scenarios.Idle do
     lead = if role == :zero_window, do: @probe_lead, else: 0
     window = div(until - start - lead, 2)
 
-    if window > 0 do
-      vanish_at = start + lead + trunc(:rand.uniform() * window)
-      {:ok, %{prepare_at: vanish_at - lead, vanish_at: vanish_at}}
-    else
-      {:skip, "the run is too short"}
+    case detectable(state, start + lead, window) do
+      {:ok, window} when window > 0 ->
+        vanish_at = start + lead + trunc(:rand.uniform() * window)
+        {:ok, %{prepare_at: vanish_at - lead, vanish_at: vanish_at}}
+
+      {:ok, _window} ->
+        {:skip, "the run is too short"}
+
+      :too_short ->
+        {:skip, "the run is too short to detect it"}
     end
   end
+
+  # Narrows the `window` after `from` in which a peer vanishes so that, when
+  # detection is required, SmolNet has time to detect it before the run's
+  # working time ends.
+  defp detectable(state, from, window) do
+    case detection_bound(state) do
+      nil ->
+        {:ok, window}
+
+      bound ->
+        room = state.timeline.work_until - @detect_slack - bound - from
+        if room >= 0, do: {:ok, min(window, room)}, else: :too_short
+    end
+  end
+
+  # The longest SmolNet may take to fail a connection after its peer
+  # vanished, when the run requires it to: the user timeout, counted from
+  # the last packet received or the first sent after it, or with keepalive,
+  # for an idle connection, every probe after its last packet. None for an
+  # idle connection without keepalive, which TCP cannot notice.
+  #
+  # A paused TLS peer's `:ssl` keeps reading its socket, megabytes ahead, so
+  # its window does not close and a TLS `zero_window` connection has nothing
+  # outstanding when its peer vanishes: to SmolNet it is `silent`.
+  defp detection_bound(%{settings: %{require_detection: false}}), do: nil
+
+  defp detection_bound(%{spec: %{role: :zero_window, transport: :tls}} = state),
+    do: detection_bound(put_in(state.spec.role, :silent))
+
+  defp detection_bound(%{spec: %{role: :silent}, settings: %{keepalive: false}}), do: nil
+
+  defp detection_bound(%{spec: %{role: :silent}, settings: %{timers: timers}}),
+    do: timers.keepalive_idle + timers.keepalive_probes * timers.keepalive_interval
+
+  defp detection_bound(%{settings: %{timers: timers}}), do: timers.user_timeout
 
   # A zero-window connection's peer stops reading and SmolNet fills its
   # window before the peer vanishes.
@@ -791,8 +927,7 @@ defmodule SmolNet.Integration.Scenarios.Idle do
     result = await_failure(state, state.timeline.work_until)
     row = detection_row(state, result, vanished_at)
 
-    if state.settings.require_detection and state.spec.role != :silent and
-         row.outcome == :undetected do
+    if detection_bound(state) != nil and row.outcome == :undetected do
       summary = "#{state.spec.label}: SmolNet did not fail a connection to a vanished peer"
       Soak.fail(state.context, :undetected, summary, [{"detection", row}])
     end

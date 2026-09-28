@@ -412,12 +412,22 @@ defmodule SmolNet.Socket do
   def close(_socket), do: {:error, :invalid_socket}
 
   @doc false
-  @spec setopt(t(), {:tcp, :nodelay}, boolean()) :: :ok | {:error, atom()}
+  @spec setopt(t(), {:tcp, :nodelay} | {:socket, :keepalive}, boolean()) ::
+          :ok | {:error, atom()}
   def setopt(%__MODULE__{} = socket, {:tcp, :nodelay}, nodelay) when is_boolean(nodelay) do
     cond do
       not valid?(socket) -> {:error, :invalid_socket}
       socket.kind != :stream -> {:error, :invalid_socket_state}
       true -> Stack.socket_set_nodelay(socket, nodelay)
+    end
+  end
+
+  def setopt(%__MODULE__{} = socket, {:socket, :keepalive}, keepalive)
+      when is_boolean(keepalive) do
+    cond do
+      not valid?(socket) -> {:error, :invalid_socket}
+      socket.kind != :stream -> {:error, :invalid_socket_state}
+      true -> Stack.socket_set_keepalive(socket, keepalive)
     end
   end
 
@@ -428,12 +438,21 @@ defmodule SmolNet.Socket do
   def setopt(_socket, _option, _value), do: {:error, :invalid_socket}
 
   @doc false
-  @spec getopt(t(), {:tcp, :nodelay}) :: {:ok, boolean()} | {:error, atom()}
+  @spec getopt(t(), {:tcp, :nodelay} | {:socket, :keepalive}) ::
+          {:ok, boolean()} | {:error, atom()}
   def getopt(%__MODULE__{} = socket, {:tcp, :nodelay}) do
     cond do
       not valid?(socket) -> {:error, :invalid_socket}
       socket.kind != :stream -> {:error, :invalid_socket_state}
       true -> Stack.socket_nodelay(socket)
+    end
+  end
+
+  def getopt(%__MODULE__{} = socket, {:socket, :keepalive}) do
+    cond do
+      not valid?(socket) -> {:error, :invalid_socket}
+      socket.kind != :stream -> {:error, :invalid_socket_state}
+      true -> Stack.socket_keepalive(socket)
     end
   end
 

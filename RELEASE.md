@@ -17,6 +17,17 @@
   not run over it unchanged. The low-level API gets the same switch as
   `SmolNet.setopt(socket, {:tcp, :nodelay}, true)`, read back with
   `SmolNet.getopt/2`.
+- `:gen_tcp`'s `keepalive` option, so that an idle connection can detect
+  a peer that has gone. It is accepted at connect, listen and
+  `:inet.setopts/2` and reported by `:inet.getopts/2`, defaults to `false`,
+  and a socket accepted from a listener takes the listener's setting.
+  Its timing is Linux's default, and fixed: a probe after 2 hours in which
+  nothing arrives, then one every 75 s, and the connection fails with
+  `:etimedout` once 9 have gone unanswered. Before, SmolNet rejected the
+  option with `:einval`, and `:gen_tcp.connect/4` exited with `:badarg`.
+  The low-level API gets the same switch as
+  `SmolNet.setopt(socket, {:socket, :keepalive}, true)`, where the
+  connection fails with `:connection_timeout`.
 - A real-network integration harness in the source repository, under
   `integration/`, for long runs of SmolNet against real peers. It is not
   part of the Hex package and does not run in `mix test`. It provides a
@@ -56,8 +67,9 @@
   for seconds to hours between echoes, trickling single bytes, bursting after
   long idles and stalling on a closed receive window, while a share of them
   lose their peer silently through nftables. It records how soon SmolNet
-  fails each connection to a vanished peer, or that it does not, and fails
-  the run if the stack polls while every connection is idle.
+  fails each connection to a vanished peer, fails the run unless it fails
+  every one it can detect, and fails the run if the stack polls while every
+  connection is idle.
 - A chaos integration script, run as
   `integration/pmtu-topology.sh isolate mix run integration/chaos.exs`. It
   injects faults into a stack while it carries TLS transfers, connection
@@ -107,6 +119,16 @@
 
 ### Fixed
 
+- A TCP connection whose peer vanishes while it has data outstanding now
+  fails with `:etimedout`, instead of retransmitting forever. A connection
+  with data or a FIN unacknowledged, or data its peer's zero window holds
+  back, that hears nothing from its peer for 924.6 s is aborted: a pending
+  `:gen_tcp.recv/3` or `:gen_tcp.send/2` returns `{:error, :etimedout}`,
+  and an active socket's owner gets `{:tcp_error, socket, :etimedout}` then
+  `{:tcp_closed, socket}`. This is RFC 5482's user timeout, fixed at how
+  long Linux takes to give up by default, and it bounds zero-window probing
+  too. An idle connection, with nothing outstanding, is never timed out.
+  In the low-level API the error is `:connection_timeout`.
 - A TCP send across a hop narrower than the stack's `:mtu` no longer
   stalls forever. SmolNet ignored the router's ICMP "Fragmentation Needed"
   or ICMPv6 "Packet Too Big" error and resent the same full-size segment,
