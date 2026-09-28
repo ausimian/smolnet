@@ -21,6 +21,8 @@ mod sixlowpan;
 pub(crate) mod multicast;
 #[cfg(feature = "socket-tcp")]
 mod tcp;
+#[cfg(feature = "socket-tcp")]
+pub use tcp::PathMtuStats;
 #[cfg(any(feature = "socket-udp", feature = "socket-dns"))]
 mod udp;
 
@@ -155,6 +157,8 @@ pub struct InterfaceInner {
     routes: Routes,
     #[cfg(feature = "multicast")]
     multicast: multicast::State,
+    #[cfg(feature = "socket-tcp")]
+    path_mtu_stats: PathMtuStats,
 }
 
 /// Configuration structure used for creating a network interface.
@@ -296,6 +300,8 @@ impl Interface {
                 slaac: Slaac::new(),
                 #[cfg(feature = "proto-ipv6-slaac")]
                 slaac_updated: Instant::from_millis(0),
+                #[cfg(feature = "socket-tcp")]
+                path_mtu_stats: PathMtuStats::default(),
                 rand,
             },
         }
@@ -413,6 +419,13 @@ impl Interface {
     /// Check whether the interface has the given IP address assigned.
     pub fn has_ip_addr<T: Into<IpAddress>>(&self, addr: T) -> bool {
         self.inner.has_ip_addr(addr)
+    }
+
+    /// Get the counts of the ICMP errors received that report a path MTU
+    /// for a TCP segment, and of what they did.
+    #[cfg(feature = "socket-tcp")]
+    pub fn path_mtu_stats(&self) -> PathMtuStats {
+        self.inner.path_mtu_stats
     }
 
     pub fn routes(&self) -> &Routes {

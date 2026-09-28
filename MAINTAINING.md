@@ -93,9 +93,11 @@ than an MSS without waiting for an ACK (#102), RFC 6675's duplicate ACK,
 which counts an ACK that SACKs new data whatever its window (#103), a
 200 ms minimum RTO in place of RFC 6298's 1 s (#103), CUBIC's RFC 6928
 initial window of up to ten segments (#123), and RFC 6675's SACK-based loss
-recovery, which resends several lost segments per round trip (#119). The
-commit that added
-the directory holds the crates.io package unmodified, so
+recovery, which resends several lost segments per round trip (#119). A
+further patch, to the interface as well as the sender, adds path MTU
+discovery: ICMP "Fragmentation Needed" and "Packet Too Big" lower a
+connection's segment size, and it resends at once (#128). The commit that
+added the directory holds the crates.io package unmodified, so
 `git log -p -- native/vendor/smoltcp` after that commit is the complete set of
 SmolNet changes. Keep any further patch small, covered by tests in the
 vendored crate, and suitable for offering upstream.
@@ -107,10 +109,10 @@ controller SmolNet enables, so that its tests run too. To run them alone:
 cargo test --manifest-path native/vendor/smoltcp/Cargo.toml --lib --features socket-tcp-cubic --target-dir native/target/vendor
 ```
 
-To move to a new smoltcp release, first check whether it already recovers
-from partial ACKs. If it does, delete `native/vendor/smoltcp`, restore the
-registry dependency in `native/smolnet_core/Cargo.toml`, and remove the
-precommit step. Otherwise, replace the directory with the new release's
+To move to a new smoltcp release, first check whether it already carries
+the equivalent of every patch above. If it does, delete
+`native/vendor/smoltcp`, restore the registry dependency in
+`native/smolnet_core/Cargo.toml`, and remove the precommit step. Otherwise, replace the directory with the new release's
 crates.io package from `~/.cargo/registry/src`, omitting `.cargo-ok` and
 `Cargo.lock`, and commit that on its own. Then reapply the patch, update the
 pinned version, and run `cargo update -p smoltcp` in both `native/` and

@@ -299,3 +299,148 @@ pub fn tcp_listen_drops_unspecified_src() {
     assert_eq!(reply, None);
     assert!(sockets.get_mut::<tcp::Socket>(handle).is_listening());
 }
+
+/// For path MTU discovery: a TCP connection from `local` to `remote`, set
+/// up by hand, whose data segments the remote never acknowledges.
+#[cfg(all(feature = "medium-ip", feature = "socket-tcp"))]
+struct PmtuConnection {
+    iface: Interface,
+    sockets: SocketSet<'static>,
+    device: crate::tests::TestingDevice,
+    local: IpAddress,
+    remote: IpAddress,
+    /// The sequence number of the first octet of data.
+    first: TcpSeqNumber,
+    /// The data segments sent, as IP packets.
+    sent: Vec<Vec<u8>>,
+    now: Instant,
+}
+
+#[cfg(all(feature = "medium-ip", feature = "socket-tcp"))]
+impl PmtuConnection {
+    const LOCAL_PORT: u16 = 49152;
+    const REMOTE_PORT: u16 = 80;
+
+    /// Connects, and sends `len` octets in segments of the interface's MTU.
+    fn new(local: IpAddress, remote: IpAddress, len: usize) -> Self {
+        use crate::socket::tcp;
+
+        let (mut iface, mut sockets, device) = setup(Medium::Ip);
+        let mut socket = tcp::Socket::new(
+            tcp::SocketBuffer::new(vec![0; 1024]),
+            tcp::SocketBuffer::new(vec![0; len]),
+        );
+        let remote_end = (remote, Self::REMOTE_PORT);
+        let local_end = (local, Self::LOCAL_PORT);
+        socket
+            .connect(iface.context(), remote_end, local_end)
+            .unwrap();
+        let handle = sockets.add(socket);
+
+        let mut conn = PmtuConnection {
+            iface,
+            sockets,
+            device,
+            local,
+            remote,
+            first: TcpSeqNumber(0),
+            sent: Vec::new(),
+            now: Instant::ZERO,
+        };
+        let syn = conn.poll().pop().expect("a SYN");
+        let isn = pmtu_segment(&syn).0;
+        conn.first = isn + 1;
+
+        let syn_ack = TcpRepr {
+            src_port: Self::REMOTE_PORT,
+            dst_port: Self::LOCAL_PORT,
+            control: TcpControl::Syn,
+            seq_number: TcpSeqNumber(-10_000),
+            ack_number: Some(isn + 1),
+            window_len: 65535,
+            window_scale: None,
+            max_seg_size: Some(1460),
+            sack_permitted: false,
+            sack_ranges: [None, None, None],
+            timestamp: None,
+            payload: &[],
+        };
+        let syn_ack = pmtu_tcp_packet(remote, local, &syn_ack);
+        conn.deliver(syn_ack);
+
+        conn.sockets
+            .get_mut::<tcp::Socket>(handle)
+            .send_slice(&vec![0x5a; len])
+            .unwrap();
+        conn.sent = conn.poll();
+        conn
+    }
+
+    /// Polls the interface a millisecond on, and returns the data segments
+    /// it sends, or a SYN.
+    fn poll(&mut self) -> Vec<Vec<u8>> {
+        self.now += crate::time::Duration::from_millis(1);
+        self.iface
+            .poll(self.now, &mut self.device, &mut self.sockets);
+        self.device
+            .tx_queue
+            .drain(..)
+            .filter(|packet| {
+                let (_, len, syn) = pmtu_segment(packet);
+                len > 0 || syn
+            })
+            .collect()
+    }
+
+    /// Delivers `packet` to the interface, and returns what [`Self::poll`]
+    /// does.
+    fn deliver(&mut self, packet: Vec<u8>) -> Vec<Vec<u8>> {
+        self.device.rx_queue.push_back(packet);
+        self.poll()
+    }
+
+    /// Asserts that `resent` holds all `len` octets of data again, from the
+    /// first, in segments of `mss` octets.
+    #[track_caller]
+    fn assert_resent(&self, resent: &[Vec<u8>], mss: usize, len: usize) {
+        let mut next = self.first;
+        for packet in resent {
+            let (seq, payload_len, _) = pmtu_segment(packet);
+            assert_eq!(seq, next, "resends in order");
+            assert_eq!(payload_len, mss.min(len - (next - self.first)));
+            next += payload_len;
+        }
+        assert_eq!(next - self.first, len, "resends all the data");
+    }
+}
+
+/// The payload of an IP packet.
+#[cfg(all(feature = "medium-ip", feature = "socket-tcp"))]
+fn pmtu_ip_payload(packet: &[u8]) -> &[u8] {
+    match IpVersion::of_packet(packet).unwrap() {
+        #[cfg(feature = "proto-ipv4")]
+        IpVersion::Ipv4 => Ipv4Packet::new_checked(packet).unwrap().payload(),
+        #[cfg(feature = "proto-ipv6")]
+        IpVersion::Ipv6 => Ipv6Packet::new_checked(packet).unwrap().payload(),
+    }
+}
+
+/// The sequence number, payload length and SYN flag of the TCP segment in
+/// an IP packet.
+#[cfg(all(feature = "medium-ip", feature = "socket-tcp"))]
+fn pmtu_segment(packet: &[u8]) -> (TcpSeqNumber, usize, bool) {
+    let segment = TcpPacket::new_checked(pmtu_ip_payload(packet)).unwrap();
+    (segment.seq_number(), segment.payload().len(), segment.syn())
+}
+
+/// An IP packet from `src` to `dst` that carries `tcp`.
+#[cfg(all(feature = "medium-ip", feature = "socket-tcp"))]
+fn pmtu_tcp_packet(src: IpAddress, dst: IpAddress, tcp: &TcpRepr) -> Vec<u8> {
+    let caps = ChecksumCapabilities::default();
+    let ip_repr = IpRepr::new(src, dst, IpProtocol::Tcp, tcp.buffer_len(), 64);
+    let mut bytes = vec![0; ip_repr.buffer_len()];
+    ip_repr.emit(&mut bytes[..], &caps);
+    let segment = &mut bytes[ip_repr.header_len()..];
+    tcp.emit(&mut TcpPacket::new_unchecked(segment), &src, &dst, &caps);
+    bytes
+}

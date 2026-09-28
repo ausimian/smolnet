@@ -1548,3 +1548,173 @@ fn test_ipv4_fragment_size() {
         );
     }
 }
+
+/// What each path MTU test sends: three segments at an MTU of 1500.
+#[cfg(all(feature = "medium-ip", feature = "socket-tcp"))]
+const PMTU_DATA: usize = 4000;
+
+#[cfg(all(feature = "medium-ip", feature = "socket-tcp"))]
+fn pmtu_connection() -> PmtuConnection {
+    let local = Ipv4Address::new(192, 168, 1, 1);
+    let remote = Ipv4Address::new(192, 168, 1, 2);
+    let conn = PmtuConnection::new(local.into(), remote.into(), PMTU_DATA);
+    assert_eq!(conn.sent.len(), 3, "sends three full-size segments");
+    conn
+}
+
+/// An ICMP "Fragmentation Needed" error from a router to `conn`, that
+/// reports `next_hop_mtu` and quotes `packet`, cut to 548 octets as Linux
+/// does.
+#[cfg(all(feature = "medium-ip", feature = "socket-tcp"))]
+fn frag_needed(conn: &PmtuConnection, packet: &[u8], next_hop_mtu: u16) -> Vec<u8> {
+    let quoted = &packet[..packet.len().min(548)];
+    let mut icmp = vec![0u8; 8 + quoted.len()];
+    icmp[0] = 3; // Destination Unreachable
+    icmp[1] = 4; // Fragmentation Needed and Don't Fragment was Set
+    icmp[6..8].copy_from_slice(&next_hop_mtu.to_be_bytes());
+    icmp[8..].copy_from_slice(quoted);
+    Icmpv4Packet::new_unchecked(&mut icmp[..]).fill_checksum();
+
+    let IpAddress::Ipv4(local) = conn.local else {
+        unreachable!()
+    };
+    let ip_repr = Ipv4Repr {
+        src_addr: Ipv4Address::new(192, 168, 1, 254),
+        dst_addr: local,
+        next_header: IpProtocol::Icmp,
+        payload_len: icmp.len(),
+        hop_limit: 64,
+    };
+    let mut bytes = vec![0; ip_repr.buffer_len() + icmp.len()];
+    let caps = ChecksumCapabilities::default();
+    ip_repr.emit(&mut Ipv4Packet::new_unchecked(&mut bytes[..]), &caps);
+    bytes[ip_repr.buffer_len()..].copy_from_slice(&icmp);
+    bytes
+}
+
+/// `packet`, a TCP segment, with its sequence number set to `seq`.
+#[cfg(all(feature = "medium-ip", feature = "socket-tcp"))]
+fn with_seq(packet: &[u8], seq: TcpSeqNumber) -> Vec<u8> {
+    let mut packet = packet.to_vec();
+    packet[24..28].copy_from_slice(&seq.0.to_be_bytes());
+    packet
+}
+
+#[test]
+#[cfg(all(feature = "medium-ip", feature = "socket-tcp"))]
+fn test_frag_needed_lowers_mss_and_resends() {
+    let mut conn = pmtu_connection();
+    let sent = conn.sent.clone();
+
+    // The router's MTU of 1000 leaves 960 octets for data.
+    let resent = conn.deliver(frag_needed(&conn, &sent[0], 1000));
+    conn.assert_resent(&resent, 960, PMTU_DATA);
+
+    // The errors for the rest of the first flight report the same MTU.
+    for packet in &sent[1..] {
+        assert!(conn.deliver(frag_needed(&conn, packet, 1000)).is_empty());
+    }
+
+    let stats = conn.iface.path_mtu_stats();
+    let expected = PathMtuStats {
+        received: 3,
+        rejected: 0,
+        reductions: 1,
+    };
+    assert_eq!(stats, expected);
+}
+
+#[test]
+#[cfg(all(feature = "medium-ip", feature = "socket-tcp"))]
+fn test_frag_needed_ignores_sequence_not_in_flight() {
+    let mut conn = pmtu_connection();
+    let sent = conn.sent[0].clone();
+
+    // Past what was sent, as one forged blind might be, and before it.
+    let past = with_seq(&sent, conn.first + PMTU_DATA);
+    let before = with_seq(&sent, TcpSeqNumber(conn.first.0 - 1));
+    for packet in [past, before] {
+        assert!(conn.deliver(frag_needed(&conn, &packet, 1000)).is_empty());
+    }
+
+    let stats = conn.iface.path_mtu_stats();
+    let expected = PathMtuStats {
+        received: 2,
+        rejected: 2,
+        reductions: 0,
+    };
+    assert_eq!(stats, expected);
+
+    // A valid error still works.
+    let resent = conn.deliver(frag_needed(&conn, &sent, 1000));
+    conn.assert_resent(&resent, 960, PMTU_DATA);
+}
+
+#[test]
+#[cfg(all(feature = "medium-ip", feature = "socket-tcp"))]
+fn test_frag_needed_never_raises_nor_goes_below_the_floor() {
+    let mut conn = pmtu_connection();
+    let sent = conn.sent[0].clone();
+
+    let resent = conn.deliver(frag_needed(&conn, &sent, 1000));
+    conn.assert_resent(&resent, 960, PMTU_DATA);
+
+    // A larger MTU is no reason to send larger segments.
+    assert!(conn.deliver(frag_needed(&conn, &sent, 1400)).is_empty());
+
+    // An MTU below 576 counts as 576.
+    let resent = conn.deliver(frag_needed(&conn, &sent, 300));
+    conn.assert_resent(&resent, 536, PMTU_DATA);
+    assert!(conn.deliver(frag_needed(&conn, &sent, 68)).is_empty());
+
+    let stats = conn.iface.path_mtu_stats();
+    let expected = PathMtuStats {
+        received: 4,
+        rejected: 0,
+        reductions: 2,
+    };
+    assert_eq!(stats, expected);
+}
+
+#[test]
+#[cfg(all(feature = "medium-ip", feature = "socket-tcp"))]
+fn test_frag_needed_without_next_hop_mtu_uses_a_plateau() {
+    let mut conn = pmtu_connection();
+    let sent = conn.sent[0].clone();
+
+    // 1492 is the plateau below the refused packet's 1500 octets.
+    let resent = conn.deliver(frag_needed(&conn, &sent, 0));
+    conn.assert_resent(&resent, 1452, PMTU_DATA);
+
+    // And then 1006, below the 1492 octets sent now.
+    let resent = conn.deliver(frag_needed(&conn, &resent[0], 0));
+    conn.assert_resent(&resent, 966, PMTU_DATA);
+}
+
+#[test]
+#[cfg(all(feature = "medium-ip", feature = "socket-tcp"))]
+fn test_frag_needed_ignores_implausible_errors() {
+    let mut conn = pmtu_connection();
+    let sent = conn.sent[0].clone();
+
+    // The quoted packet is not from this interface.
+    let mut other = sent.clone();
+    other[12..16].copy_from_slice(&[192, 168, 1, 9]);
+    assert!(conn.deliver(frag_needed(&conn, &other, 1000)).is_empty());
+
+    // The MTU is not below the length of the packet it refused.
+    assert!(conn.deliver(frag_needed(&conn, &sent, 1500)).is_empty());
+
+    // The checksum is wrong.
+    let mut corrupt = frag_needed(&conn, &sent, 1000);
+    corrupt[20 + 2] ^= 0xff;
+    assert!(conn.deliver(corrupt).is_empty());
+
+    let stats = conn.iface.path_mtu_stats();
+    let expected = PathMtuStats {
+        received: 3,
+        rejected: 3,
+        reductions: 0,
+    };
+    assert_eq!(stats, expected);
+}

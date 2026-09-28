@@ -144,10 +144,12 @@ boundaries. Ancillary data, multicast, broadcast, OS file descriptors,
 IPv4-mapped IPv6 addresses, and fragmented IPv4 or IPv6 ingress are not
 supported.
 
-SmolNet does no path MTU discovery. It never sends a packet larger than
-`:mtu`, but it ignores ICMP errors reporting a narrower hop, so a TCP send
-across one stalls. Set `:mtu` to the narrowest MTU on the path, or clamp
-the MSS on the router at the narrow link; see [Path MTU](path_mtu.md).
+SmolNet never sends a packet larger than `:mtu`. A TCP connection does
+path MTU discovery from ICMP errors: when a router reports a narrower hop,
+it sends smaller segments from then on. Where those errors are filtered,
+the path is a black hole and a TCP send across it stalls; set `:mtu` to
+the narrowest MTU on the path, or clamp the MSS on the router at the
+narrow link. UDP datagrams must fit the path. See [Path MTU](path_mtu.md).
 
 ## Troubleshooting
 
@@ -155,8 +157,10 @@ the MSS on the router at the narrow link; see [Path MTU](path_mtu.md).
   MTU, or a list within the stack's `input_packets` and `bytes_copied` limits.
   Do not include Ethernet headers.
 - If connections open and small exchanges work, but larger transfers hang
-  with no error, the path is probably narrower than `:mtu`; see
-  [Path MTU](path_mtu.md).
+  with no error, the path is probably narrower than `:mtu` and filters the
+  ICMP errors that would report it. If `stack_info`'s
+  `icmp_too_big_received` stays at 0 while a send hangs, set `:mtu` or
+  clamp the MSS; see [Path MTU](path_mtu.md).
 - If an operation times out, confirm that the link is forwarding outbound
   packets and returning peer traffic. SmolNet drives protocol timers, but it
   cannot move packets across the external transport.
