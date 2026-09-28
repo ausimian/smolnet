@@ -8,6 +8,13 @@ and this project adheres to
 
 <!-- %% CHANGELOG_ENTRIES %% -->
 
+## 0.7.1 - 2026-09-28
+
+### Fixed
+
+- The README's installation instructions now depend on `{:smolnet, "~> 0.7"}`.
+  They named `~> 0.2`, which also allows versions older than 0.7.0.
+
 ## 0.7.0 - 2026-09-28
 
 SmolNet's TCP now behaves much more like Linux's on real networks, with
