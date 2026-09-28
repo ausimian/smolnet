@@ -50,9 +50,18 @@ defmodule SmolNet.Integration.TunLink do
   queue for the device, which drops what overflows it, as a real network
   interface does.
 
+  ## Credit starvation
+
+  `starve/2` makes the link hold back the egress credit it would grant:
+  late, one packet at a time, or not at all, as a link whose transport
+  has stalled does. The stack then sees the device as slow or stopped,
+  without a packet being lost. `integration/chaos.exs` uses it.
+
   ## Failure
 
-  If the helper exits, the link exits with `{:helper_exit, status}`, and the
+  If the helper exits, the link exits with `{:helper_exit, status}`, where
+  `status` is the helper's exit status or, if the link wrote to the helper
+  after it had gone, the reason its port closed, such as `:epipe`. The
   stack applies its `:link_down` policy as for any other link that dies. The
   link watches its stack with `SmolNet.monitor/1` and stops normally when the
   stack stops. Stopping the link closes the port; the helper then sees end of
@@ -91,8 +100,13 @@ defmodule SmolNet.Integration.TunLink do
           ingress_credit: non_neg_integer(),
           ingress_dropped: non_neg_integer(),
           device: String.t(),
-          helper_os_pid: non_neg_integer() | nil
+          helper_os_pid: non_neg_integer() | nil,
+          starve: starve_mode(),
+          credit_withheld_packets: non_neg_integer(),
+          credit_withheld_bytes: non_neg_integer()
         }
+
+  @type starve_mode :: :off | :stop | {:delay, pos_integer()} | {:trickle, pos_integer()}
 
   @doc """
   Starts a link linked to the caller, and the stack it carries.
@@ -137,6 +151,31 @@ defmodule SmolNet.Integration.TunLink do
   @spec stats(GenServer.server()) :: stats()
   def stats(link), do: GenServer.call(link, :stats)
 
+  @doc """
+  Starves the stack of the egress credit the link grants it, or stops.
+
+  From now on, credit the helper returns is granted by `mode`:
+
+    * `:off` - at once, as by default.
+    * `{:delay, ms}` - `ms` milliseconds late.
+    * `{:trickle, ms}` - held back, and granted one packet every `ms`
+      milliseconds, each with an even share of the bytes held.
+    * `:stop` - held back.
+
+  Credit held back is granted when the mode becomes `:off` or a delay,
+  and a delayed grant that falls due under `:stop` or a trickle is held
+  back in turn, so none is lost. `stats/1` reports the mode as `starve`,
+  and the credit held back or on its way as `credit_withheld_packets` and
+  `credit_withheld_bytes`. Returns `{:error, :no_credit}` if the stack has
+  unlimited credit.
+  """
+  @spec starve(GenServer.server(), starve_mode()) :: :ok | {:error, :no_credit}
+  def starve(link, mode) when mode in [:off, :stop], do: GenServer.call(link, {:starve, mode})
+
+  def starve(link, {kind, ms} = mode)
+      when kind in [:delay, :trickle] and is_integer(ms) and ms > 0,
+      do: GenServer.call(link, {:starve, mode})
+
   defp server_options(nil), do: []
   defp server_options(name), do: [name: name]
 
@@ -145,6 +184,9 @@ defmodule SmolNet.Integration.TunLink do
 
   @impl true
   def init(options) do
+    # A port closed by a write to a helper already gone exits, rather than
+    # reporting the helper's exit status.
+    Process.flag(:trap_exit, true)
     {link_options, stack_options} = Keyword.split(options, @link_options)
     stack_options = Keyword.put_new(stack_options, :egress_credit, @default_credit)
 
@@ -173,10 +215,32 @@ defmodule SmolNet.Integration.TunLink do
         ingress_refused: :counters.get(state.ingress, @ingress_refused),
         ingress_queue_len: :counters.get(state.ingress, @ingress_queued),
         ingress_credit: state.rx_granted,
-        helper_os_pid: os_pid(state.port)
+        helper_os_pid: os_pid(state.port),
+        starve: state.starve,
+        credit_withheld_packets: elem(state.withheld, 0) + elem(state.delayed, 0),
+        credit_withheld_bytes: elem(state.withheld, 1) + elem(state.delayed, 1)
       })
 
     {:reply, stats, state}
+  end
+
+  def handle_call({:starve, _mode}, _from, %{credit: nil} = state),
+    do: {:reply, {:error, :no_credit}, state}
+
+  def handle_call({:starve, mode}, _from, state) do
+    state = %{state | starve: mode}
+
+    result =
+      case mode do
+        :stop -> {:ok, state}
+        {:trickle, _ms} -> {:ok, arm_trickle(state)}
+        _off_or_delay -> release(state)
+      end
+
+    case result do
+      {:ok, state} -> {:reply, :ok, state}
+      {:closed, state} -> {:stop, :normal, :ok, state}
+    end
   end
 
   @impl true
@@ -210,8 +274,42 @@ defmodule SmolNet.Integration.TunLink do
 
   def handle_info(:ingress_consumed, state), do: {:noreply, grant_ingress(state)}
 
+  # A delayed grant falls due; under a delay it is granted, and under
+  # :stop or a trickle it is held back with the rest.
+  def handle_info({:delayed_grant, packets, bytes}, state) do
+    state = %{state | delayed: add(state.delayed, -packets, -bytes)}
+
+    case state.starve do
+      {:delay, _ms} -> state |> grant_now(packets, bytes) |> noreply()
+      _other -> state |> pass_on(packets, bytes) |> noreply()
+    end
+  end
+
+  def handle_info(:trickle, %{starve: {:trickle, _ms}, withheld: {packets, bytes}} = state)
+      when packets > 0 do
+    share = if packets == 1, do: bytes, else: div(bytes, packets)
+    state = %{state | trickle: nil, withheld: {packets - 1, bytes - share}}
+    {result, state} = grant_now(state, 1, share)
+    noreply({result, arm_trickle(state)})
+  end
+
+  def handle_info(:trickle, state), do: {:noreply, %{state | trickle: nil}}
+
   def handle_info({port, {:exit_status, status}}, %{port: port} = state) do
     {:stop, {:helper_exit, status}, %{state | port: nil}}
+  end
+
+  def handle_info({:EXIT, port, reason}, %{port: port} = state) do
+    receive do
+      {^port, {:exit_status, status}} -> {:stop, {:helper_exit, status}, %{state | port: nil}}
+    after
+      0 -> {:stop, {:helper_exit, reason}, %{state | port: nil}}
+    end
+  end
+
+  # The feeder returns once its stack has gone; any other exit is a crash.
+  def handle_info({:EXIT, feeder, reason}, %{feeder: feeder} = state) do
+    if reason == :normal, do: {:noreply, state}, else: {:stop, reason, state}
   end
 
   # The stack was stopped from elsewhere, so the device it fed has no purpose.
@@ -274,12 +372,20 @@ defmodule SmolNet.Integration.TunLink do
   defp grant_ingress(state) do
     room = state.ingress_queue - state.rx_granted - :counters.get(state.ingress, @ingress_queued)
 
-    if room >= grant_batch(state.ingress_queue) do
-      true = Port.command(state.port, <<1, room::32>>)
+    if room >= grant_batch(state.ingress_queue) and command(state.port, <<1, room::32>>) do
       %{state | rx_granted: state.rx_granted + room}
     else
       state
     end
+  end
+
+  # A helper that exits closes its port, possibly before the link has seen
+  # the exit status that stops it, and a command to a closed port raises.
+  # Whatever the link sends meanwhile is lost with the helper.
+  defp command(port, data) do
+    Port.command(port, data)
+  catch
+    :error, :badarg -> false
   end
 
   defp grant_batch(queue), do: max(1, div(queue, 4))
@@ -346,6 +452,12 @@ defmodule SmolNet.Integration.TunLink do
            feeder: spawn_link(fn -> feed(feeder) end),
            monitor: SmolNet.monitor(stack),
            credit: credit(Keyword.fetch!(stack_options, :egress_credit)),
+           starve: :off,
+           # Credit held back by starve/2, and credit on a delayed grant's
+           # timer, as {packets, bytes}.
+           withheld: {0, 0},
+           delayed: {0, 0},
+           trickle: nil,
            mtu: Keyword.get(stack_options, :mtu, 1_500),
            stats: %{
              tx_packets: 0,
@@ -378,14 +490,16 @@ defmodule SmolNet.Integration.TunLink do
   end
 
   defp transmit(packet, state) do
-    true = Port.command(state.port, [0, packet])
-
-    count(state,
-      tx_packets: 1,
-      tx_bytes: byte_size(packet),
-      in_flight_packets: 1,
-      in_flight_bytes: byte_size(packet)
-    )
+    if command(state.port, [0, packet]) do
+      count(state,
+        tx_packets: 1,
+        tx_bytes: byte_size(packet),
+        in_flight_packets: 1,
+        in_flight_bytes: byte_size(packet)
+      )
+    else
+      count(state, tx_packets: 1, tx_bytes: byte_size(packet), tx_dropped: 1)
+    end
   end
 
   defp note_credit_wait(%{credit: nil} = state), do: state
@@ -402,12 +516,44 @@ defmodule SmolNet.Integration.TunLink do
   defp grant(%{credit: nil} = state, _packets, _bytes), do: {:noreply, state}
   defp grant(state, 0, _bytes), do: {:noreply, state}
 
-  defp grant(state, packets, bytes) do
+  defp grant(state, packets, bytes), do: state |> pass_on(packets, bytes) |> noreply()
+
+  # Every grant passes through here, where starve/2 applies.
+  defp pass_on(%{starve: :off} = state, packets, bytes), do: grant_now(state, packets, bytes)
+
+  defp pass_on(%{starve: {:delay, ms}} = state, packets, bytes) do
+    Process.send_after(self(), {:delayed_grant, packets, bytes}, ms)
+    {:ok, %{state | delayed: add(state.delayed, packets, bytes)}}
+  end
+
+  defp pass_on(state, packets, bytes) do
+    {:ok, arm_trickle(%{state | withheld: add(state.withheld, packets, bytes)})}
+  end
+
+  # Passes on the credit held back, when starving stops or turns to a delay.
+  defp release(%{withheld: {0, _bytes}} = state), do: {:ok, state}
+
+  defp release(%{withheld: {packets, bytes}} = state),
+    do: pass_on(%{state | withheld: {0, 0}}, packets, bytes)
+
+  defp arm_trickle(%{starve: {:trickle, ms}, trickle: nil, withheld: {packets, _bytes}} = state)
+       when packets > 0,
+       do: %{state | trickle: Process.send_after(self(), :trickle, ms)}
+
+  defp arm_trickle(state), do: state
+
+  defp grant_now(state, packets, bytes) do
     case SmolNet.grant_egress(state.stack, packets, bytes) do
-      :ok -> {:noreply, state}
-      {:error, :closed} -> {:stop, :normal, state}
+      :ok -> {:ok, state}
+      {:error, :closed} -> {:closed, state}
     end
   end
+
+  defp noreply({:ok, state}), do: {:noreply, state}
+  defp noreply({:closed, state}), do: {:stop, :normal, state}
+
+  defp add({packets, bytes}, more_packets, more_bytes),
+    do: {packets + more_packets, bytes + more_bytes}
 
   defp count(state, increments) do
     stats =

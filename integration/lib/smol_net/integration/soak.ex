@@ -33,6 +33,10 @@ defmodule SmolNet.Integration.Soak do
     * `:stack` - extra `SmolNet.start_stack/1` options, over
       `SmolNet.Integration.Network.stack_options/0`, or a function of the
       script's switch values (the context's `:extra`) that returns them.
+    * `:network` - `:scenario` for a scenario that starts and stops stacks
+      of its own: the runner then starts no link and no packet capture, and
+      the context's `:stack` and `:link` are `nil`. By default the runner
+      starts both, as described below.
     * `:trend` - overrides of `SmolNet.Integration.Soak.Metrics.trend_limits/0`:
       `column: false` stops checking a column, and `column: [floor: f, ratio: r]`
       changes its limit.
@@ -351,6 +355,7 @@ defmodule SmolNet.Integration.Soak do
       out_dir: options.out_dir,
       device: options.device,
       netem: options.netem,
+      egress_credit: options.egress_credit,
       extra: options.extra,
       server: server,
       table: table,
@@ -396,6 +401,14 @@ defmodule SmolNet.Integration.Soak do
   end
 
   defp start_network(context, options, config) do
+    if Keyword.get(config, :network) == :scenario do
+      {:ok, context, nil}
+    else
+      start_link_and_stack(context, options, config)
+    end
+  end
+
+  defp start_link_and_stack(context, options, config) do
     stack_options =
       case Keyword.get(config, :stack, []) do
         stack when is_function(stack, 1) -> stack.(options.extra)
@@ -428,7 +441,13 @@ defmodule SmolNet.Integration.Soak do
 
   defp start_capture(context, %{pcap: false}, _config), do: {:ok, context, nil}
 
-  defp start_capture(context, options, _config) do
+  defp start_capture(context, options, config) do
+    if Keyword.get(config, :network) == :scenario,
+      do: {:ok, context, nil},
+      else: capture(context, options)
+  end
+
+  defp capture(context, options) do
     directory = Path.join(options.out_dir, "pcap")
 
     case Pcap.start(options.device, directory) do

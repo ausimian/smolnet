@@ -112,6 +112,39 @@ defmodule SmolNet.Integration.TunLinkTest do
     SmolNet.stop_stack(stack)
   end
 
+  # Egress queued ahead of the helper's exit status finds its port closed.
+  # Suspending the link queues it there deterministically.
+  test "a helper that dies with egress queued takes the link down with its exit status" do
+    {link, _stack} = start_link()
+    link_monitor = Process.monitor(link)
+    %{port: port} = :sys.get_state(link)
+    {:os_pid, helper} = Port.info(port, :os_pid)
+
+    capture_log(fn ->
+      :ok = :sys.suspend(link)
+      send(link, {:smol_stack, :tun_link, :egress, [<<0::160>>]})
+      {_output, 0} = System.cmd("kill", ["-KILL", to_string(helper)])
+      assert_eventually(fn -> Port.info(port) == nil end)
+      :ok = :sys.resume(link)
+
+      assert_receive {:DOWN, ^link_monitor, :process, _pid, {:helper_exit, 137}}, 5_000
+    end)
+  end
+
+  # A write to a helper already gone closes its port with :epipe, which
+  # reaches the link as an exit rather than as an exit status. That race
+  # cannot be forced, so the port's exit is delivered as the link sees it.
+  test "a port that exits instead of reporting a status takes the link down too" do
+    {link, _stack} = start_link()
+    link_monitor = Process.monitor(link)
+    %{port: port} = :sys.get_state(link)
+
+    capture_log(fn ->
+      send(link, {:EXIT, port, :epipe})
+      assert_receive {:DOWN, ^link_monitor, :process, _pid, {:helper_exit, :epipe}}, 5_000
+    end)
+  end
+
   test "stopping the stack stops the link" do
     {link, stack} = start_link()
     monitor = Process.monitor(link)
@@ -132,6 +165,44 @@ defmodule SmolNet.Integration.TunLinkTest do
 
   test "a device the helper cannot open is an error" do
     assert {:error, {:helper_exit, 1}} = TunLink.start(device: "smolnet-name-too-long")
+  end
+
+  test "starving the stack stops its egress, and ending it returns every packet's credit" do
+    credit = %{packets: 4, bytes: 8_000}
+    {link, stack} = start_link(egress_credit: {4, 8_000})
+
+    assert :ok = TunLink.starve(link, :stop)
+    echo = Task.async(fn -> echo(stack, 65_536) end)
+
+    assert_eventually(fn -> egress_credit(stack).packets == 0 end)
+    assert %{starve: :stop, credit_withheld_packets: withheld} = TunLink.stats(link)
+    assert withheld > 0
+    assert Task.yield(echo, 200) == nil
+
+    assert :ok = TunLink.starve(link, :off)
+    assert Task.await(echo, 30_000)
+    assert_eventually(fn -> egress_credit(stack) == credit end)
+    assert %{credit_withheld_packets: 0, credit_withheld_bytes: 0} = TunLink.stats(link)
+  end
+
+  test "a trickle or a delay of credit slows the stack without losing any" do
+    credit = %{packets: 4, bytes: 8_000}
+    {link, stack} = start_link(egress_credit: {4, 8_000})
+
+    for mode <- [{:trickle, 2}, {:delay, 20}] do
+      assert :ok = TunLink.starve(link, mode)
+      assert echo(stack, 65_536)
+      assert :ok = TunLink.starve(link, :off)
+
+      assert_eventually(fn ->
+        egress_credit(stack) == credit and TunLink.stats(link).credit_withheld_packets == 0
+      end)
+    end
+  end
+
+  test "a stack with unlimited credit cannot be starved" do
+    {link, _stack} = start_link(egress_credit: :infinity)
+    assert TunLink.starve(link, :stop) == {:error, :no_credit}
   end
 
   defp start_link(options \\ []) do

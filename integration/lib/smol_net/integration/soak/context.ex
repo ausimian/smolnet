@@ -3,7 +3,9 @@ defmodule SmolNet.Integration.Soak.Context do
   What a soak workload is handed: the run's options, and the network it runs
   over.
 
-  `:extra` holds the values of the script's own switches. `:stack` and
+  `:extra` holds the values of the script's own switches, and
+  `:egress_credit` the `--egress-credit` the runner's link starts its stack
+  with, for a scenario that starts stacks of its own. `:stack` and
   `:link` are `nil` in baseline mode, where there is no SmolNet stack. The
   remaining fields belong to `SmolNet.Integration.Soak`; pass the context to
   its functions rather than reading them.
@@ -19,6 +21,7 @@ defmodule SmolNet.Integration.Soak.Context do
     :out_dir,
     :device,
     :netem,
+    :egress_credit,
     :stack,
     :link,
     :server,
@@ -38,6 +41,7 @@ defmodule SmolNet.Integration.Soak.Context do
           out_dir: Path.t(),
           device: String.t() | nil,
           netem: String.t() | nil,
+          egress_credit: {non_neg_integer(), non_neg_integer()} | :infinity | nil,
           stack: SmolNet.Stack.Ref.t() | nil,
           link: pid() | nil,
           server: pid() | nil,

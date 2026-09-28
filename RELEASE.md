@@ -58,6 +58,17 @@
   lose their peer silently through nftables. It records how soon SmolNet
   fails each connection to a vanished peer, or that it does not, and fails
   the run if the stack polls while every connection is idle.
+- A chaos integration script, run as
+  `integration/pmtu-topology.sh isolate mix run integration/chaos.exs`. It
+  injects faults into a stack while it carries TLS transfers, connection
+  churn and blocked calls. The faults are kills of the TUN helper or the
+  link under each `:link_down` policy, `SmolNet.stop_stack/1`, device and
+  route flaps, egress credit delayed, trickled or withheld, and socket
+  owners killed or swapped. After each one it checks that every blocked
+  call returns an error within a deadline, that `SmolNet.monitor/1`
+  delivers its `:DOWN`, that nothing of the stack is left running, and
+  that a fresh stack works. Its schedule of faults comes from `--seed`, so
+  a run can be replayed.
 
 ### Changed
 
