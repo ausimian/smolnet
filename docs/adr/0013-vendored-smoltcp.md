@@ -322,9 +322,12 @@ Hex packages are unaffected: they ship only precompiled NIFs and omit
   - Tail loss probes (RFC 8985 7): to a peer that SACKs, with no
     recovery under way, nothing SACKed and nothing resent in the log,
     sending new data or an ACK of new data arms a probe timer: twice SRTT
-    plus 2 ms, Linux's floor, plus 200 ms when only one segment is in
-    flight, for the peer's delayed ACK, and only if it would expire before
-    the RTO. The probe is one new segment if the peer's window allows one,
+    plus 2 ms, Linux's floor, and at least 10 ms, the TLP draft's, plus
+    200 ms when only one segment is in flight, for the peer's delayed
+    ACK, and only if it would expire before the RTO. Where the round trip
+    is well under a millisecond, the 10 ms keeps an ACK that the host
+    holds up briefly from drawing a needless probe, which
+    `tcp_loss_recovery_test.exs` saw on a slow CI runner. The probe is one new segment if the peer's window allows one,
     and otherwise a resend of the last segment sent, whatever the
     congestion window; it restarts the RTO. Its SACK is what lets RACK
     find the losses before it. A probe that resent data and whose episode

@@ -326,6 +326,12 @@ const CLOSE_DELAY: Duration = Duration::from_millis(10_000);
 /// Linux's `TCP_TIMEOUT_MIN`.
 const TLP_MIN_TIMEOUT: Duration = Duration::from_millis(2);
 
+/// The least a loss probe waits at all, as the TLP draft's `max(2 * SRTT,
+/// 10ms)` and early Linux did. Where the round trip is well under a
+/// millisecond, an ACK held up for a few milliseconds by the host, as a
+/// busy stack's is, would otherwise draw a needless probe.
+const TLP_MIN_PTO: Duration = Duration::from_millis(10);
+
 /// RFC 8985 `WCDelAckT`: the longest a receiver delays an ACK, which a loss
 /// probe allows for when only one segment is in flight to be ACKed.
 const TLP_DELAYED_ACK: Duration = Duration::from_millis(200);
@@ -1870,9 +1876,9 @@ impl<'a> Socket<'a> {
     }
 
     /// Starts or restarts the loss probe timer (RFC 8985 7.2). The probe
-    /// timeout is twice SRTT, plus a worst-case delayed ACK when only one
-    /// segment is in flight, and the timer is armed only if it would expire
-    /// before the retransmission timer.
+    /// timeout is twice SRTT, and at least 10 ms, plus a worst-case delayed
+    /// ACK when only one segment is in flight, and the timer is armed only
+    /// if it would expire before the retransmission timer.
     fn arm_loss_probe(&mut self, now: Instant) {
         self.rack.cancel_probe();
         let Some(srtt) = self.rtte.srtt() else {
@@ -1881,7 +1887,7 @@ impl<'a> Socket<'a> {
         if !self.loss_probe_allowed() {
             return;
         }
-        let mut pto = srtt * 2 + TLP_MIN_TIMEOUT;
+        let mut pto = (srtt * 2 + TLP_MIN_TIMEOUT).max(TLP_MIN_PTO);
         if self.flight_size() <= self.remote_mss {
             pto += TLP_DELAYED_ACK;
         }
