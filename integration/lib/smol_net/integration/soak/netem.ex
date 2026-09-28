@@ -40,6 +40,19 @@ defmodule SmolNet.Integration.Soak.Netem do
     "high-bdp" => {~w(delay 100ms rate 100mbit limit 100000), nil}
   }
 
+  # The round trip each profile adds to an otherwise idle path, in
+  # milliseconds: its delay both ways, plus for bufferbloat the queue that
+  # a sender filling the bucket builds in front of it.
+  @round_trips %{
+    "delay" => 200,
+    "loss-burst" => 0,
+    "reorder" => 40,
+    "duplicate" => 0,
+    "corrupt" => 0,
+    "bufferbloat" => 40 + 1_000,
+    "high-bdp" => 200
+  }
+
   @doc "Returns the profile names."
   @spec profiles() :: [String.t()]
   def profiles, do: @profiles |> Map.keys() |> Enum.sort()
@@ -47,6 +60,14 @@ defmodule SmolNet.Integration.Soak.Netem do
   @doc "Returns whether `name` is a profile."
   @spec profile?(String.t()) :: boolean()
   def profile?(name), do: Map.has_key?(@profiles, name)
+
+  @doc """
+  Returns the round trip, in milliseconds, that `profile` adds to a path
+  that has none of its own: its delay both ways, and for `bufferbloat` the
+  full queue too. Jitter and reordering are left out.
+  """
+  @spec round_trip_ms(String.t()) :: non_neg_integer()
+  def round_trip_ms(profile), do: Map.fetch!(@round_trips, profile)
 
   @doc "Returns the alias that marks an `ifb` as one `impair/2` created."
   @spec ifb_alias() :: String.t()

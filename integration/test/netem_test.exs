@@ -52,6 +52,12 @@ defmodule SmolNet.Integration.Soak.NetemTest do
     assert Netem.undo_commands([]) == []
   end
 
+  test "knows the round trip each profile adds" do
+    assert Enum.all?(Netem.profiles(), &is_integer(Netem.round_trip_ms(&1)))
+    assert Netem.round_trip_ms("high-bdp") == 200
+    assert Netem.round_trip_ms("bufferbloat") == 1_040
+  end
+
   test "keeps the ifb name within the kernel's interface name limit" do
     assert Netem.ifb("a-long-device") == "ifb-a-long-devi"
   end

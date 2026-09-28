@@ -155,6 +155,24 @@ jq '.results | {list: .list.id, outcomes, comparison, causes}' <out>/verdict.jso
 jq '.results.smolnet_only[] | {host, family, smolnet, kernel, reasons, evidence}' <out>/verdict.json
 ```
 
+The netem matrix, `netem_matrix.exs`, runs bulk TCP transfers under every
+profile of `SmolNet.Integration.Soak.Netem`: SmolNet sending and
+receiving through the device, and, as the baseline, the kernel sending to
+a kernel in another namespace across a veth that `netem-topology.sh`
+builds and the matrix impairs with the same profile. It too runs under
+`isolate`, with the capture off so that tcpdump does not share the CPU:
+
+```console
+integration/netem-topology.sh isolate mix run integration/netem_matrix.exs --no-pcap
+integration/netem-topology.sh isolate mix run integration/netem_matrix.exs --no-pcap \
+  --profiles loss-burst --flows send,kernel --streams 1 --repeats 9 --family inet
+```
+
+It fails when a transfer loses integrity or SmolNet stalls for longer
+than `--stall-rtos` retransmission timeouts, and records throughput and
+completion time beside the kernel's, each gap tagged with the issue that
+tracks it. `netem.md` has the latest matrix and how to read it.
+
 Each script's `--help` lists its options. `--self-check` runs a scenario
 over the TUN helper's loopback with no device and no root, and `--baseline`
 over the kernel's stack alone. Use `MIX_ENV=prod` for measurements: the
