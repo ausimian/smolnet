@@ -362,6 +362,40 @@ Hex packages are unaffected: they ship only precompiled NIFs and omit
     new samples and limited transmit switched off; the other two guard
     against spurious resends and pick the probe's segment. Eleven unit tests
     cover the log and RACK's state, and one the scoreboard's new query.
+- #126: upstream's CUBIC grew the window in slow start by at most one MSS
+  per ACK (`len.min(mss)`), RFC 5681's conservative rule, and counted the
+  same capped `segment` in congestion avoidance, in both `W_est` and the
+  cubic increment. Real servers acknowledge several segments at once:
+  their NICs coalesce what arrives (GRO, LRO), and they delay ACKs. A
+  capture of SmolNet's uploads to speed.cloudflare.com from a GitHub
+  runner (integration run 36404710012) held 3,366 ACKs of new data,
+  covering a median of 3 segments and a mean of 4.5; 4% covered one. In
+  slow start SmolNet's flight grew about a quarter each round trip, 14,
+  17, 20, 23 and 27 KB, where the kernel's doubles, and its uploads ran at
+  0.52 (one stream) and 0.47 (four) times the kernel's.
+  - Slow start now grows by every byte an ACK acknowledges, up to
+    `ssthresh`, as Linux's `tcp_slow_start` does: RFC 3465's appropriate
+    byte counting without its per-ACK limit. This departs from that
+    limit, `L = 2 * SMSS`, on purpose: with ACKs of three segments it
+    would still grow the window only about 1.6 times a round trip. The
+    limit guards against bursts from a cumulative ACK of much data at
+    once; the window still grows by no more than the ACK frees, so a
+    burst is at most twice what was acknowledged, as on Linux.
+  - After a timeout it counts one MSS per ACK, RFC 3465's `L = 1 * SMSS`,
+    until the window reaches `ssthresh` or a loss ends it: the go-back-N
+    resend follows a cleared scoreboard, so one ACK may cover everything
+    the receiver held.
+  - Congestion avoidance counts bytes too, in `W_est` (RFC 9438 4.3's
+    `segments_acked`) and in the cubic increment, as Linux counts `acked`
+    in `tcp_cong_avoid_ai`. Before, a peer that acknowledged every second
+    segment halved CUBIC's growth, which #119's captures under loss
+    showed. The increment's product is taken in 64 bits, since an ACK can
+    now cover a whole window.
+  - Two unit tests fail without the patch: stretch ACKs doubling the
+    window in slow start and stopping at `ssthresh`, and ACKs of one, two
+    and eight segments growing congestion avoidance alike, on the
+    Reno-friendly line and on the curve after a loss. A third covers one
+    MSS per ACK after a timeout.
 
 ## Later configuration
 

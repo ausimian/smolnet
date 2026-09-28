@@ -29,6 +29,9 @@ pub struct Cubic {
     // are retransmissions of the same segment and must not reduce ssthresh
     // again (RFC 5681 section 3.1).
     in_rto_recovery: bool,
+    // Set on RTO, cleared when slow start ends or on loss: RFC 3465 §2.3
+    // counts at most one MSS per ACK in the slow start after a timeout.
+    rto_slow_start: bool,
     idle_start: Option<Instant>, // RFC 9438 §4.2: when in-flight last hit 0
 }
 
@@ -47,6 +50,7 @@ impl Cubic {
             recovery_start: None,
             in_fast_recovery: false,
             in_rto_recovery: false,
+            rto_slow_start: false,
             idle_start: None,
         };
         cubic.recompute_k();
@@ -78,8 +82,6 @@ impl Controller for Cubic {
     }
 
     fn on_ack(&mut self, now: Instant, len: usize, in_flight: usize, rtt: &RttEstimator) {
-        let segment = len.min(self.mss);
-
         self.absorb_idle(now);
 
         if in_flight == 0 {
@@ -104,12 +106,23 @@ impl Controller for Cubic {
             self.w_est = self.cwnd as f64;
             return;
         } else if self.cwnd < self.ssthresh {
-            // Slow start: increase `cwnd` by 1 MSS per ACK.
-            self.cwnd = self
-                .cwnd
-                .saturating_add(segment)
-                .min(self.rwnd)
-                .max(self.mss);
+            // Slow start, with RFC 3465 byte counting as Linux does it: grow
+            // by every byte the ACK acknowledges, up to ssthresh, so that a
+            // receiver acknowledging several segments at once (delayed or
+            // GRO stretch ACKs) still doubles the window each round trip.
+            // After a timeout everything is resent and the scoreboard is
+            // gone, so one ACK may cover what the receiver held; RFC 3465
+            // §2.3 counts one MSS per ACK then.
+            let counted = if self.rto_slow_start {
+                len.min(self.mss)
+            } else {
+                len
+            };
+            let grow = counted.min(self.ssthresh - self.cwnd);
+            self.cwnd = self.cwnd.saturating_add(grow).min(self.rwnd).max(self.mss);
+            if self.cwnd >= self.ssthresh {
+                self.rto_slow_start = false;
+            }
             return;
         }
 
@@ -147,7 +160,9 @@ impl Controller for Cubic {
                 ALPHA_CUBIC
             };
 
-            self.w_est += alpha * self.mss as f64 * segment as f64 / self.cwnd as f64;
+            // Per byte acknowledged, as slow start counts, so that delayed
+            // and stretch ACKs grow it as fast as an ACK per segment would.
+            self.w_est += alpha * self.mss as f64 * len as f64 / self.cwnd as f64;
             self.w_est
         };
 
@@ -169,7 +184,9 @@ impl Controller for Cubic {
 
         // TODO: clamps to 0 on small w_cubic_target (i.e. close to plateau)
         // add additional counter (linux `cwnd_cnt`?) to track "lost" bytes
-        let increment = (w_cubic_target as usize).saturating_sub(self.cwnd) * segment / self.cwnd;
+        // Per byte acknowledged, as Linux counts `acked` segments.
+        let gap = (w_cubic_target as usize).saturating_sub(self.cwnd);
+        let increment = (gap as u64 * len as u64 / self.cwnd as u64) as usize;
         self.cwnd = (self.cwnd + increment).min(self.rwnd).max(self.mss);
     }
 
@@ -185,6 +202,7 @@ impl Controller for Cubic {
 
     fn on_loss(&mut self, now: Instant, in_flight: usize) {
         self.idle_start = None;
+        self.rto_slow_start = false;
         // Only cut window size on first entrance to fast recovery.
         if !self.in_fast_recovery {
             // RFC 9438 §4.3: remember the cwnd at this congestion event so W_est can
@@ -223,6 +241,7 @@ impl Controller for Cubic {
 
         self.cwnd = self.mss;
         self.cwnd_prior = in_flight;
+        self.rto_slow_start = true;
 
         // RFC 9438 §4.8: defer W_max and K reset to the start of the next CA stage.
         self.recovery_start = None;
@@ -381,6 +400,52 @@ mod test {
         assert_eq!(cubic.window(), cubic.rwnd);
     }
 
+    // Acknowledges `rounds` round trips of 50 ms from `start` ms, a window
+    // each, `per_ack` bytes an ACK spread evenly, and returns the growth.
+    fn grow_over(cubic: &mut Cubic, start: i64, rounds: i64, per_ack: usize) -> usize {
+        let before = cubic.window();
+        for round in 0..rounds {
+            let acks = (cubic.window() / per_ack) as i64;
+            for i in 0..acks {
+                let now = start + round * 50 + 50 * i / acks;
+                ack(cubic, per_ack, Instant::from_millis(now));
+            }
+        }
+        cubic.window() - before
+    }
+
+    #[test]
+    fn congestion_avoidance_counts_what_each_ack_acknowledges() {
+        // #126, #119: an ACK every second segment, or a stretch ACK, must
+        // grow the window as fast as an ACK per segment does, on the
+        // Reno-friendly line from slow start, and on the curve after a loss.
+        for loss in [false, true] {
+            let growth = |per_ack| {
+                let mut cubic = Cubic::new();
+                cubic.set_mss(MSS);
+                cubic.set_remote_window(1 << 20);
+                cubic.cwnd = 64 * MSS;
+                cubic.ssthresh = 64 * MSS;
+                if loss {
+                    cubic.w_max = 100 * MSS;
+                    cubic.on_loss(Instant::from_millis(0), cubic.cwnd);
+                    ack(&mut cubic, MSS, Instant::from_millis(1));
+                }
+                grow_over(&mut cubic, 2, 20, per_ack)
+            };
+            let (each, delayed, stretch) = (growth(MSS), growth(2 * MSS), growth(8 * MSS));
+            assert!(each > 4 * MSS, "loss {loss}: {each}");
+            assert!(
+                delayed * 10 >= each * 9,
+                "loss {loss}: {delayed} against {each}"
+            );
+            assert!(
+                stretch * 10 >= each * 8,
+                "loss {loss}: {stretch} against {each}"
+            );
+        }
+    }
+
     #[test]
     fn fast_recovery_works() {
         let mut cubic = Cubic::new();
@@ -528,6 +593,56 @@ mod test {
         ack(&mut cubic, MSS, Instant::from_millis(30));
         assert_eq!(cubic.window(), initial_cwnd + MSS);
         assert_eq!(cubic.ssthresh, initial_cwnd + MSS);
+    }
+
+    #[test]
+    fn slow_start_counts_what_a_stretch_ack_acknowledges() {
+        // #126: a receiver that coalesces segments (GRO, LRO) acknowledges
+        // several at once, and slow start must still double each round trip.
+        let mut cubic = Cubic::new();
+        cubic.set_mss(MSS);
+        let initial = cubic.window();
+        assert_eq!(initial, 10 * MSS);
+
+        // A round trip of ACKs of five segments each.
+        ack(&mut cubic, 5 * MSS, Instant::from_millis(1));
+        ack(&mut cubic, 5 * MSS, Instant::from_millis(2));
+        assert_eq!(cubic.window(), 2 * initial);
+
+        // One ACK for the whole window, as GRO of 64 KiB may send.
+        ack(&mut cubic, 2 * initial, Instant::from_millis(3));
+        assert_eq!(cubic.window(), 4 * initial);
+
+        // It stops at ssthresh, and the next ACK is congestion avoidance's.
+        cubic.ssthresh = cubic.window() + 3 * MSS;
+        ack(&mut cubic, 10 * MSS, Instant::from_millis(4));
+        assert_eq!(cubic.window(), cubic.ssthresh);
+        assert_eq!(cubic.recovery_start, None);
+        ack(&mut cubic, MSS, Instant::from_millis(5));
+        assert_eq!(cubic.recovery_start, Some(Instant::from_millis(5)));
+    }
+
+    #[test]
+    fn slow_start_after_a_timeout_counts_one_mss_an_ack() {
+        // RFC 3465 §2.3: after a timeout everything is resent, and one ACK
+        // may cover what the receiver held, so each counts one MSS.
+        let mut cubic = Cubic::new();
+        cubic.set_mss(MSS);
+        cubic.cwnd = 40 * MSS;
+        cubic.on_rto(Instant::from_millis(0), 40 * MSS);
+        for i in 1..=5 {
+            ack(&mut cubic, 8 * MSS, Instant::from_millis(i));
+            assert_eq!(cubic.window(), (1 + i as usize) * MSS);
+        }
+
+        // Reaching ssthresh ends it.
+        let mut time = 5;
+        while cubic.window() < cubic.ssthresh {
+            time += 1;
+            ack(&mut cubic, 8 * MSS, Instant::from_millis(time));
+        }
+        assert_eq!(cubic.window(), cubic.ssthresh);
+        assert!(!cubic.rto_slow_start);
     }
 
     #[test]
