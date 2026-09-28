@@ -120,6 +120,9 @@ SmolNet provides three interfaces over the same stack and socket machinery:
 | `:gen_udp` and `:inet` | Existing code expects OTP UDP sockets and active or passive delivery | [Using `:gen_udp`](gen_udp.md) |
 | `SmolNet` | You want explicit endpoint maps, direct timeouts, or nonblocking readiness | [Using the low-level socket API](socket_api.md) |
 
+For TLS, `:ssl` runs over the same TCP sockets, with `SmolNet.Inet.Tcp` or
+`SmolNet.Inet6.Tcp` as its transport. See [Using `:ssl`](ssl.md).
+
 Both address families are supported. The OTP adapters use `SmolNet.Inet.Tcp`
 and `SmolNet.Inet.Udp` for IPv4, and `SmolNet.Inet6.Tcp` and
 `SmolNet.Inet6.Udp` for IPv6. The low-level API selects `:inet` or `:inet6`

@@ -98,6 +98,7 @@ defmodule SmolNet.MixProject do
   defp docs do
     guides = [
       "gen_tcp.md",
+      "ssl.md",
       "gen_udp.md",
       "socket_api.md",
       "path_mtu.md"
@@ -122,6 +123,7 @@ defmodule SmolNet.MixProject do
         "examples/quickstart.exs",
         "examples/loopback.exs",
         "gen_tcp.md",
+        "ssl.md",
         "gen_udp.md",
         "socket_api.md",
         "path_mtu.md",
