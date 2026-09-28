@@ -40,9 +40,10 @@ defmodule SmolNet.Integration.Scenarios.Pmtu do
   Every case has an expected outcome and a reason for it, which
   `expect/2` gives and the notes and `verdict.json` explain. A case that
   should adapt and does not fails the run, once the matrix is done: the
-  control, a clamped path, a peer that adapts. A case that is known not
-  to adapt, because SmolNet has no path MTU discovery, because it does
-  not reassemble fragments, or because the peer black-holes itself, is
+  control, a clamped path, SmolNet or the peer sending with the router's
+  ICMP errors reaching it. A case that is known not to adapt, because no
+  ICMP error reaches SmolNet and it does no black-hole probing, because it
+  does not reassemble fragments, or because the peer black-holes itself, is
   recorded, not failed. One of those that adapts after all is noted, as a
   sign that the expectation is out of date. A TCP handshake or UDP probe
   that fails, or a path the topology script cannot set, fails the run
@@ -76,9 +77,12 @@ defmodule SmolNet.Integration.Scenarios.Pmtu do
     fits: "the whole path carries SmolNet's MTU",
     clamped: "the router's MSS clamp keeps every segment within the hop",
     peer_pmtud: "the router's ICMP error reaches the peer, whose kernel sends smaller segments",
-    no_pmtud:
-      "SmolNet ignores ICMP Fragmentation Needed and Packet Too Big, and goes on " <>
-        "resending segments too big for the hop, without ever failing (#128)",
+    pmtud:
+      "the router's ICMP error reaches SmolNet, which lowers the connection's segment " <>
+        "size and resends (RFC 1191, RFC 8201; #128)",
+    icmp_black_hole:
+      "no error reaches SmolNet, and it does not probe for a smaller MTU (no RFC 4821): " <>
+        "a black hole, which an MSS clamp at the router or a lower :mtu avoids (path_mtu.md)",
     peer_black_hole:
       "no error reaches the peer, and its kernel does not probe for a smaller MTU " <>
         "(net.ipv4.tcp_mtu_probing=0): the peer's own black hole",
@@ -96,7 +100,8 @@ defmodule SmolNet.Integration.Scenarios.Pmtu do
           :fits
           | :clamped
           | :peer_pmtud
-          | :no_pmtud
+          | :pmtud
+          | :icmp_black_hole
           | :peer_black_hole
           | :black_hole
           | :fragments
@@ -335,7 +340,10 @@ defmodule SmolNet.Integration.Scenarios.Pmtu do
   # Either clamp lowers the MSS each end advertises to the other, since
   # `rt mtu` takes the smaller of the route's MTU each way.
   def expect(%{transport: :tcp, clamp: clamp}, _mtu) when clamp != :none, do: {:adapts, :clamped}
-  def expect(%{transport: :tcp, direction: :out}, _mtu), do: {:stalls, :no_pmtud}
+  def expect(%{transport: :tcp, direction: :out, icmp: :on}, _mtu), do: {:adapts, :pmtud}
+
+  def expect(%{transport: :tcp, direction: :out, icmp: :off}, _mtu),
+    do: {:stalls, :icmp_black_hole}
 
   def expect(%{transport: :tcp, direction: :in, peer_df: :off}, _mtu), do: {:stalls, :fragments}
   def expect(%{transport: :tcp, direction: :in, icmp: :on}, _mtu), do: {:adapts, :peer_pmtud}
