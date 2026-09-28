@@ -155,6 +155,24 @@ jq '.results | {list: .list.id, outcomes, comparison, causes}' <out>/verdict.jso
 jq '.results.smolnet_only[] | {host, family, smolnet, kernel, reasons, evidence}' <out>/verdict.json
 ```
 
+The netem matrix, `netem_matrix.exs`, runs bulk TCP transfers under every
+profile of `SmolNet.Integration.Soak.Netem`: SmolNet sending and
+receiving through the device, and, as the baseline, the kernel sending to
+a kernel in another namespace across a veth that `netem-topology.sh`
+builds and the matrix impairs with the same profile. It too runs under
+`isolate`, with the capture off so that tcpdump does not share the CPU:
+
+```console
+integration/netem-topology.sh isolate mix run integration/netem_matrix.exs --no-pcap
+integration/netem-topology.sh isolate mix run integration/netem_matrix.exs --no-pcap \
+  --profiles loss-burst --flows send,kernel --streams 1 --repeats 9 --family inet
+```
+
+It fails when a transfer loses integrity or SmolNet stalls for longer
+than `--stall-rtos` retransmission timeouts, and records throughput and
+completion time beside the kernel's, each gap tagged with the issue that
+tracks it. `netem.md` has the latest matrix and how to read it.
+
 Each script's `--help` lists its options. `--self-check` runs a scenario
 over the TUN helper's loopback with no device and no root, and `--baseline`
 over the kernel's stack alone. Use `MIX_ENV=prod` for measurements: the
@@ -185,11 +203,12 @@ which is not a failure. IPv6 over the device, to the host, works.
 | nightly, 03:17 UTC | 10 min each of `smoke`, `tls --target local` and `tls` to speed.cloudflare.com | yes |
 | weekly, Sunday 04:43 UTC | 1 h of `smoke`; 4 h each of `tls --target local`, `tls` to the internet (5 min between rounds) and `idle` (idles of up to 2 h, with keepalive); 1 h of `crawl` of the Tranco top 1,000 | yes |
 | `workflow_dispatch` | one run from the inputs below | no |
-| pull request changing `integration/**` or the workflow | 1 to 2 min each of `smoke`, `smoke` under netem `delay`, `tls --target local` and `tls` to the internet, the whole `pmtu` matrix, 4 min of `idle`, with its timers shortened so that every vanished peer is detected, 3 min of `chaos`, and 2 min of `crawl --target local`, ceiling included | no |
+| pull request changing `integration/**` or the workflow | 1 to 2 min each of `smoke`, `smoke` under netem `delay`, `tls --target local` and `tls` to the internet, the whole `pmtu` matrix, 4 min of `idle`, with its timers shortened so that every vanished peer is detected, 3 min of `chaos`, 2 min of `crawl --target local`, ceiling included, and one pass of `netem_matrix` with 2 MiB transfers under every profile but `loss-burst` | no |
 
 `integration/ci/plan.sh` holds the schedule, and `integration/ci/run.sh`
-runs `pmtu` and `chaos` under `pmtu-topology.sh isolate`, so that their
-routers and flaps never touch the runner's own network. A hosted job may run 6 h,
+runs `pmtu`, `netem_matrix` and `chaos` under `pmtu-topology.sh isolate`,
+so that their routers, veths and flaps never touch the runner's own
+network. A hosted job may run 6 h,
 so the long soak is 4 h rather than 6 h, and a dispatched run at most 5 h.
 GitHub disables scheduled workflows after 60 days without a commit to the
 repository; re-enable it from the Actions tab.
@@ -207,7 +226,7 @@ gh workflow run integration.yml --repo ausimian/smolnet --ref <branch> \
 
 | input | values | default |
 | --- | --- | --- |
-| `scenario` | `tls`, `smoke`, `pmtu`, `idle`, `chaos`, `crawl`: runs `integration/<scenario>.exs` | `tls` |
+| `scenario` | `tls`, `smoke`, `pmtu`, `idle`, `chaos`, `crawl`, `netem_matrix`: runs `integration/<scenario>.exs` | `tls` |
 | `duration` | `90s`, `10m`, `1h30m`: at most `5h` | `10m` |
 | `netem` | `none` or a profile of `SmolNet.Integration.Soak.Netem` | `none` |
 | `family` | `both`, `inet`, `inet6` | `both` |

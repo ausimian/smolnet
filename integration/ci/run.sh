@@ -49,11 +49,14 @@ if [[ -n $netem ]]; then argv+=(--netem "$netem"); fi
 argv+=("${extra[@]}" --out "$out")
 command="mix run ${argv[*]}"
 
-# The pmtu scenario builds its own routed path, and the chaos scenario
-# flaps its device and routes, so each runs in a network namespace of its
-# own, with a device of its own there, and leaves the host's alone.
+# The pmtu scenario builds its own routed path, the netem matrix its
+# kernel baseline's veth, and the chaos scenario flaps its device and
+# routes, so each runs in a network namespace of its own, with a device of
+# its own there, and leaves the host's alone.
 isolate=()
-if [[ $scenario == pmtu || $scenario == chaos ]]; then isolate=(integration/pmtu-topology.sh isolate); fi
+case $scenario in
+  pmtu | netem_matrix | chaos) isolate=(integration/pmtu-topology.sh isolate) ;;
+esac
 
 # soak SECONDS ARG...: runs `mix run ARG...` as root, as ci.yml's smoke job
 # does, killed if it outlasts SECONDS.
