@@ -37,12 +37,12 @@
   and as a result in `verdict.json`.
 - A path MTU guide, `path_mtu.md`. It covers what SmolNet does when a hop
   on the path is narrower than its `:mtu`, and how to configure a link so
-  that this does not happen. SmolNet does no path MTU discovery, so a TCP
-  send across such a hop stalls with no error, and UDP datagrams too large
-  for it are lost. Setting `:mtu` to the narrowest MTU on the path avoids
-  both. Where no `:mtu` fits, as on an IPv4 path below 1280, clamping the
-  MSS on the router at the narrow link fixes TCP, and UDP datagrams must
-  be kept within the path.
+  that this does not matter. Where the path filters the ICMP errors that
+  report such a hop, a TCP send across it stalls with no error, and UDP
+  datagrams too large for it are lost wherever they are. Setting `:mtu` to
+  the narrowest MTU on the path avoids both. Where no `:mtu` fits, as on
+  an IPv4 path below 1280, clamping the MSS on the router at the narrow
+  link fixes TCP, and UDP datagrams must be kept within the path.
 - A path MTU integration script, run as
   `integration/pmtu-topology.sh isolate mix run integration/pmtu.exs`. It
   puts a hop with a smaller MTU between SmolNet and a Linux peer, in
@@ -107,6 +107,19 @@
 
 ### Fixed
 
+- A TCP send across a hop narrower than the stack's `:mtu` no longer
+  stalls forever. SmolNet ignored the router's ICMP "Fragmentation Needed"
+  or ICMPv6 "Packet Too Big" error and resent the same full-size segment,
+  backing off, without ever failing. A connection now does path MTU
+  discovery (RFC 1191, RFC 8201): the error lowers its segment size to fit
+  the reported MTU, never below 536 bytes for IPv4 or 1220 for IPv6, and
+  it resends the unacknowledged data at once in smaller segments. An error
+  must quote data the connection has in flight (RFC 5927), so one forged
+  blind is ignored. Each connection learns the path MTU for itself. Where
+  the path filters these errors it is still a black hole, which setting
+  `:mtu` or clamping the MSS avoids; see `path_mtu.md`. `stack_info`'s
+  native counters now include `icmp_too_big_received`,
+  `icmp_too_big_rejected` and `path_mtu_reductions`.
 - A TCP write longer than one segment no longer holds its last, partial
   segment back until the peer acknowledges the earlier ones. Nagle's
   algorithm now holds a partial segment only while another partial segment

@@ -18,6 +18,8 @@ mod socket_set;
 
 mod packet;
 
+#[cfg(feature = "socket-tcp")]
+pub use self::interface::PathMtuStats;
 #[cfg(feature = "multicast")]
 pub use self::interface::multicast::MulticastError;
 pub use self::interface::{
