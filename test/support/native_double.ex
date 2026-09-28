@@ -79,7 +79,7 @@ defmodule SmolNet.Test.NativeDouble do
     end
   end
 
-  def stack_shutdown(_resource) do
+  def stack_shutdown(_resource, _reason) do
     case Application.get_env(:smolnet, :native_shutdown_result, empty_effects()) do
       {:counted, counter, result} ->
         :atomics.add(counter, 1, 1)

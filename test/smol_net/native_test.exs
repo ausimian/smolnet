@@ -105,11 +105,42 @@ defmodule SmolNet.NativeTest do
     assert {:ok, %{more: true}} =
              Native.test_socket_ready(resource, [%{identity: identity, direction: :read}])
 
-    assert {:ok, _shutdown} = Native.stack_shutdown(resource)
+    assert {:ok, _shutdown} = Native.stack_shutdown(resource, :closed)
     assert {:ok, %{more: false}} = poll_until_complete(resource)
     %{id: id, generation: generation} = identity
     assert_receive {:"$smol_socket", {^id, ^generation}, :abort, ^reference, :closed}
     refute_receive {:"$smol_socket", {^id, ^generation}, :select, ^reference}
+  end
+
+  @tag :debug_nif
+  test "shutdown aborts waiters with the reason it is given" do
+    for reason <- [:link_down, :stack_down] do
+      resource = native_stack()
+      {:ok, %{result: identity}} = Native.test_socket_open(resource, 1)
+      reference = make_ref()
+
+      assert {:ok, %{result: {:select, :recv, ^reference}}} =
+               Native.test_socket_wait(resource, identity, %{
+                 direction: :read,
+                 operation: :recv,
+                 pid: self(),
+                 reference: reference,
+                 arm_point: :none,
+                 wake_count: 0,
+                 completed: false
+               })
+
+      assert {:ok, _shutdown} = Native.stack_shutdown(resource, reason)
+      assert {:ok, %{more: false}} = poll_until_complete(resource)
+      %{id: id, generation: generation} = identity
+      assert_receive {:"$smol_socket", {^id, ^generation}, :abort, ^reference, ^reason}
+    end
+  end
+
+  test "shutdown rejects an unknown abort reason" do
+    resource = native_stack()
+    reason = Enum.random([:bogus])
+    assert_raise ErlangError, fn -> Native.stack_shutdown(resource, reason) end
   end
 
   @tag :debug_nif
@@ -209,7 +240,7 @@ defmodule SmolNet.NativeTest do
       end)
 
     assert {:ok, %{result: :ok}} = Native.test_set_budget_checkpoints(resource, 1)
-    assert {:ok, %{more: true}} = Native.stack_shutdown(resource)
+    assert {:ok, %{more: true}} = Native.stack_shutdown(resource, :closed)
     refute_receive {:"$smol_socket", _identity, :abort, _reference, :closed}, 0
 
     assert {:ok, %{result: :ok}} = Native.test_set_budget_checkpoints(resource, 1)

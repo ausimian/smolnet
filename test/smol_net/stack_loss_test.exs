@@ -6,12 +6,18 @@ defmodule SmolNet.StackLossTest do
   # see whichever the scheduler delivers first, usually the DOWN. These force
   # the shutdown to arrive first, by having the adapter stop watching the
   # stack before it dies, and check that pending calls still see `:enetdown`.
+  #
+  # A stack that stops on its own, because its link died under
+  # `link_down: :stop` or because it failed, wakes its waiters itself before
+  # it exits. Those wakeups carry the loss, so pending calls see `:enetdown`
+  # there too (#136).
   use ExUnit.Case, async: false
 
   alias SmolNet.Inet6.Tcp
   alias SmolNet.Inet6.Udp
   alias SmolNet.Stack.Ref
   alias SmolNet.Test.IPv6TcpPeer
+  alias SmolNet.Test.Monitoring
   alias SmolNet.Test.Timing
 
   @client {0xFD00, 0, 0, 0, 0, 0, 0, 1}
@@ -46,7 +52,8 @@ defmodule SmolNet.StackLossTest do
       assert_eventually(fn -> Tcp.info(socket).write_pending end)
 
       monitor = kill_stack_behind_shutdown(stack, adapter)
-      assert {:error, :enetdown} = Task.await(sender, @wait_1s)
+      assert {:error, {:enetdown, unsent}} = Task.await(sender, @wait_1s)
+      assert is_binary(unsent)
       assert_shut_down(monitor, adapter)
     end
 
@@ -156,6 +163,196 @@ defmodule SmolNet.StackLossTest do
       assert {:error, :closed} = Task.await(tcp_receiver, @wait_1s)
       assert {:error, :closed} = Task.await(udp_receiver, @wait_1s)
     end
+
+    test "stop_stack ends an active gen_tcp owner's stream with a bare tcp_closed" do
+      {stack, _peer} = stack_and_peer()
+      {:ok, socket} = tcp_connect(stack, active: true)
+      assert_eventually(fn -> Tcp.info(socket).read_pending end)
+
+      assert :ok = SmolNet.stop_stack(stack)
+      assert_receive {:tcp_closed, ^socket}, @wait_1s
+      refute_received {:tcp_error, ^socket, _reason}
+    end
+  end
+
+  describe "gen_tcp, when the link dies under link_down: :stop" do
+    test "a pending passive recv returns enetdown" do
+      {stack, peer} = stack_and_peer(:accept, link_down: :stop)
+      {:ok, socket} = tcp_connect(stack)
+
+      receiver = Task.async(fn -> :gen_tcp.recv(socket, 1, :infinity) end)
+      assert_eventually(fn -> Tcp.info(socket).read_pending end)
+
+      monitor = kill_link(stack, peer)
+      assert {:error, :enetdown} = Task.await(receiver, @wait_1s)
+      assert_link_down(monitor)
+    end
+
+    # The send had queued part of its data, so it reports the rest unsent.
+    test "a pending send returns enetdown" do
+      {stack, peer} = stack_and_peer(:accept, link_down: :stop)
+      {:ok, socket} = tcp_connect(stack, sndbuf: 4_096)
+
+      assert :ok = IPv6TcpPeer.hold_acks(peer, true)
+      sender = Task.async(fn -> :gen_tcp.send(socket, :binary.copy("lost", 4_096)) end)
+      assert_eventually(fn -> Tcp.info(socket).write_pending end)
+
+      monitor = kill_link(stack, peer)
+      assert {:error, {:enetdown, unsent}} = Task.await(sender, @wait_1s)
+      assert is_binary(unsent)
+      assert_link_down(monitor)
+    end
+
+    # The stack aborts the read and the write waiter one at a time; the
+    # first must not stop the adapter before the send has its answer.
+    test "an active owner's pending send returns enetdown too" do
+      {stack, peer} = stack_and_peer(:accept, link_down: :stop)
+      {:ok, socket} = tcp_connect(stack, active: true, sndbuf: 4_096)
+
+      assert :ok = IPv6TcpPeer.hold_acks(peer, true)
+      sender = Task.async(fn -> :gen_tcp.send(socket, :binary.copy("lost", 4_096)) end)
+      assert_eventually(fn -> Tcp.info(socket).write_pending end)
+
+      monitor = kill_link(stack, peer)
+      assert {:error, {:enetdown, unsent}} = Task.await(sender, @wait_1s)
+      assert is_binary(unsent)
+      assert_receive {:tcp_error, ^socket, :enetdown}, @wait_1s
+      assert_receive {:tcp_closed, ^socket}, @wait_1s
+      assert_link_down(monitor)
+    end
+
+    test "a pending accept returns enetdown" do
+      {stack, peer} = stack_and_peer(:accept, link_down: :stop)
+      {:ok, listener} = :gen_tcp.listen(0, tcp_options(stack))
+
+      acceptor = Task.async(fn -> :gen_tcp.accept(listener, :infinity) end)
+      assert_eventually(fn -> Tcp.info(listener).accept_pending end)
+
+      monitor = kill_link(stack, peer)
+      assert {:error, :enetdown} = Task.await(acceptor, @wait_1s)
+      assert_link_down(monitor)
+    end
+
+    test "a pending connect returns enetdown" do
+      {stack, peer} = stack_and_peer(:ignore, link_down: :stop)
+
+      connector =
+        Task.async(fn -> :gen_tcp.connect(@peer, 443, tcp_options(stack), :infinity) end)
+
+      assert_eventually(fn -> length(adapter_pids(stack)) == 1 end)
+      [adapter] = adapter_pids(stack)
+
+      assert_eventually(fn ->
+        match?({:connecting, %{connect_select: {:select_info, _, _}}}, :sys.get_state(adapter))
+      end)
+
+      monitor = kill_link(stack, peer)
+      assert {:error, :enetdown} = Task.await(connector, @wait_1s)
+      assert_link_down(monitor)
+    end
+
+    test "an active owner gets tcp_error enetdown, then tcp_closed" do
+      {stack, peer} = stack_and_peer(:accept, link_down: :stop)
+      {:ok, socket} = tcp_connect(stack, active: true)
+      assert_eventually(fn -> Tcp.info(socket).read_pending end)
+
+      monitor = kill_link(stack, peer)
+      assert_receive {:tcp_error, ^socket, :enetdown}, @wait_1s
+      assert_receive {:tcp_closed, ^socket}, @wait_1s
+      assert_link_down(monitor)
+    end
+  end
+
+  describe "gen_udp, when the link dies under link_down: :stop" do
+    test "a pending passive recv returns enetdown" do
+      {stack, link} = blackhole_stack(link_down: :stop)
+      {:ok, socket} = :gen_udp.open(0, udp_options(stack))
+
+      receiver = Task.async(fn -> :gen_udp.recv(socket, 0, :infinity) end)
+      assert_eventually(fn -> Udp.info(socket).read_pending end)
+
+      monitor = kill_link(stack, link)
+      assert {:error, :enetdown} = Task.await(receiver, @wait_1s)
+      assert_link_down(monitor)
+    end
+
+    # Credit for one datagram leaves the rest in the transmit ring, so a send
+    # blocks once the ring is full.
+    test "a pending send returns enetdown" do
+      {stack, link} = blackhole_stack(link_down: :stop, egress_credit: {1, 1_280})
+      {:ok, socket} = :gen_udp.open(0, udp_options(stack))
+      payload = :binary.copy(<<0>>, 1_000)
+
+      sender = Task.async(fn -> send_until_error(socket, payload) end)
+      assert_eventually(fn -> Udp.info(socket).write_pending end)
+
+      monitor = kill_link(stack, link)
+      assert {:error, :enetdown} = Task.await(sender, @wait_1s)
+      assert_link_down(monitor)
+    end
+
+    test "an active owner gets udp_error enetdown" do
+      {stack, link} = blackhole_stack(link_down: :stop)
+      {:ok, socket} = :gen_udp.open(0, udp_options(stack, active: true))
+      assert_eventually(fn -> Udp.info(socket).read_pending end)
+
+      monitor = kill_link(stack, link)
+      assert_receive {:udp_error, ^socket, :enetdown}, @wait_1s
+      assert_link_down(monitor)
+    end
+  end
+
+  # The other policies keep the stack running without its link, so nothing
+  # pending fails until the stack is stopped, and stop_stack/1 closes it.
+  describe "when the link dies under a policy that keeps the stack" do
+    for policy <- [:mark_down, :notify] do
+      test "#{policy}: pending calls wait, and stop_stack closes them" do
+        link_down = if unquote(policy) == :notify, do: {:notify, self()}, else: :mark_down
+        {stack, peer} = stack_and_peer(:accept, link_down: link_down)
+        {:ok, tcp} = tcp_connect(stack)
+        {:ok, udp} = :gen_udp.open(0, udp_options(stack))
+
+        tcp_receiver = Task.async(fn -> :gen_tcp.recv(tcp, 1, :infinity) end)
+        udp_receiver = Task.async(fn -> :gen_udp.recv(udp, 0, :infinity) end)
+        assert_eventually(fn -> Tcp.info(tcp).read_pending and Udp.info(udp).read_pending end)
+
+        monitor = kill_link(stack, peer)
+
+        assert_eventually(fn ->
+          match?({:ok, %{link_status: :down}}, SmolNet.stack_info(stack))
+        end)
+
+        refute_received {:DOWN, ^monitor, :process, _pid, _reason}
+        assert Task.yield(tcp_receiver, 0) == nil
+        assert Task.yield(udp_receiver, 0) == nil
+
+        assert :ok = SmolNet.stop_stack(stack)
+        assert {:error, :closed} = Task.await(tcp_receiver, @wait_1s)
+        assert {:error, :closed} = Task.await(udp_receiver, @wait_1s)
+      end
+    end
+  end
+
+  describe "a stack that stops abnormally on its own" do
+    # `:sys.terminate/2` runs the stack's terminate/2 with the given reason,
+    # as a crash in one of its callbacks does.
+    @tag capture_log: true
+    test "wakes pending gen_tcp and gen_udp calls with enetdown" do
+      {stack, _peer} = stack_and_peer()
+      {:ok, tcp} = tcp_connect(stack)
+      {:ok, udp} = :gen_udp.open(0, udp_options(stack))
+
+      tcp_receiver = Task.async(fn -> :gen_tcp.recv(tcp, 1, :infinity) end)
+      udp_receiver = Task.async(fn -> :gen_udp.recv(udp, 0, :infinity) end)
+      assert_eventually(fn -> Tcp.info(tcp).read_pending and Udp.info(udp).read_pending end)
+
+      stack_pid = Ref.pids(stack).stack
+      monitor = Monitoring.monitor_in_place(stack_pid)
+      assert :ok = :sys.terminate(stack_pid, :crashed)
+      assert {:error, :enetdown} = Task.await(tcp_receiver, @wait_1s)
+      assert {:error, :enetdown} = Task.await(udp_receiver, @wait_1s)
+      assert_receive {:DOWN, ^monitor, :process, ^stack_pid, :crashed}, @wait_1s
+    end
   end
 
   # Kills the stack after `adapter` has stopped watching it, so the adapter
@@ -184,11 +381,45 @@ defmodule SmolNet.StackLossTest do
     assert_receive {:DOWN, ^monitor, :process, ^adapter, :shutdown}, @wait_1s
   end
 
-  defp stack_and_peer(mode \\ :accept) do
-    {:ok, peer} = IPv6TcpPeer.start_link(self(), mode)
+  # Kills the stack's link, as a transport that fails would, and returns a
+  # monitor on the stack, taken in place first (see #109).
+  defp kill_link(stack, link) do
+    monitor = Monitoring.monitor_in_place(Ref.pids(stack).stack)
+    Process.unlink(link)
+    Process.exit(link, :kill)
+    monitor
+  end
 
-    {:ok, stack} =
-      SmolNet.start_stack(egress: {peer, :tcp_client}, addresses: [{@client, 64}])
+  defp assert_link_down(monitor) do
+    assert_receive {:DOWN, ^monitor, :process, _stack, {:shutdown, {:link_down, :killed}}},
+                   @wait_1s
+  end
+
+  # A link that discards everything the stack sends it.
+  defp blackhole_stack(extra) do
+    link = spawn(fn -> discard() end)
+    options = [egress: {link, :blackhole}, addresses: [{@client, 64}]] ++ extra
+    {:ok, stack} = SmolNet.start_stack(options)
+    {stack, link}
+  end
+
+  defp discard do
+    receive do
+      _message -> discard()
+    end
+  end
+
+  defp send_until_error(socket, payload) do
+    case :gen_udp.send(socket, @peer, 9, payload) do
+      :ok -> send_until_error(socket, payload)
+      error -> error
+    end
+  end
+
+  defp stack_and_peer(mode \\ :accept, extra \\ []) do
+    {:ok, peer} = IPv6TcpPeer.start_link(self(), mode)
+    options = [egress: {peer, :tcp_client}, addresses: [{@client, 64}]] ++ extra
+    {:ok, stack} = SmolNet.start_stack(options)
 
     :ok = IPv6TcpPeer.attach(peer, stack)
     {stack, peer}

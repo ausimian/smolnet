@@ -4,8 +4,8 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Mutex, TryLockError};
 
 use rustler::{
-    Atom, Binary, Decoder, Encoder, Env, LocalPid, NewBinary, NifMap, NifResult, Reference,
-    Resource, ResourceArc, Term,
+    Atom, Binary, Decoder, Encoder, Env, LocalPid, NewBinary, NifMap, NifResult, NifUnitEnum,
+    Reference, Resource, ResourceArc, Term,
 };
 use smoltcp::iface::{Config, Interface, PollResult, Route, SocketHandle, SocketSet};
 use smoltcp::socket::tcp::{self, ConnectError, ListenError};
@@ -163,6 +163,7 @@ pub struct NativeStack {
     next_forced_budget_checkpoints: Option<usize>,
     next_forced_slice_exhaustion: Option<usize>,
     pending_notifications: VecDeque<PendingNotification>,
+    shutdown_reason: AbortReason,
 }
 
 impl NativeStack {
@@ -238,6 +239,7 @@ impl NativeStack {
             next_forced_budget_checkpoints: None,
             next_forced_slice_exhaustion: None,
             pending_notifications: VecDeque::new(),
+            shutdown_reason: AbortReason::Closed,
         })
     }
 
@@ -1931,10 +1933,13 @@ impl NativeStack {
         }
     }
 
-    pub fn shutdown(&mut self, env: Env<'_>) -> Envelope<Atom> {
+    /// Shuts the stack down, aborting every waiter with `reason`.
+    pub fn shutdown(&mut self, env: Env<'_>, reason: AbortReason) -> Envelope<Atom> {
         if matches!(self.lifecycle, Lifecycle::Shutdown) {
             return Envelope::empty(crate::atoms::ok());
         }
+
+        self.shutdown_reason = reason;
 
         // Linearize shutdown before draining the bounded state. Any socket
         // operation serialized after this point is rejected as closed while
@@ -3227,6 +3232,12 @@ impl NativeStack {
     }
 
     fn send_abort(&mut self, env: Env<'_>, waiter: &Waiter, identity: SocketIdentity) {
+        // A running stack aborts a waiter only because its socket closed. Once
+        // the stack is shutting down, every abort reports why it is.
+        let reason = match self.lifecycle {
+            Lifecycle::Running => AbortReason::Closed,
+            Lifecycle::ShuttingDown | Lifecycle::Shutdown => self.shutdown_reason,
+        };
         let delivered = env
             .send(
                 &waiter.pid,
@@ -3235,7 +3246,7 @@ impl NativeStack {
                     (identity.id, identity.generation),
                     crate::atoms::abort(),
                     waiter.reference(env),
-                    crate::atoms::closed(),
+                    reason,
                 ),
             )
             .is_ok();
@@ -4350,6 +4361,17 @@ pub struct PendingNotification {
     #[allow(dead_code)]
     direction: Direction,
     waiter: Waiter,
+}
+
+/// The reason an abort gives a waiter. A socket's close, or an orderly stack
+/// shutdown, aborts it as `:closed`. A stack shutting down because its link
+/// died, or because it failed, aborts it as `:link_down` or `:stack_down`, so
+/// the waiter can tell a lost stack from one that was stopped.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, NifUnitEnum)]
+pub enum AbortReason {
+    Closed,
+    LinkDown,
+    StackDown,
 }
 
 #[derive(Clone, Copy)]

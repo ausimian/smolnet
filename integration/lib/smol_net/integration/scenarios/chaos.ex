@@ -32,8 +32,11 @@ defmodule SmolNet.Integration.Scenarios.Chaos do
 
   An episode fails unless:
 
-    * every call blocked when the stack stops returns an error, `:closed`
-      or `:enetdown`, within `--stop-deadline` of it: nothing hangs;
+    * every call blocked when the stack stops returns an error within
+      `--stop-deadline` of it: nothing hangs. The error is `:enetdown`
+      when the link died under `:stop`, and the stream's owner gets
+      `tcp_error` before `tcp_closed`; after `SmolNet.stop_stack/1` it is
+      `:closed` or `:enetdown`;
     * `SmolNet.monitor/1` delivers `:DOWN` whenever the stack stops, and
       not before; `{:notify, pid}` delivers its message; `:mark_down` and
       `:notify` keep the stack running, marked down;

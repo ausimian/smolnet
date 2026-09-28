@@ -167,5 +167,9 @@ may progress independently; competing operations in the same direction return
 
 If a socket's stack fails, a call pending on the socket returns
 `{:error, :enetdown}`, and an active socket's owner receives
-`{:udp_error, socket, :enetdown}`. Calls pending when `SmolNet.stop_stack/1`
-stops the stack fail with `:closed`.
+`{:udp_error, socket, :enetdown}`. A stack fails when it crashes, and when its
+link dies under `link_down: :stop`. Calls pending when `SmolNet.stop_stack/1`
+stops the stack, or when its supervisor shuts it down, fail with `:closed`.
+Under `link_down: :mark_down` or `{:notify, pid}` the stack keeps running
+without its link, so pending calls keep waiting until they time out or the
+stack is stopped.

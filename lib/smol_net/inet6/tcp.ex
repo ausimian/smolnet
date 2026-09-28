@@ -585,10 +585,11 @@ defmodule SmolNet.Inet6.Tcp do
         state_name,
         %{low_socket: %Socket{} = socket} = data
       ) do
-    if Socket.identity(socket) == identity do
-      handle_abort(reference, translate_reason(reason), state_name, data)
-    else
-      :keep_state_and_data
+    cond do
+      Socket.identity(socket) != identity -> :keep_state_and_data
+      # The stack is going: fail everything pending, not only this waiter.
+      translate_reason(reason) == :enetdown -> stack_lost(data)
+      true -> handle_abort(reference, translate_reason(reason), state_name, data)
     end
   end
 
@@ -661,8 +662,7 @@ defmodule SmolNet.Inet6.Tcp do
         _state_name,
         %{stack_monitor: monitor, stack_pid: stack_pid} = data
       ) do
-    data = fail_all(data, :enetdown)
-    {:stop, {:shutdown, :stack_down}, %{data | low_socket: nil}}
+    stack_lost(data)
   end
 
   def handle_event(:info, _message, _state_name, _data), do: :keep_state_and_data
@@ -681,8 +681,28 @@ defmodule SmolNet.Inet6.Tcp do
     :ok
   end
 
-  defp stack_lost?(:shutdown, data), do: not Process.alive?(data.stack_pid)
+  defp stack_lost(data) do
+    data = fail_all(data, :enetdown)
+    {:stop, {:shutdown, :stack_down}, %{data | low_socket: nil}}
+  end
+
+  defp stack_lost?(:shutdown, data), do: stack_gone?(data)
   defp stack_lost?(_reason, _data), do: false
+
+  # SmolNet reports a call into a stack that has stopped as `:closed`, as it
+  # does an orderly close or the end of a stream. The stack aborts the waiters
+  # it holds with the reason it stopped, but a call this adapter has in flight
+  # when it stops sees only `:closed`. `stop_stack/1` and a supervisor's
+  # shutdown stop the adapters before the stack, so a stack found gone here
+  # was lost, and the call fails with `:enetdown` like the waiters.
+  defp io_reason(reason, data) do
+    case translate_reason(reason) do
+      :closed -> if stack_gone?(data), do: :enetdown, else: :closed
+      translated -> translated
+    end
+  end
+
+  defp stack_gone?(data), do: not Process.alive?(data.stack_pid)
 
   defp getstat_reply(names) do
     supported = [
@@ -801,11 +821,11 @@ defmodule SmolNet.Inet6.Tcp do
              :ok <- maybe_bind(socket, Options.local_endpoint(data.options)) do
           attempt_connect(data)
         else
-          {:error, reason} -> complete_connect({:error, translate_reason(reason)}, data)
+          {:error, reason} -> complete_connect({:error, io_reason(reason, data)}, data)
         end
 
       {:error, reason} ->
-        complete_connect({:error, translate_reason(reason)}, data)
+        complete_connect({:error, io_reason(reason, data)}, data)
     end
   end
 
@@ -848,7 +868,7 @@ defmodule SmolNet.Inet6.Tcp do
 
       {:error, reason} ->
         accept = cancel_op_timer(data.accept)
-        :gen_statem.reply(accept.from, {:error, translate_reason(reason)})
+        :gen_statem.reply(accept.from, {:error, io_reason(reason, data)})
         {:keep, %{data | accept: nil}}
     end
   end
@@ -857,7 +877,7 @@ defmodule SmolNet.Inet6.Tcp do
     case SmolNet.connect(data.low_socket, data.endpoint, :nowait) do
       :ok -> complete_connect(:ok, %{data | connect_select: nil})
       {:select, select_info} -> {:keep, %{data | connect_select: select_info}}
-      {:error, reason} -> complete_connect({:error, translate_reason(reason)}, data)
+      {:error, reason} -> complete_connect({:error, io_reason(reason, data)}, data)
     end
   end
 
@@ -1012,7 +1032,7 @@ defmodule SmolNet.Inet6.Tcp do
         {:keep, %{data | write: write}}
 
       {:error, reason} ->
-        write_failure(data, translate_reason(reason))
+        write_failure(data, io_reason(reason, data))
     end
   end
 
@@ -1124,13 +1144,22 @@ defmodule SmolNet.Inet6.Tcp do
           {:keep, put_in(data, [:read, :select], select_info)}
 
         {:error, :closed} ->
-          data
-          |> Map.put(:read_closed, true)
-          |> drive_read(chunks - 1, deliveries)
+          read_closed(data, chunks, deliveries)
 
         {:error, reason} ->
-          read_failure(data, translate_reason(reason))
+          read_failure(data, io_reason(reason, data))
       end
+    end
+  end
+
+  # The end of the stream, unless the stack is gone (see `io_reason/2`).
+  defp read_closed(data, chunks, deliveries) do
+    if stack_gone?(data) do
+      read_failure(data, :enetdown)
+    else
+      data
+      |> Map.put(:read_closed, true)
+      |> drive_read(chunks - 1, deliveries)
     end
   end
 
@@ -1487,7 +1516,7 @@ defmodule SmolNet.Inet6.Tcp do
     end
 
     if data.write do
-      :gen_statem.reply(data.write.from, {:error, reason})
+      :gen_statem.reply(data.write.from, write_error_reply(data.write, reason))
     end
 
     %{data | connect_from: nil, accept: nil, read: nil, write: nil}

@@ -121,6 +121,20 @@
   could get no `tcp_error`, `tcp_closed` or `udp_error` message at all. This
   covers pending receives, sends, accepts and connects. Calls pending when
   `SmolNet.stop_stack/1` stops a stack still fail with `:closed`.
+- A stack that stops because its link died, under the default
+  `link_down: :stop`, now fails `:gen_tcp` and `:gen_udp` calls pending on
+  its sockets with `{:error, :enetdown}`, and gives an active socket's owner
+  `{:tcp_error, socket, :enetdown}` then `{:tcp_closed, socket}`, or
+  `{:udp_error, socket, :enetdown}`. So does a stack that crashes. Before,
+  they got `{:error, :closed}` and a bare `tcp_closed`, exactly as after
+  `SmolNet.stop_stack/1`, so a caller could not tell a lost network from a
+  stack the application stopped, and a stream cut short by a dead link read
+  as one that had ended. A send that had queued part of its data returns
+  `{:error, {:enetdown, rest}}` in every such case. `SmolNet.stop_stack/1`
+  and a supervisor's shutdown still give `:closed`. In the low-level API,
+  the `:abort` message a stack sends as it stops carries `:link_down` or
+  `:stack_down` in these cases instead of `:closed`; blocking calls still
+  return `{:error, :closed}`.
 - A TCP sender now fast-retransmits a lost segment to a Linux peer instead
   of waiting at least a second for its retransmission timer. Linux grows
   its advertised window on nearly every ACK early in a connection, and

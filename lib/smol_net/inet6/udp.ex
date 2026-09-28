@@ -407,10 +407,11 @@ defmodule SmolNet.Inet6.Udp do
         :open,
         %{low_socket: %Socket{} = socket} = data
       ) do
-    if Socket.identity(socket) == identity do
-      handle_abort(reference, translate_reason(reason), data)
-    else
-      :keep_state_and_data
+    cond do
+      Socket.identity(socket) != identity -> :keep_state_and_data
+      # The stack is going: fail everything pending, not only this waiter.
+      translate_reason(reason) == :enetdown -> stack_lost(data)
+      true -> handle_abort(reference, translate_reason(reason), data)
     end
   end
 
@@ -441,8 +442,7 @@ defmodule SmolNet.Inet6.Udp do
         _state_name,
         %{stack_monitor: monitor, stack_pid: stack_pid} = data
       ) do
-    data = fail_operations(data, :enetdown)
-    {:stop, {:shutdown, :stack_down}, %{data | low_socket: nil}}
+    stack_lost(data)
   end
 
   def handle_event(:info, _message, _state_name, _data), do: :keep_state_and_data
@@ -457,8 +457,24 @@ defmodule SmolNet.Inet6.Udp do
     :ok
   end
 
-  defp stack_lost?(:shutdown, data), do: not Process.alive?(data.stack_pid)
+  defp stack_lost(data) do
+    data = fail_operations(data, :enetdown)
+    {:stop, {:shutdown, :stack_down}, %{data | low_socket: nil}}
+  end
+
+  defp stack_lost?(:shutdown, data), do: stack_gone?(data)
   defp stack_lost?(_reason, _data), do: false
+
+  # As in `SmolNet.Inet6.Tcp`: a call in flight when the stack is lost sees
+  # `:closed`, so a stack found gone turns it into `:enetdown`.
+  defp io_reason(reason, data) do
+    case translate_reason(reason) do
+      :closed -> if stack_gone?(data), do: :enetdown, else: :closed
+      translated -> translated
+    end
+  end
+
+  defp stack_gone?(data), do: not Process.alive?(data.stack_pid)
 
   defp start_socket(%Options{} = options) do
     child = child_spec(%{owner: self(), options: options})
@@ -527,7 +543,7 @@ defmodule SmolNet.Inet6.Udp do
         {:keep, %{data | write: %{write | select: select_info}}}
 
       {:error, reason} ->
-        :gen_statem.reply(write.from, {:error, translate_reason(reason)})
+        :gen_statem.reply(write.from, {:error, io_reason(reason, data)})
         {:keep, %{data | write: nil}}
     end
   end
@@ -556,7 +572,7 @@ defmodule SmolNet.Inet6.Udp do
         {:keep, put_in(data, [:read, :select], select_info)}
 
       {:error, reason} ->
-        read_failure(data, translate_reason(reason))
+        read_failure(data, io_reason(reason, data))
     end
   end
 

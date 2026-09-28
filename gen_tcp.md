@@ -274,5 +274,11 @@ Network and lifecycle errors use the usual OTP-style atoms, including
 
 If a socket's stack fails, a call pending on the socket returns
 `{:error, :enetdown}`, and an active socket's owner receives
-`{:tcp_error, socket, :enetdown}` and then `{:tcp_closed, socket}`. Calls
-pending when `SmolNet.stop_stack/1` stops the stack fail with `:closed`.
+`{:tcp_error, socket, :enetdown}` and then `{:tcp_closed, socket}`. A send
+that had already queued part of its data returns `{:error, {:enetdown, rest}}`
+with the part it did not queue. A stack fails when it crashes, and when its
+link dies under `link_down: :stop`. Calls pending when `SmolNet.stop_stack/1`
+stops the stack, or when its supervisor shuts it down, fail with `:closed`.
+Under `link_down: :mark_down` or `{:notify, pid}` the stack keeps running
+without its link, so pending calls keep waiting until they time out or the
+stack is stopped.
