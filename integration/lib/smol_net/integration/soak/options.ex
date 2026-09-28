@@ -24,6 +24,8 @@ defmodule SmolNet.Integration.Soak.Options do
     egress_credit: :string,
     out: :string,
     pcap: :boolean,
+    keep_pcap: :boolean,
+    pcap_snaplen: :integer,
     metrics_interval: :string,
     warmup: :string,
     help: :boolean
@@ -42,6 +44,8 @@ defmodule SmolNet.Integration.Soak.Options do
           egress_credit: {non_neg_integer(), non_neg_integer()} | :infinity,
           out_dir: Path.t(),
           pcap: boolean(),
+          keep_pcap: boolean(),
+          pcap_snaplen: non_neg_integer(),
           metrics_interval_ms: pos_integer(),
           warmup_ms: non_neg_integer(),
           extra: map()
@@ -114,6 +118,8 @@ defmodule SmolNet.Integration.Soak.Options do
       --egress-credit C     the link's credit, PACKETS:BYTES or infinity (default 64:131072)
       --out DIR             where artifacts go (default integration/runs/<script>-<time>)
       --no-pcap             do not capture packets on the device
+      --keep-pcap           keep the capture when the run passes too
+      --pcap-snaplen N      capture only the first N bytes of each packet (default 0, all)
       --metrics-interval D  how often to sample metrics (default 10s)
       --warmup D            how long before metric trends count (default: a fifth of the run, at most 10m)
       --help                show this text
@@ -128,7 +134,9 @@ defmodule SmolNet.Integration.Soak.Options do
       device: System.get_env("SMOLNET_TUN", "tun0"),
       egress_credit: "64:131072",
       metrics_interval: "10s",
-      pcap: true
+      pcap: true,
+      keep_pcap: false,
+      pcap_snaplen: 0
     ]
   end
 
@@ -143,6 +151,7 @@ defmodule SmolNet.Integration.Soak.Options do
          {:ok, concurrency} <- concurrency(options[:concurrency]),
          {:ok, families} <- families(options[:family]),
          {:ok, netem} <- netem(options[:netem], mode),
+         {:ok, snaplen} <- snaplen(options[:pcap_snaplen]),
          {:ok, credit} <- egress_credit(options[:egress_credit]) do
       {:ok,
        %{
@@ -156,6 +165,8 @@ defmodule SmolNet.Integration.Soak.Options do
          egress_credit: credit,
          out_dir: out_dir(options[:out], name, mode),
          pcap: mode == :smolnet and options[:pcap],
+         keep_pcap: options[:keep_pcap],
+         pcap_snaplen: snaplen,
          metrics_interval_ms: interval,
          warmup_ms: warmup,
          extra: extra(parsed, config)
@@ -215,6 +226,9 @@ defmodule SmolNet.Integration.Soak.Options do
   defp netem(_profile, _mode) do
     {:error, "--netem shapes the TUN device, so it needs neither --baseline nor --self-check"}
   end
+
+  defp snaplen(bytes) when is_integer(bytes) and bytes >= 0, do: {:ok, bytes}
+  defp snaplen(bytes), do: {:error, "--pcap-snaplen must be 0 or more, got #{bytes}"}
 
   defp egress_credit("infinity"), do: {:ok, :infinity}
 

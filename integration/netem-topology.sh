@@ -25,8 +25,17 @@
 # per packet, loses one. So up limits GSO to one segment per packet on the
 # device and on both ends of the veth, and down restores the device's.
 #
+# up --thin-acks N makes the peer's kernel acknowledge as a server whose
+# NIC coalesces what it receives (GRO, LRO) does, with stretch ACKs of
+# several segments each (#126): nftables there drops all but one in N of
+# its pure ACKs, those with no data, no SYN, FIN or RST and no SACK
+# blocks, so that every duplicate ACK still arrives. The peer becomes the
+# kernel end of SmolNet's transfers too: this namespace forwards between
+# the device and the veth, so that SmolNet over the device and the kernel
+# over the veth send to the same receiver and see the same ACKs.
+#
 #     integration/netem-topology.sh isolate COMMAND [ARG...]
-#     integration/netem-topology.sh up
+#     integration/netem-topology.sh up [--thin-acks N]
 #     integration/netem-topology.sh show
 #     integration/netem-topology.sh down
 #
@@ -89,8 +98,39 @@ one_segment() {
   $1 ip link set dev "$2" gso_max_segs 1
 }
 
+# Has the peer send only one in $1 of its pure ACKs. A pure ACK's IP
+# length is its TCP header's alone, which nftables can match only for
+# each header length in turn.
+thin_acks() {
+  pure="tcp flags & (fin | syn | rst) == 0 tcp option sack missing"
+  thin="numgen inc mod $1 != 0 drop"
+  rules=""
+  for doff in 5 6 7 8 9 10 11 12 13 14 15; do
+    rules="$rules
+    $pure ip length $((20 + 4 * doff)) tcp doff $doff $thin
+    $pure ip6 length $((4 * doff)) tcp doff $doff $thin"
+  done
+  in_peer nft -f - <<EOF
+table inet smolnet_thin_acks {
+  chain output {
+    type filter hook output priority filter; policy accept;$rules
+  }
+}
+EOF
+}
+
 up() {
-  [ "$#" -eq 0 ] || usage
+  thin=""
+  case $# in
+    0) ;;
+    2)
+      [ "$1" = --thin-acks ] || usage
+      case $2 in '' | *[!0-9]*) usage ;; esac
+      [ "$2" -ge 2 ] || die "--thin-acks needs 2 or more, not $2"
+      thin=$2
+      ;;
+    *) usage ;;
+  esac
   require_root up
   if in_host_namespace; then
     die "refusing to change the host's own network namespace; run under: $0 isolate COMMAND"
@@ -120,6 +160,17 @@ up() {
   ip -6 addr add fd00:80::1/64 dev "$local_end" nodad
   in_peer ip addr add 10.80.0.2/24 dev "$peer_end"
   in_peer ip -6 addr add fd00:80::2/64 dev "$peer_end" nodad
+
+  if [ -n "$thin" ]; then
+    save ip_forward "$(sysctl -n net.ipv4.ip_forward)"
+    save ipv6_forwarding "$(sysctl -n net.ipv6.conf.all.forwarding)"
+    sysctl -qw net.ipv4.ip_forward=1
+    sysctl -qw net.ipv6.conf.all.forwarding=1
+    # SmolNet's side of the device, integration/setup.sh's.
+    in_peer ip route add 10.77.0.0/24 via 10.80.0.1
+    in_peer ip -6 route add fd00:77::/64 via fd00:80::1
+    thin_acks "$thin"
+  fi
 
   ready 10.80.0.2
   ready fd00:80::2
@@ -157,6 +208,11 @@ down() {
   if ip link show dev "$ifb" 2>/dev/null | grep -q '^ *alias smolnet-integration$'; then
     ip link del dev "$ifb"
   fi
+
+  forward=$(setting ip_forward)
+  if [ -n "$forward" ]; then sysctl -qw "net.ipv4.ip_forward=$forward"; fi
+  forward=$(setting ipv6_forwarding)
+  if [ -n "$forward" ]; then sysctl -qw "net.ipv6.conf.all.forwarding=$forward"; fi
 
   segs=$(setting gso_max_segs)
   if [ -n "$segs" ] && ip link show dev "$(setting device)" >/dev/null 2>&1; then

@@ -235,6 +235,51 @@ netem). The cells are median Mbit/s, one stream and then four.
 - **Handshakes** (TCP connect and TLS together) grow by about two and a
   half of the profile's added round trips, and no more.
 
+## Stretch ACKs
+
+A real server acknowledges several segments at once: its NIC coalesces
+what arrives (GRO, LRO), and it delays ACKs. In a capture of SmolNet's
+uploads to speed.cloudflare.com (#126, run 36404710012, kept with
+`--keep-pcap`), the ACKs of new data covered a median of 3 segments and
+a mean of 4.5, and 4% covered one. The kernel across a veth, and so the
+matrix above, acknowledges nearly every segment, which hides how a
+sender grows its window against such a server.
+
+`--thin-acks N` reproduces them: `netem-topology.sh up --thin-acks N`
+has nftables in `netem-peer` drop all but one in N of the kernel's pure
+ACKs there, keeping every one with SACK blocks. That kernel becomes the
+peer of every flow, forwarded through this namespace, and only the veth
+is impaired. With N = 3, SmolNet's sends see ACKs of a median of 3
+segments, as against Cloudflare.
+
+It drops ACKs the peer would not have held back too, such as the last of
+a flight: that costs the sender a timeout, as a lost ACK would, and both
+stacks' longest waits are about 200 ms. It is for measuring how a window
+grows, on paths without loss.
+
+Sending 1 MiB, the size of the TLS scenario's uploads, over IPv4 with
+`--thin-acks 3`, before and after #126 taught CUBIC to count every byte
+an ACK acknowledges. Two runs of each, interleaved, 3 repeats a case;
+each cell is the two runs' medians in Mbit/s, and SmolNet's ratio to the
+kernel's in the same run.
+
+| profile | streams | SmolNet before | SmolNet after | kernel |
+| --- | --- | --- | --- | --- |
+| `delay` | 1 | 2.62, 2.68 (0.76×, 0.61×) | 3.95, 4.1 (0.95×, 1.02×) | 3.47 to 4.36 |
+| `delay` | 4 | 1.5, 1.53 (0.3×, 0.31×) | 4.42, 5.6 (0.76×, 0.98×) | 4.98 to 5.83 |
+| `high-bdp` | 1 | 3.08, 3.08 (0.56×, 0.56×) | 4.87, 4.88 (0.88×, 0.88×) | 5.49 to 5.52 |
+| `high-bdp` | 4 | 4.85, 4.85 (0.66×, 0.65×) | 7.36, 7.38 (0.99×, 1.0×) | 7.4 |
+
+The default matrix, without `--thin-acks`, run before and after, over
+IPv4 and then IPv6, shows no profile slower for the change. Under
+`reorder` and `loss-burst`, whose medians swing from run to run, more
+repeats were taken: 26 to 41 transfers a case, both families. SmolNet's
+sends under `reorder` took a median of 1,460 and 522 ms before (one
+stream, four) and 1,443 and 517 ms after, from the first connect's
+answer. Under `loss-burst` they took 4,617 and 182 ms before and 990 and
+167 ms after. The one-stream figure varies widely, and the kernel's own
+medians ranged from 7 to 44 Mbit/s over the same runs.
+
 ## Idle connections under netem
 
 `idle.exs` ran under `--netem delay`, `loss-burst` and `reorder`, in the
@@ -284,6 +329,10 @@ integration/netem-topology.sh isolate mix run integration/netem_matrix.exs --no-
 integration/netem-topology.sh isolate mix run integration/netem_matrix.exs --family inet \
   --profiles loss-burst --flows receive,kernel --streams 4 --repeats 300 \
   --transfer-timeout 120000 --duration 15m
+
+# stretch ACKs, sending 1 MiB as the TLS scenario's uploads do
+integration/netem-topology.sh isolate mix run integration/netem_matrix.exs --no-pcap \
+  --thin-acks 3 --family inet --profiles delay,high-bdp --flows send,kernel --bytes 1048576
 
 # idle connections
 integration/pmtu-topology.sh isolate mix run integration/idle.exs --netem delay \

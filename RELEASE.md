@@ -98,7 +98,12 @@
   SmolNet stall longer than a set number of retransmission timeouts.
   Throughput and completion time are recorded next to the kernel's, and
   `integration/netem.md` holds the latest results, with each gap linked
-  to the issue that tracks it.
+  to the issue that tracks it. `--thin-acks N` has the kernel peer send
+  only one in N of its pure ACKs, as a server whose network card
+  coalesces what it receives acknowledges several segments at once, and
+  makes it the peer of every flow. The soak scripts' `--keep-pcap` keeps
+  a passing run's packet capture, and `--pcap-snaplen` trims each packet
+  in it.
 
 ### Changed
 
@@ -146,6 +151,16 @@
   acknowledged, and the first two duplicate ACKs each let a new segment
   out (RFC 3042), so a small window still draws enough of them to
   start recovery.
+- A TCP sender now grows its congestion window by the bytes each ACK
+  acknowledges, as Linux does, instead of by at most one segment per ACK.
+  Servers on the internet acknowledge several segments at once, because
+  their network cards coalesce what arrives, and against them SmolNet's
+  window grew by about a quarter each round trip at the start of a
+  connection instead of doubling: uploads to `speed.cloudflare.com` ran at
+  about half the kernel's speed. Later in a connection, a peer that
+  acknowledges every second segment likewise halved its growth. After a
+  retransmission timeout, each ACK still counts for one segment at most
+  until the window regains its threshold.
 
 ### Fixed
 

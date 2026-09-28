@@ -72,7 +72,8 @@ defmodule SmolNet.Integration.Soak do
   Artifacts go to the output directory: `verdict.json`, `metrics.csv` and
   `run.log` always, and on failure `failures/*.txt` (one per failure, with
   its diagnostics), `stack_info.txt` (taken at the first failure) and the
-  `pcap/` window. A passing run deletes its capture.
+  `pcap/` window. A passing run deletes its capture, unless given
+  `--keep-pcap`.
   """
 
   alias SmolNet.Integration.Network
@@ -450,7 +451,7 @@ defmodule SmolNet.Integration.Soak do
   defp capture(context, options) do
     directory = Path.join(options.out_dir, "pcap")
 
-    case Pcap.start(options.device, directory) do
+    case Pcap.start(options.device, directory, snaplen: options.pcap_snaplen) do
       {:ok, pcap} ->
         {:ok, context, fn -> Pcap.stop(pcap) end}
 
@@ -461,6 +462,12 @@ defmodule SmolNet.Integration.Soak do
         {:ok, context, nil}
     end
   end
+
+  # A passing run's capture shows nothing wrong, so it goes unless asked for.
+  defp discard_capture(:pass, %{keep_pcap: false} = options),
+    do: File.rm_rf(Path.join(options.out_dir, "pcap"))
+
+  defp discard_capture(_outcome, _options), do: :ok
 
   defp impair(%{netem: nil} = context, _options, _config), do: {:ok, context, nil}
 
@@ -576,7 +583,7 @@ defmodule SmolNet.Integration.Soak do
         true -> :pass
       end
 
-    if outcome == :pass, do: File.rm_rf(Path.join(options.out_dir, "pcap"))
+    discard_capture(outcome, options)
 
     verdict = %{
       script: options.script,
