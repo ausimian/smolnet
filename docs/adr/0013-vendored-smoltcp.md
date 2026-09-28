@@ -85,7 +85,8 @@ round trip instead of costing a 1 s timeout per burst. Losses that leave no
 later segment to produce duplicate ACKs, such as the tail of a transfer, still
 wait for the minimum RTO, 1 s when this was written and 200 ms since #103. Many holes in one window over a long RTT still
 recover more slowly than SACK-based recovery would, since smoltcp's sender
-does not use SACK. (#119 later added SACK-based recovery; see "Later
+does not use SACK. (#119 later added SACK-based recovery, and #138 tail
+loss probes and RACK's detection of lost retransmissions; see "Later
 patches".)
 
 SmolNet now owns a fork of smoltcp's TCP sender. Upgrading smoltcp means
@@ -269,6 +270,84 @@ Hex packages are unaffected: they ship only precompiled NIFs and omit
   that resets them, unacknowledged data left to the user timeout with
   keep-alive on, and keep-alive turned off. `test_established_timeout`
   now expects no timeout while the connection is idle.
+- #138: with SACK recovery (#119), a single stream under burst loss still
+  spent most of its time waiting on the retransmission timer. A loss at
+  the tail of a flight left too few segments after it to draw three
+  duplicate ACKs; a lost retransmission was resent only by the timer; and
+  recovery took no round trip samples (Karn's algorithm), so a backed-off
+  RTO stayed high. The patch adds RACK-TLP (RFC 8985), in
+  `src/socket/tcp/rack.rs`, beside RFC 6675's `IsLost` rather than in
+  place of it:
+  - `SendLog` records when each octet from `SND.UNA` up was last sent.
+    `dispatch` segments the send buffer afresh on every transmission and
+    keeps no per-segment record, so the log keeps ranges instead: octets
+    first sent in the same millisecond share one, up to 64, and past that
+    the two neighbours sent closest in time merge as if sent at the later
+    time, which can only delay a verdict on them. Each range says whether
+    its last transmission was a retransmission, whether it is deemed lost,
+    and whether it resent octets not deemed lost, which `pipe` counts
+    twice. It also numbers the sends that made it, one or a run of
+    consecutive sends of new data: SmolNet's clock counts milliseconds,
+    and a resend and new data sent in the same one must still be told
+    apart, or RACK would take the resend as lost when the new data sent
+    before it arrived. `pipe` and `NextSeg` rule (1) now read the log: rule (1) resends
+    the lowest octets not SACKed whose last transmission is deemed lost,
+    by `IsLost` or by RACK, which may be a lost retransmission below
+    `HighRxt`. `IsLost` marks only first transmissions lost. Rule (3) is
+    unchanged.
+  - RACK: each ACK finds, among the octets it newly reports delivered,
+    cumulatively or by SACK, the latest sent, and takes its round trip as
+    `RACK.rtt`. A retransmission acknowledged sooner than the minimum
+    round trip is passed over, since its first transmission may be what
+    arrived. A range sent before the latest delivered, and not SACKed, is
+    lost once `RACK.rtt` plus the reordering window has passed since it
+    was sent. Sent before means in an earlier send, or earlier in the
+    same run. The window is a quarter of the minimum round trip, at
+    most SRTT, and zero during recovery or once three segments' worth are
+    SACKed, until a segment sent once is delivered below one delivered
+    earlier (reordering). A round trip with a D-SACK raises its multiplier
+    for the next 16 recoveries. A reordering timer rechecks when the next
+    range would be lost. Data RACK deems lost starts fast recovery as the
+    third duplicate ACK does, with the controller's usual reduction.
+  - Tail loss probes (RFC 8985 7): to a peer that SACKs, with no
+    recovery under way, nothing SACKed and nothing resent in the log,
+    sending new data or an ACK of new data arms a probe timer: twice SRTT
+    plus 2 ms, Linux's floor, plus 200 ms when only one segment is in
+    flight, for the peer's delayed ACK, and only if it would expire before
+    the RTO. The probe is one new segment if the peer's window allows one,
+    and otherwise a resend of the last segment sent, whatever the
+    congestion window; it restarts the RTO. Its SACK is what lets RACK
+    find the losses before it. A probe that resent data and whose episode
+    ends with no D-SACK repaired a loss, so the controller's `on_loss`
+    then reduces the window (RFC 8985 7.4); recovery started meanwhile
+    ends the episode instead.
+  - Round trip samples: an ACK that newly reports delivered octets sent
+    only once gives a sample from the earliest sent of them, as Linux
+    takes one: from those acknowledged cumulatively, unless the ACK also
+    acknowledges a retransmission so, when they may have arrived long
+    before; otherwise from those newly SACKed. The estimator takes it
+    during recovery, which holds back the cumulative ACK the timer's own
+    sample waits for, and whenever that sample is not running, as after a
+    retransmission. A backed-off RTO then resets once recovery shows the
+    path works, instead of when new data sent after it is acknowledged.
+  - RFC 3042 limited transmit: each of the first two duplicate ACKs
+    before recovery lets one more new segment past the congestion window.
+  - A timeout and a path MTU reduction (#128) both resend from `SND.UNA`:
+    the log then deems everything in flight lost, as RFC 8985 6.3 has for
+    a timeout, RACK's timer and the probe timer stop, and any probe
+    episode ends, so neither fires on the resend. The retransmission
+    timer a reduction leaves running (#142) is unchanged. Neither a probe
+    nor a RACK resend is anything heard from the peer, so the user
+    timeout (#132) still aborts only a connection whose peer is silent.
+  - Nine socket tests cover a tail loss recovered through a probe, a probe
+    of new data, a lost retransmission resent before the timeout, the
+    backoff reset by a sample during recovery, reordering within RACK's
+    window left alone, the reordering timer, limited transmit, a resent
+    probe's congestion response with and without a D-SACK, and a path MTU
+    reduction stopping the timers. Seven fail with RACK, the probes, the
+    new samples and limited transmit switched off; the other two guard
+    against spurious resends and pick the probe's segment. Eleven unit tests
+    cover the log and RACK's state, and one the scoreboard's new query.
 
 ## Later configuration
 

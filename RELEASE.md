@@ -116,6 +116,18 @@
   below a range the peer reported earlier now also counts as a duplicate
   ACK; before, it did not when it also changed the window, which could
   delay a fast retransmission.
+- A TCP sender now repairs the loss of the last segments it sent, and of a
+  retransmission, without waiting for its retransmission timer, as Linux
+  does (RFC 8985's RACK-TLP). When the tail of what it sent goes
+  unacknowledged for about two round trips, it sends a loss probe, whose
+  acknowledgement shows what is missing. It deems a segment lost once one
+  sent after it has arrived and a short reordering window has passed,
+  which also catches a resend that is itself lost. Before, both waited
+  for the timer, which backs off to as much as a minute. A backed-off
+  timeout now also resets as soon as data sent during recovery is
+  acknowledged, and the first two duplicate ACKs each let a new segment
+  out (RFC 3042), so a small window still draws enough of them to
+  start recovery.
 
 ### Fixed
 

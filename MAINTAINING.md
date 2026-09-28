@@ -92,8 +92,11 @@ variant of Nagle's algorithm, which sends the partial tail of a write longer
 than an MSS without waiting for an ACK (#102), RFC 6675's duplicate ACK,
 which counts an ACK that SACKs new data whatever its window (#103), a
 200 ms minimum RTO in place of RFC 6298's 1 s (#103), CUBIC's RFC 6928
-initial window of up to ten segments (#123), and RFC 6675's SACK-based loss
-recovery, which resends several lost segments per round trip (#119). A
+initial window of up to ten segments (#123), RFC 6675's SACK-based loss
+recovery, which resends several lost segments per round trip (#119), and
+RFC 8985's RACK-TLP, which probes a lost tail and detects a lost
+retransmission without waiting for the timer, with round trip samples
+during recovery and RFC 3042's limited transmit (#138). A
 further patch, to the interface as well as the sender, adds path MTU
 discovery: ICMP "Fragmentation Needed" and "Packet Too Big" lower a
 connection's segment size, and it resends at once (#128). Two more patch

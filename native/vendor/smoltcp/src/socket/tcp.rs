@@ -19,9 +19,11 @@ use crate::wire::{
 };
 
 mod congestion;
+mod rack;
 mod scoreboard;
 
-use scoreboard::Scoreboard;
+use rack::{Probe, Rack};
+use scoreboard::{DUP_THRESH, Scoreboard};
 
 macro_rules! tcp_trace {
     ($($arg:expr),*) => (net_log!(trace, $($arg),*));
@@ -203,6 +205,17 @@ impl RttEstimator {
         Duration::from_millis(self.rto as _)
     }
 
+    /// The smoothed round trip, once one has been measured.
+    fn srtt(&self) -> Option<Duration> {
+        self.have_measurement
+            .then(|| Duration::from_millis(self.srtt as _))
+    }
+
+    /// Whether a round trip is being timed.
+    fn sampling(&self) -> bool {
+        self.timestamp.is_some()
+    }
+
     #[cfg(feature = "socket-tcp-cubic")]
     fn smoothed_rtt(&self) -> u32 {
         if self.have_measurement { self.srtt } else { 0 }
@@ -308,6 +321,14 @@ enum Timer {
 
 const ACK_DELAY_DEFAULT: Duration = Duration::from_millis(10);
 const CLOSE_DELAY: Duration = Duration::from_millis(10_000);
+
+/// The least a loss probe waits beyond twice the smoothed round trip, as
+/// Linux's `TCP_TIMEOUT_MIN`.
+const TLP_MIN_TIMEOUT: Duration = Duration::from_millis(2);
+
+/// RFC 8985 `WCDelAckT`: the longest a receiver delays an ACK, which a loss
+/// probe allows for when only one segment is in flight to be ACKed.
+const TLP_DELAYED_ACK: Duration = Duration::from_millis(200);
 
 impl Timer {
     fn new() -> Timer {
@@ -573,6 +594,9 @@ pub struct Socket<'a> {
     /// RFC 6675 `HighRxt`, as the end of the highest range retransmitted
     /// during fast recovery, or `None` outside it.
     recovery_rxt_end: Option<TcpSeqNumber>,
+    /// RFC 8985: when each octet in flight was last sent, RACK's loss
+    /// detection, and tail loss probes.
+    rack: Rack,
 
     /// Duration for Delayed ACK. If None no ACKs will be delayed.
     ack_delay: Option<Duration>,
@@ -703,6 +727,7 @@ impl<'a> Socket<'a> {
             recover: None,
             scoreboard: Scoreboard::new(),
             recovery_rxt_end: None,
+            rack: Rack::new(),
             ack_delay: Some(ACK_DELAY_DEFAULT),
             ack_delay_timer: AckDelayTimer::Idle,
             challenge_ack_timer: Instant::from_secs(0),
@@ -1066,6 +1091,7 @@ impl<'a> Socket<'a> {
         self.recover = None;
         self.scoreboard.clear();
         self.recovery_rxt_end = None;
+        self.rack = Rack::new();
         self.nagle_small_segment_end = None;
         self.ack_delay_timer = AckDelayTimer::Idle;
         self.challenge_ack_timer = Instant::from_secs(0);
@@ -1632,6 +1658,7 @@ impl<'a> Socket<'a> {
         self.recover = None;
         self.recovery_rxt_end = None;
         self.scoreboard.clear();
+        self.rack.on_rewind();
         // The small segment in flight, if any, was dropped or is resent now:
         // Nagle's algorithm must not hold back the tail of the resend for it.
         self.nagle_small_segment_end = None;
@@ -1641,27 +1668,122 @@ impl<'a> Socket<'a> {
         PathMtuOutcome::Reduced
     }
 
-    /// Records the SACK blocks of an incoming ACK in the scoreboard, and
-    /// returns whether any of them reports data above `ack_number` that no
-    /// earlier ACK reported. A block must end within what has been sent;
-    /// D-SACK blocks, at or below the ACK, never count.
-    fn sacks_new_data(&mut self, repr: &TcpRepr, ack_number: TcpSeqNumber) -> bool {
-        self.scoreboard.advance(ack_number);
-
+    /// The SACK blocks of an incoming ACK that report data above
+    /// `ack_number`, trimmed to start above it, and how many there are. A
+    /// block must end within what has been sent; D-SACK blocks, at or below
+    /// the ACK, are left out.
+    fn sack_blocks(
+        &self,
+        repr: &TcpRepr,
+        ack_number: TcpSeqNumber,
+    ) -> ([(TcpSeqNumber, TcpSeqNumber); 3], usize) {
+        let mut blocks = [(ack_number, ack_number); 3];
+        let mut len = 0;
         if !self.remote_has_sack {
-            return false;
+            return (blocks, len);
         }
-
-        let mut new_data = false;
         for &(left, right) in repr.sack_ranges.iter().flatten() {
             let right = TcpSeqNumber(right as i32);
             if right <= ack_number || right > self.remote_last_seq {
                 continue;
             }
-            let left = TcpSeqNumber(left as i32).max(ack_number);
+            blocks[len] = (TcpSeqNumber(left as i32).max(ack_number), right);
+            len += 1;
+        }
+        (blocks, len)
+    }
+
+    /// Records SACK blocks, as `sack_blocks` returns them, in the
+    /// scoreboard, and returns whether any of them reports data that no
+    /// earlier ACK reported.
+    fn sacks_new_data(
+        &mut self,
+        blocks: &[(TcpSeqNumber, TcpSeqNumber)],
+        ack_number: TcpSeqNumber,
+    ) -> bool {
+        self.scoreboard.advance(ack_number);
+        let mut new_data = false;
+        for &(left, right) in blocks {
             new_data |= self.scoreboard.add(left, right);
         }
         new_data
+    }
+
+    /// Whether an incoming ACK carries a D-SACK (RFC 2883): a first SACK
+    /// block at or below the cumulative ACK, or within the second block.
+    fn has_dsack(&self, repr: &TcpRepr, ack_number: TcpSeqNumber) -> bool {
+        let seq = |n: u32| TcpSeqNumber(n as i32);
+        match repr.sack_ranges {
+            [Some((left, right)), second, _] if self.remote_has_sack => {
+                seq(right) <= ack_number
+                    || second.is_some_and(|(l, r)| seq(l) <= seq(left) && seq(right) <= seq(r))
+            }
+            _ => false,
+        }
+    }
+
+    /// Takes in what an incoming ACK reports delivered: RACK's state and the
+    /// round trip sample it allows, the scoreboard, and the losses they
+    /// imply. Returns whether the ACK SACKs data that no earlier ACK
+    /// reported, and whether RACK newly deems data lost.
+    fn on_ack_delivery(
+        &mut self,
+        now: Instant,
+        repr: &TcpRepr,
+        ack_number: TcpSeqNumber,
+    ) -> (bool, bool) {
+        let (blocks, len) = self.sack_blocks(repr, ack_number);
+        let blocks = &blocks[..len];
+        let acked = (self.local_seq_no, ack_number);
+        let sample = self.rack.on_ack(now, &self.scoreboard, acked, blocks);
+        // Karn's algorithm allows a sample from a first transmission. The
+        // timer's own sample waits for a cumulative ACK, which recovery holds
+        // back, and a retransmission cancels it, which would leave a
+        // backed-off RTO in place until new data is acknowledged.
+        if let Some(rtt) = sample
+            && (self.recover.is_some() || !self.rtte.sampling())
+        {
+            self.rtte.sample(rtt.total_millis() as u32);
+        }
+        let sacks_new_data = self.sacks_new_data(blocks, ack_number);
+        self.rack.log.advance(ack_number);
+        if self.has_dsack(repr, ack_number) {
+            self.rack.on_dsack(ack_number, self.remote_last_seq);
+            if let Some(probe) = &mut self.rack.probe {
+                probe.dsacked = true;
+            }
+        }
+        (sacks_new_data, self.detect_losses(now))
+    }
+
+    /// Marks lost in the log what RFC 6675's `IsLost` and RACK deem lost,
+    /// and returns whether RACK newly deems data lost that is not SACKed.
+    fn detect_losses(&mut self, now: Instant) -> bool {
+        if !self.remote_has_sack {
+            return false;
+        }
+        if let Some(boundary) = self.scoreboard.lost_below(self.remote_mss) {
+            self.rack.log.mark_lost_below(boundary);
+        }
+        let sacked = self
+            .scoreboard
+            .sacked_between(self.local_seq_no, self.remote_last_seq);
+        let recovering_or_sacked = self.recover.is_some()
+            || self.rack.log.recovering()
+            || sacked >= DUP_THRESH * self.remote_mss;
+        let srtt = self.rtte.srtt();
+        self.rack
+            .detect(&self.scoreboard, now, recovering_or_sacked, srtt)
+    }
+
+    /// Enters fast recovery, with a fast retransmission of the first
+    /// unacknowledged segment. Any loss probe episode ends: recovery answers
+    /// for the loss it probed for.
+    fn start_recovery(&mut self) {
+        self.recover = Some(self.remote_last_seq);
+        self.timer.set_for_fast_retransmit();
+        self.rack.cancel_probe();
+        self.rack.probe = None;
     }
 
     /// Whether the socket is in RFC 6675 loss recovery: fast recovery with a
@@ -1671,20 +1793,13 @@ impl<'a> Socket<'a> {
     }
 
     /// RFC 6675 `SetPipe`: the octets thought to be in the network. Each
-    /// unacknowledged octet counts once unless it is SACKed or lost, and once
-    /// more if it has been retransmitted.
+    /// unacknowledged octet counts once unless it is SACKed, or its last
+    /// transmission is deemed lost, by `IsLost` or by RACK; one resent while
+    /// its earlier transmission was not deemed lost counts twice.
     fn pipe(&self) -> usize {
-        let (una, high) = (self.local_seq_no, self.remote_last_seq);
-        let unsacked_below = |end: TcpSeqNumber| {
-            let end = end.max(una).min(high);
-            (end - una) - self.scoreboard.sacked_between(una, end)
-        };
-        let lost = self
-            .scoreboard
-            .lost_below(self.remote_mss)
-            .map_or(0, unsacked_below);
-        let retransmitted = self.recovery_rxt_end.map_or(0, unsacked_below);
-        unsacked_below(high) - lost + retransmitted
+        self.rack
+            .log
+            .pipe(&self.scoreboard, self.local_seq_no, self.remote_last_seq)
     }
 
     fn cwnd_remaining(&self) -> usize {
@@ -1693,33 +1808,114 @@ impl<'a> Socket<'a> {
         } else {
             self.flight_size()
         };
+        // RFC 3042 limited transmit: each of the first two duplicate ACKs
+        // before recovery lets one more new segment out, so that a small
+        // window still draws the duplicates that start recovery.
+        let limited_transmit = if self.recover.is_none() {
+            usize::from(self.local_rx_dup_acks.min(2)) * self.remote_mss
+        } else {
+            0
+        };
         self.congestion_controller
             .inner()
             .window()
+            .saturating_add(limited_transmit)
             .saturating_sub(in_flight)
     }
 
     /// RFC 6675 `NextSeg` rules (1) and (3): during SACK recovery, the next
     /// hole to retransmit, as a sequence number and length of at most `mss`,
-    /// if the congestion window has room. A hole not yet deemed lost is
-    /// returned only when `no_new_data`, that is when rule (2) cannot send.
+    /// if the congestion window has room. Rule (1) takes the lowest octets
+    /// not SACKed whose last transmission is deemed lost, by `IsLost` or by
+    /// RACK, which may be a lost retransmission. A hole not yet deemed lost
+    /// is returned only when `no_new_data`, that is when rule (2) cannot
+    /// send.
     fn sack_retransmission(&self, mss: usize, no_new_data: bool) -> Option<(TcpSeqNumber, usize)> {
         if !self.in_sack_recovery() || self.cwnd_remaining() == 0 {
+            return None;
+        }
+        let data_end = self.local_seq_no + self.tx_buffer.len();
+        let segment = |(start, end): (TcpSeqNumber, TcpSeqNumber)| {
+            let end = end.min(data_end);
+            (start < end).then(|| (start, (end - start).min(mss)))
+        };
+        if let Some(hole) = self
+            .rack
+            .log
+            .first_lost(&self.scoreboard, self.remote_last_seq)
+        {
+            return segment(hole);
+        }
+        if !no_new_data {
             return None;
         }
         let from = self
             .recovery_rxt_end
             .map_or(self.local_seq_no, |end| end.max(self.local_seq_no));
-        let (start, end) = self.scoreboard.next_hole(from)?;
-        let lost = self
-            .scoreboard
-            .lost_below(self.remote_mss)
-            .is_some_and(|lost| start < lost);
-        if !lost && !no_new_data {
-            return None;
+        segment(self.scoreboard.next_hole(from)?)
+    }
+
+    /// Whether RFC 8985 7.2 allows a loss probe: the remote SACKs, data is in
+    /// flight, and no loss recovery or probe episode is under way, nor is
+    /// anything SACKed, which recovery or RACK's reordering timer sees to.
+    fn loss_probe_allowed(&self) -> bool {
+        self.remote_has_sack
+            && matches!(
+                self.state,
+                State::Established
+                    | State::CloseWait
+                    | State::FinWait1
+                    | State::Closing
+                    | State::LastAck
+            )
+            && self.remote_last_seq > self.local_seq_no
+            && self.recover.is_none()
+            && self.scoreboard.is_empty()
+            && self.rack.probe.is_none()
+            && !self.rack.log.recovering()
+            && self.remote_win_len > 0
+    }
+
+    /// Starts or restarts the loss probe timer (RFC 8985 7.2). The probe
+    /// timeout is twice SRTT, plus a worst-case delayed ACK when only one
+    /// segment is in flight, and the timer is armed only if it would expire
+    /// before the retransmission timer.
+    fn arm_loss_probe(&mut self, now: Instant) {
+        self.rack.cancel_probe();
+        let Some(srtt) = self.rtte.srtt() else {
+            return;
+        };
+        if !self.loss_probe_allowed() {
+            return;
         }
-        let end = end.min(self.local_seq_no + self.tx_buffer.len());
-        (start < end).then(|| (start, (end - start).min(mss)))
+        let mut pto = srtt * 2 + TLP_MIN_TIMEOUT;
+        if self.flight_size() <= self.remote_mss {
+            pto += TLP_DELAYED_ACK;
+        }
+        if let Timer::Retransmit { expires_at } = self.timer
+            && now + pto < expires_at
+        {
+            self.rack.probe_at = Some(now + pto);
+        }
+    }
+
+    /// Runs RACK's reordering timer and the loss probe timer, if either has
+    /// expired (RFC 8985 6.3, 7.3).
+    fn poll_rack_timers(&mut self, now: Instant) {
+        if self.rack.reo_timeout.is_some_and(|at| now >= at) {
+            self.rack.reo_timeout = None;
+            if self.detect_losses(now)
+                && self.recover.is_none()
+                && !self.timer.is_zero_window_probe()
+            {
+                net_debug!("RACK reordering timer deems data lost, starting fast retransmit");
+                self.start_recovery();
+            }
+        }
+        if self.rack.probe_at.is_some_and(|at| now >= at) {
+            self.rack.probe_at = None;
+            self.rack.probe_pending = self.loss_probe_allowed();
+        }
     }
 
     /// Whether all the data the remote window allows has been sent, so that
@@ -2413,6 +2609,7 @@ impl<'a> Socket<'a> {
             self.tx_waker.wake();
         }
 
+        let mut rack_lost = false;
         if let Some(ack_number) = repr.ack_number {
             // TODO: When flow control is implemented,
             // refractor the following block within that implementation
@@ -2423,7 +2620,27 @@ impl<'a> Socket<'a> {
             // nearly every ACK while its receive buffer autotunes, so without
             // this none of its duplicate ACKs would count, and every loss would
             // wait for the retransmission timer.
-            let sacks_new_data = self.sacks_new_data(repr, ack_number);
+            let sacks_new_data;
+            (sacks_new_data, rack_lost) = self.on_ack_delivery(cx.now(), repr, ack_number);
+
+            // RFC 8985 7.4: a loss probe's episode ends once what was in
+            // flight when it was sent is acknowledged. A probe that resent
+            // data, with no D-SACK to show the resend needless, repaired a
+            // loss, and the congestion window answers for it as for any
+            // other: the controller enters recovery here, and the ACK below
+            // ends it.
+            if let Some(probe) = self.rack.probe
+                && ack_number >= probe.end
+            {
+                self.rack.probe = None;
+                if probe.retransmitted && !probe.dsacked {
+                    net_debug!("loss probe repaired a loss");
+                    let in_flight = self.flight_size();
+                    self.congestion_controller
+                        .inner_mut()
+                        .on_loss(cx.now(), in_flight);
+                }
+            }
 
             match self.local_rx_last_ack {
                 // Duplicate ACK if payload empty and ACK doesn't move send window ->
@@ -2458,8 +2675,7 @@ impl<'a> Socket<'a> {
                         .lost_below(self.remote_mss)
                         .is_some_and(|lost| ack_number < lost);
                     if (self.local_rx_dup_acks == 3 || head_lost) && self.recover.is_none() {
-                        self.recover = Some(self.remote_last_seq);
-                        self.timer.set_for_fast_retransmit();
+                        self.start_recovery();
                         net_debug!("started fast retransmit");
                     }
 
@@ -2506,6 +2722,7 @@ impl<'a> Socket<'a> {
                             net_debug!("fast recovery complete");
                             self.recover = None;
                             self.recovery_rxt_end = None;
+                            self.rack.on_recovery_end();
                             // A partial ACK earlier in the same poll may have queued a
                             // retransmission that this ACK has made unnecessary.
                             self.pending_fast_retransmit = false;
@@ -2580,6 +2797,21 @@ impl<'a> Socket<'a> {
         if self.remote_win_len != 0 && self.timer.is_zero_window_probe() {
             tcp_trace!("stopping zero-window-probe timer");
             self.timer.set_for_idle(cx.now(), self.keep_alive);
+        }
+
+        // RFC 8985 6.2: data RACK deems lost starts recovery, as the third
+        // duplicate ACK does. It may be a partial ACK, so this comes after the
+        // retransmission timer has been restarted for it.
+        if rack_lost && self.recover.is_none() && !self.timer.is_zero_window_probe() {
+            net_debug!("RACK deems data lost, starting fast retransmit");
+            self.start_recovery();
+        }
+
+        // RFC 8985 7.2: an ACK of new data restarts the loss probe timer.
+        if ack_len > 0 {
+            self.arm_loss_probe(cx.now());
+        } else if !self.loss_probe_allowed() {
+            self.rack.cancel_probe();
         }
 
         let payload_len = payload.len();
@@ -2707,6 +2939,11 @@ impl<'a> Socket<'a> {
     fn seq_to_transmit(&self, cx: &mut Context) -> bool {
         // Fast retransmits should always send, even if later congestion checks would disallow
         if self.pending_fast_retransmit && !self.tx_buffer.is_empty() {
+            return true;
+        }
+
+        // So should a loss probe.
+        if self.rack.probe_pending && self.loss_probe_allowed() {
             return true;
         }
 
@@ -2890,6 +3127,12 @@ impl<'a> Socket<'a> {
             .inner_mut()
             .pre_transmit(cx.now());
 
+        // RACK's reordering timer and the loss probe timer, unless the
+        // retransmission timer has expired, which supersedes both.
+        if !self.timer.should_retransmit(cx.now()) {
+            self.poll_rack_timers(cx.now());
+        }
+
         // Check if any state needs to be changed because of a timer.
         if self.timed_out(cx.now()) || self.keep_alive_exhausted(cx.now()) {
             // If a timeout expires, or no keep-alive probe was answered, we should abort the
@@ -2918,6 +3161,7 @@ impl<'a> Socket<'a> {
                 self.recover = None;
                 self.recovery_rxt_end = None;
                 self.scoreboard.clear();
+                self.rack.on_rewind();
 
                 // Inform RTTE, so that it can can handle RTO backoff
                 self.rtte.on_rto();
@@ -3009,6 +3253,8 @@ impl<'a> Socket<'a> {
         let mut is_zero_window_probe = false;
         let mut is_fast_retransmit = false;
         let mut is_sack_retransmission = false;
+        let mut is_loss_probe = false;
+        let mut is_probe_retransmission = false;
         let mut is_small_segment = false;
 
         #[cfg_attr(
@@ -3088,6 +3334,29 @@ impl<'a> Socket<'a> {
                     is_fast_retransmit = true;
 
                     0
+                } else if self.rack.probe_pending {
+                    // RFC 8985 7.3: a loss probe is one new segment, if the
+                    // remote window allows one, and otherwise a resend of the
+                    // last segment sent. The congestion window does not hold
+                    // it back.
+                    let sent = self.flight_size().min(self.tx_buffer.len());
+                    let unsent = self
+                        .tx_buffer
+                        .len()
+                        .min(self.remote_win_len)
+                        .saturating_sub(self.flight_size());
+                    let (offset, size) = if unsent > 0 {
+                        (sent, unsent.min(effective_mss))
+                    } else {
+                        is_probe_retransmission = true;
+                        let size = effective_mss.min(sent);
+                        (sent - size, size)
+                    };
+                    repr.seq_number = self.local_seq_no + offset;
+                    repr.payload = self.tx_buffer.get_allocated(offset, size);
+                    is_loss_probe = true;
+
+                    offset
                 } else if let Some((seq, size)) = sack_retransmission {
                     let offset = seq - self.local_seq_no;
                     repr.seq_number = seq;
@@ -3255,7 +3524,7 @@ impl<'a> Socket<'a> {
             let end = repr.seq_number + repr.payload.len();
             self.recovery_rxt_end = Some(self.recovery_rxt_end.map_or(end, |last| last.max(end)));
         }
-        if is_sack_retransmission {
+        if is_sack_retransmission || is_probe_retransmission {
             self.rtte.on_retransmit();
         }
 
@@ -3297,6 +3566,12 @@ impl<'a> Socket<'a> {
         self.remote_last_seq = self
             .remote_last_seq
             .max(repr.seq_number + repr.segment_len());
+        if repr.segment_len() > 0 && repr.control != TcpControl::Syn {
+            let end = repr.seq_number + repr.segment_len();
+            self.rack
+                .log
+                .record(self.local_seq_no, repr.seq_number, end, cx.now());
+        }
 
         if is_small_segment {
             let end = repr.seq_number + repr.segment_len();
@@ -3322,6 +3597,23 @@ impl<'a> Socket<'a> {
             // so that it will expire after RTO seconds.
             let rto = self.rtte.retransmission_timeout();
             self.timer.set_for_retransmit(cx.now(), rto);
+        }
+
+        if is_loss_probe {
+            // RFC 8985 7.3: the probe's episode lasts until what is in flight
+            // now is acknowledged, and the retransmission timer restarts to
+            // guard it.
+            self.rack.probe_pending = false;
+            self.rack.probe = Some(Probe {
+                end: self.remote_last_seq,
+                retransmitted: is_probe_retransmission,
+                dsacked: false,
+            });
+            let rto = self.rtte.retransmission_timeout();
+            self.timer.set_for_retransmit(cx.now(), rto);
+        } else if repr.segment_len() > 0 && !is_fast_retransmit && !is_sack_retransmission {
+            // RFC 8985 7.2: sending new data restarts the loss probe timer.
+            self.arm_loss_probe(cx.now());
         }
 
         if self.state == State::Closed {
@@ -3375,11 +3667,22 @@ impl<'a> Socket<'a> {
                 (_, _) => PollAt::Ingress,
             };
 
-            // We wait for the earliest of our timers to fire.
-            *[self.timer.poll_at(), timeout_poll_at, delayed_ack_poll_at]
-                .iter()
+            let rack_poll_at = [self.rack.reo_timeout, self.rack.probe_at]
+                .into_iter()
+                .flatten()
                 .min()
-                .unwrap_or(&PollAt::Ingress)
+                .map_or(PollAt::Ingress, PollAt::Time);
+
+            // We wait for the earliest of our timers to fire.
+            *[
+                self.timer.poll_at(),
+                timeout_poll_at,
+                delayed_ack_poll_at,
+                rack_poll_at,
+            ]
+            .iter()
+            .min()
+            .unwrap_or(&PollAt::Ingress)
         }
     }
 }
@@ -8074,6 +8377,240 @@ mod test {
         assert_eq!(s.recovery_rxt_end, None);
         assert_eq!(s.recover, None);
         recv!(s, time 3050, Ok(data_repr(3, b"BBB")));
+    }
+
+    // Sends "xxx" and has the SACK-capable peer ACK it 50 ms later, which
+    // makes SRTT and RACK's minimum round trip 50 ms, and the RTO 200 ms.
+    fn socket_sack_rtt_50() -> TestSocket {
+        let mut s = socket_established();
+        s.remote_has_sack = true;
+        s.remote_mss = 3;
+        send!(s, time 0, ack_repr(0));
+        s.send_slice(b"xxx").unwrap();
+        recv!(s, time 0, Ok(data_repr(0, b"xxx")));
+        send!(s, time 50, ack_repr(3));
+        assert_eq!(s.rtte.retransmission_timeout(), Duration::from_millis(200));
+        s
+    }
+
+    #[test]
+    fn test_tlp_recovers_a_tail_loss_without_a_timeout() {
+        let mut s = socket_sack_rtt_50();
+
+        // Four segments go out at 100, and only the first arrives.
+        s.send_slice(b"aaaBBBcccDDD").unwrap();
+        for (i, payload) in [b"aaa", b"BBB", b"ccc", b"DDD"].iter().enumerate() {
+            recv!(s, time 100, Ok(data_repr(3 + 3 * i, &payload[..])));
+        }
+        send!(s, time 150, ack_repr(6));
+
+        // Too few segments are left to draw three duplicate ACKs, so before
+        // RFC 8985 only the timeout, at 350, would resend them. Twice SRTT,
+        // plus 2 ms, after the ACK, a probe resends the last segment.
+        recv_nothing!(s, time 251);
+        recv!(s, time 252, Ok(data_repr(12, b"DDD")));
+        recv_nothing!(s, time 252);
+
+        // Its SACK shows that the two segments sent before it were lost.
+        send!(s, time 302, sack_repr(6, 256, &[(12, 15)]));
+        recv!(s, time 302, Ok(data_repr(6, b"BBB")));
+        recv!(s, time 302, Ok(data_repr(9, b"ccc")));
+        recv_nothing!(s, time 302);
+        send!(s, time 352, ack_repr(15));
+        assert_eq!(s.recover, None);
+        recv_nothing!(s, time 1000);
+    }
+
+    #[test]
+    fn test_tlp_sends_new_data_when_the_window_allows() {
+        let mut s = socket_sack_rtt_50();
+        s.send_slice(b"aaaBBB").unwrap();
+        recv!(s, time 100, Ok(data_repr(3, b"aaa")));
+        recv!(s, time 100, Ok(data_repr(6, b"BBB")));
+
+        // Data queued since, which the congestion window would let out
+        // anyway, goes first as the probe.
+        s.send_slice(b"ccc").unwrap();
+        s.rack.probe_at = Some(Instant::from_millis(101));
+        recv!(s, time 101, Ok(data_repr(9, b"ccc")));
+        assert!(s.rack.probe.is_some_and(|probe| !probe.retransmitted));
+        recv_nothing!(s, time 101);
+    }
+
+    #[test]
+    fn test_rack_resends_a_lost_retransmission_before_a_timeout() {
+        let mut s = socket_sack_three_holes();
+        recv!(s, time 1050, Ok(data_repr(0, b"aaa")));
+        recv!(s, time 1050, Ok(data_repr(6, b"ccc")));
+        recv!(s, time 1050, Ok(data_repr(12, b"eee")));
+        s.send_slice(b"iiiJJJ").unwrap();
+        recv!(s, time 1050, Ok(data_repr(24, b"iii")));
+        recv!(s, time 1050, Ok(data_repr(27, b"JJJ")));
+        recv_nothing!(s, time 1050);
+
+        // "aaa" and "eee" arrive, and so does the new data sent after them,
+        // but the resent "ccc" is lost again. RFC 6675 alone resends a hole
+        // once, and waits for the timeout; RACK sees that "ccc" was sent
+        // before data now delivered, a round trip ago.
+        send!(s, time 1100, sack_repr(6, 256, &[(9, 30)]));
+        recv!(s, time 1100, Ok(data_repr(6, b"ccc")));
+        recv_nothing!(s, time 1100);
+        send!(s, time 1150, ack_repr(30));
+        assert_eq!(s.recover, None);
+    }
+
+    #[test]
+    fn test_rack_rtt_sample_in_recovery_resets_the_rto_backoff() {
+        let mut s = socket_sack_rtt_50();
+
+        // A lone segment is lost. The timeout resends it, with the RTO
+        // doubled, and then data queued since.
+        s.send_slice(b"aaa").unwrap();
+        recv!(s, time 100, Ok(data_repr(3, b"aaa")));
+        recv_nothing!(s, time 299);
+        s.send_slice(b"BBBccc").unwrap();
+        recv!(s, time 300, Ok(data_repr(3, b"aaa")));
+        recv!(s, time 300, Ok(data_repr(6, b"BBB")));
+        recv!(s, time 300, Ok(data_repr(9, b"ccc")));
+        assert_eq!(s.rtte.retransmission_timeout(), Duration::from_millis(400));
+
+        // The resent "aaa" is lost again. The timer's own round trip sample
+        // waits for it to be acknowledged, and a sample from "aaa" itself
+        // would break Karn's algorithm. "ccc", sent once, is SACKed during
+        // the recovery RACK starts, and its sample ends the backoff.
+        send!(s, time 350, sack_repr(3, 256, &[(6, 9)]));
+        send!(s, time 351, sack_repr(3, 256, &[(6, 12)]));
+        assert_eq!(s.rtte.retransmission_timeout(), Duration::from_millis(200));
+        recv!(s, time 351, Ok(data_repr(3, b"aaa")));
+    }
+
+    // Sends "aaa", "BBB" and "ccc" at 100 after a 40 ms round trip, so that
+    // RACK's reordering window is 10 ms.
+    fn socket_sack_reordering_window_10() -> TestSocket {
+        let mut s = socket_established();
+        s.remote_has_sack = true;
+        s.remote_mss = 3;
+        send!(s, time 0, ack_repr(0));
+        s.send_slice(b"xxx").unwrap();
+        recv!(s, time 0, Ok(data_repr(0, b"xxx")));
+        send!(s, time 40, ack_repr(3));
+        s.send_slice(b"aaaBBBccc").unwrap();
+        for (i, payload) in [b"aaa", b"BBB", b"ccc"].iter().enumerate() {
+            recv!(s, time 100, Ok(data_repr(3 + 3 * i, &payload[..])));
+        }
+
+        // "aaa" is overtaken.
+        send!(s, time 140, sack_repr(3, 256, &[(6, 9)]));
+        send!(s, time 140, sack_repr(3, 256, &[(6, 12)]));
+        s
+    }
+
+    #[test]
+    fn test_rack_tolerates_reordering_within_its_window() {
+        let mut s = socket_sack_reordering_window_10();
+        recv_nothing!(s, time 140);
+
+        // "aaa" arrives within the window: nothing was lost.
+        send!(s, time 149, ack_repr(12));
+        recv_nothing!(s, time 160);
+        assert_eq!(s.recover, None);
+        assert!(s.rack.reo_timeout.is_none());
+    }
+
+    #[test]
+    fn test_rack_reordering_timer_resends_what_stays_missing() {
+        let mut s = socket_sack_reordering_window_10();
+        recv_nothing!(s, time 149);
+
+        // "aaa" is still missing a round trip plus the window after it was
+        // sent: it is lost, too few segments were SACKed for RFC 6675 to
+        // tell, and the timeout is at 300.
+        recv!(s, time 150, Ok(data_repr(3, b"aaa")));
+        assert!(s.recover.is_some());
+        recv_nothing!(s, time 150);
+    }
+
+    #[test]
+    #[cfg(feature = "socket-tcp-cubic")]
+    fn test_limited_transmit_sends_new_data_on_the_first_two_duplicates() {
+        let mut s = socket_established_with_buffer_sizes(4096, 64);
+        s.set_congestion_control(CongestionControl::Cubic);
+        s.remote_mss = 128;
+        s.congestion_controller.inner_mut().set_mss(128);
+        send!(s, time 0, sack_repr(0, 4000, &[]));
+
+        // Sixteen segments fill the congestion window, of 2,048 octets, and
+        // the first is lost.
+        let data: Vec<u8> = (0..2432u32).map(|i| (i / 128) as u8).collect();
+        s.send_slice(&data).unwrap();
+        for offset in (0..2048).step_by(128) {
+            recv!(s, time 1000, Ok(data_repr(offset, &data[offset..offset + 128])));
+        }
+        recv_nothing!(s, time 1000);
+
+        // RFC 3042: each of the first two duplicate ACKs lets out a new
+        // segment. The third starts recovery.
+        send!(s, time 1050, sack_repr(0, 4000, &[]));
+        recv!(s, time 1050, Ok(data_repr(2048, &data[2048..2176])));
+        recv_nothing!(s, time 1050);
+        send!(s, time 1051, sack_repr(0, 4000, &[]));
+        recv!(s, time 1051, Ok(data_repr(2176, &data[2176..2304])));
+        recv_nothing!(s, time 1051);
+        send!(s, time 1052, sack_repr(0, 4000, &[]));
+        recv!(s, time 1052, Ok(data_repr(0, &data[0..128])));
+    }
+
+    #[test]
+    #[cfg(feature = "socket-tcp-cubic")]
+    fn test_tlp_that_repairs_a_loss_reduces_the_window() {
+        for dsack in [false, true] {
+            let mut s = socket_sack_rtt_50();
+            s.send_slice(b"aaaBBB").unwrap();
+            recv!(s, time 100, Ok(data_repr(3, b"aaa")));
+            recv!(s, time 100, Ok(data_repr(6, b"BBB")));
+            recv!(s, time 202, Ok(data_repr(6, b"BBB")));
+            let window = s.congestion_controller.inner().window();
+
+            // Only the probe's ACK arrives. With a D-SACK of "BBB", the
+            // probe was needless: the first "BBB" arrived, and its ACK was
+            // lost. Without one, the probe repaired a loss.
+            let blocks: &[(usize, usize)] = if dsack { &[(6, 9)] } else { &[] };
+            send!(s, time 252, sack_repr(9, 256, blocks));
+            assert_eq!(s.rack.probe, None);
+            let reduced = s.congestion_controller.inner().window() < window;
+            assert_eq!(reduced, !dsack);
+        }
+    }
+
+    #[test]
+    fn test_path_mtu_reduction_stops_rack_timers() {
+        let mut s = socket_established_with_buffer_sizes(4096, 64);
+        s.remote_has_sack = true;
+        s.remote_mss = 1400;
+        s.congestion_controller.inner_mut().set_mss(1400);
+        send!(s, time 0, sack_repr(0, 4000, &[]));
+        s.send_slice(&[0; 10]).unwrap();
+        recv!(s, time 0, Ok(data_repr(0, &[0; 10])));
+        send!(s, time 50, sack_repr(10, 4000, &[]));
+
+        // Two full segments are in flight, with a loss probe armed.
+        s.send_slice(&[1; 2800]).unwrap();
+        recv!(s, time 100, Ok(data_repr(10, &[1; 1400])));
+        recv!(s, time 100, Ok(data_repr(1410, &[1; 1400])));
+        assert!(s.rack.probe_at.is_some());
+
+        // They are too big for the path, and are resent at the new size
+        // from the last ACK. Resending is loss recovery of a kind, and no
+        // probe is due during it.
+        let outcome = s
+            .socket
+            .process_path_mtu(&s.cx, LOCAL_END, REMOTE_END, LOCAL_SEQ + 11, 1280);
+        assert_eq!(outcome, PathMtuOutcome::Reduced);
+        assert_eq!(s.rack.probe_at, None);
+        recv(&mut s, Instant::from_millis(110), |repr| {
+            assert_eq!(repr.unwrap().seq_number, LOCAL_SEQ + 11)
+        });
+        assert!(!s.loss_probe_allowed());
     }
 
     #[test]
