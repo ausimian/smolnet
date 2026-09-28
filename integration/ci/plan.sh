@@ -168,6 +168,11 @@ plan() {
       # and the socket ceiling pushed past, over both families.
       run crawl-local crawl 2m '' both --target local --ceiling-step 5000 --round-pause 10000 \
         --max-smolnet-only 0
+      # One pass of the matrix, small transfers, every profile but
+      # loss-burst, whose one-stream sends can wait minutes on SmolNet's
+      # backed-off retransmission timer (#138).
+      run netem-matrix netem_matrix 10m '' both --no-pcap --repeats 1 --bytes 2097152 \
+        --profiles none,bufferbloat,corrupt,delay,duplicate,high-bdp,reorder
       ;;
     *) die "no runs are planned for the event '${EVENT_NAME:-}'" ;;
   esac

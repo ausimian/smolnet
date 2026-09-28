@@ -34,7 +34,7 @@ on:
       scenario:
         description: The scenario, integration/<scenario>.exs
         type: choice
-        options: [tls, smoke, pmtu, idle, chaos, crawl]
+        options: [tls, smoke, pmtu, idle, chaos, crawl, netem_matrix]
         default: tls
       duration:
         description: How long to run, such as 90s, 10m or 1h30m; at most 5h
@@ -149,8 +149,10 @@ jobs:
           missing=""
           command -v nft >/dev/null || missing="$missing nftables"
           command -v tcpdump >/dev/null || missing="$missing tcpdump"
-          # netem and ifb, for a profile, ship in the kernel's extra modules.
-          if [ -n "$NETEM" ] && ! modprobe -n -a sch_netem ifb 2>/dev/null; then
+          # netem and ifb, for a profile or the netem matrix, ship in the
+          # kernel's extra modules.
+          if { [ -n "$NETEM" ] || [ "$SCENARIO" = netem_matrix ]; } &&
+            ! modprobe -n -a sch_netem sch_tbf ifb 2>/dev/null; then
             missing="$missing linux-modules-extra-$(uname -r)"
           fi
           if [ -n "$missing" ]; then
@@ -161,6 +163,7 @@ jobs:
           sudo integration/setup.sh
         env:
           NETEM: ${{ matrix.netem }}
+          SCENARIO: ${{ matrix.scenario }}
 
       - name: Run ${{ matrix.id }}
         run: integration/ci/run.sh
