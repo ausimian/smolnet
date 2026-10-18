@@ -396,6 +396,29 @@ Hex packages are unaffected: they ship only precompiled NIFs and omit
     and eight segments growing congestion avoidance alike, on the
     Reno-friendly line and on the curve after a loss. A third covers one
     MSS per ACK after a timeout.
+- #168: upstream read D-SACKs as a sender but never sent one, and reported
+  a duplicate segment only with its usual SACK block. A Linux sender marks
+  a segment lost when a later one arrives a quarter of the minimum round
+  trip before it, so a path that reorders by more retransmits segments that
+  are not lost and reduces its window each time. It undoes the reduction
+  and widens its reordering window only on evidence that the
+  retransmission was spurious: a D-SACK or the timestamps (see "Later
+  configuration"). Through a WireGuard tunnel with netem `delay 20ms 5ms`
+  and no loss, a Linux sender to SmolNet made 871 spurious fast
+  retransmissions a minute and held its window at 2–7 segments: 0.5 MiB/s,
+  against 12.9 MiB/s to the macOS kernel.
+  - A segment that repeats data already received is acknowledged at once,
+    with the repeated octets as RFC 2883's D-SACK in the first SACK block:
+    data below `RCV.NXT`, whether the whole segment or the part before
+    new data, and otherwise the first range of out-of-order data it
+    repeats. The usual SACK block follows it, so a duplicate of
+    out-of-order data lies within the second block, which is how the
+    sender tells the two apart. A peer that did not negotiate SACK gets
+    the ACKs it got before.
+  - Five socket tests cover a duplicate below `RCV.NXT` with and without
+    out-of-order data held, a segment straddling `RCV.NXT`, a repeat of
+    out-of-order data, and a peer without SACK; a sixth checks that
+    SmolNet's own sender reads both forms as D-SACKs.
 
 ## Later configuration
 

@@ -1989,6 +1989,19 @@ impl<'a> Socket<'a> {
     }
 
     fn ack_reply(&mut self, ip_repr: &IpRepr, repr: &TcpRepr) -> (IpRepr, TcpRepr<'static>) {
+        self.ack_reply_with_dsack(ip_repr, repr, None)
+    }
+
+    /// An ACK for `repr` that also reports `dsack`, data of `repr` that was
+    /// received before, as RFC 2883's D-SACK. Without it a sender cannot
+    /// tell that a retransmission was spurious, and so cannot undo the
+    /// congestion window reduction that came with it.
+    fn ack_reply_with_dsack(
+        &mut self,
+        ip_repr: &IpRepr,
+        repr: &TcpRepr,
+        dsack: Option<(TcpSeqNumber, TcpSeqNumber)>,
+    ) -> (IpRepr, TcpRepr<'static>) {
         let (mut ip_reply_repr, mut reply_repr) = Self::reply(ip_repr, repr);
         reply_repr.timestamp = repr
             .timestamp
@@ -2044,6 +2057,18 @@ impl<'a> Socket<'a> {
                     .map(|(left, right)| (ack + left, ack + right))
                     .next()
                     .map(|(left, right)| (left.0 as u32, right.0 as u32));
+            }
+
+            // RFC 2883: the D-SACK block comes first, and the SACK block
+            // above takes the second place. A duplicate of out-of-order
+            // data lies within that block, which is how the sender tells
+            // the D-SACK from an ordinary SACK block.
+            if let Some((left, right)) = dsack {
+                reply_repr.sack_ranges = [
+                    Some((left.0 as u32, right.0 as u32)),
+                    reply_repr.sack_ranges[0],
+                    None,
+                ];
             }
         }
 
@@ -2227,6 +2252,9 @@ impl<'a> Socket<'a> {
         };
         let segment_start = repr.seq_number;
         let segment_end = repr.seq_number + repr.payload.len();
+        // Data of the segment that was received before, which the ACK
+        // reports as a D-SACK (RFC 2883).
+        let mut dsack = None;
 
         let (payload, payload_offset) = match self.state {
             // In LISTEN and SYN-SENT states, we have not yet synchronized with the remote end.
@@ -2294,6 +2322,10 @@ impl<'a> Socket<'a> {
 
                     self.local_rx_last_seq = Some(repr.seq_number);
 
+                    if segment_start < window_start {
+                        dsack = Some((segment_start, window_start));
+                    }
+
                     (
                         &repr.payload[overlap_start - segment_start..overlap_end - segment_start],
                         overlap_start - window_start,
@@ -2340,7 +2372,9 @@ impl<'a> Socket<'a> {
                             TcpControl::None | TcpControl::Psh | TcpControl::Fin
                         )
                     {
-                        return Some(self.ack_reply(ip_repr, repr));
+                        let dsack = (segment_start < window_start)
+                            .then(|| (segment_start, segment_end.min(window_start)));
+                        return Some(self.ack_reply_with_dsack(ip_repr, repr, dsack));
                     }
 
                     return self.challenge_ack_reply(cx, ip_repr, repr);
@@ -2819,6 +2853,22 @@ impl<'a> Socket<'a> {
 
         let assembler_was_empty = self.assembler.is_empty();
 
+        // Out-of-order data the segment repeats is a duplicate too. One
+        // block reports it, so where the segment repeats several ranges,
+        // the first stands for them all.
+        let dsack = dsack.or_else(|| {
+            self.assembler
+                .iter_data()
+                .map(|(left, right)| {
+                    (
+                        left.max(payload_offset),
+                        right.min(payload_offset + payload_len),
+                    )
+                })
+                .find(|(left, right)| left < right)
+                .map(|(left, right)| (window_start + left, window_start + right))
+        });
+
         // Try adding payload octets to the assembler.
         let Ok(contig_len) = self
             .assembler
@@ -2887,12 +2937,17 @@ impl<'a> Socket<'a> {
         // Per RFC 5681, we should send an immediate ACK when either:
         //  1) an out-of-order segment is received, or
         //  2) a segment arrives that fills in all or part of a gap in sequence space.
-        if !self.assembler.is_empty() || !assembler_was_empty {
+        // So should a duplicate a peer with SACK sends, as only this ACK
+        // carries its D-SACK.
+        if (dsack.is_some() && self.remote_has_sack)
+            || !self.assembler.is_empty()
+            || !assembler_was_empty
+        {
             // Note that we change the transmitter state here.
             // This is fine because smoltcp assumes that it can always transmit zero or one
             // packets for every packet it receives.
             tcp_trace!("ACKing incoming segment");
-            Some(self.ack_reply(ip_repr, repr))
+            Some(self.ack_reply_with_dsack(ip_repr, repr, dsack))
         } else {
             None
         }
@@ -5494,6 +5549,213 @@ mod test {
                 ..RECV_TEMPL
             })
         );
+    }
+
+    #[test]
+    fn test_established_dsack_for_duplicate_below_window() {
+        // RFC 2883: a duplicate of data already acknowledged is reported in
+        // the first SACK block, at or below the cumulative ACK.
+        let mut s = socket_recved();
+        s.remote_has_sack = true;
+        let base = REMOTE_SEQ.0 as u32 + 1;
+        send!(
+            s,
+            TcpRepr {
+                seq_number: REMOTE_SEQ + 1,
+                ack_number: Some(LOCAL_SEQ + 1),
+                payload: &b"abcdef"[..],
+                ..SEND_TEMPL
+            },
+            Some(TcpRepr {
+                seq_number: LOCAL_SEQ + 1,
+                ack_number: Some(REMOTE_SEQ + 1 + 6),
+                window_len: 58,
+                sack_ranges: [Some((base, base + 6)), None, None],
+                ..RECV_TEMPL
+            })
+        );
+    }
+
+    #[test]
+    fn test_established_dsack_precedes_sack_block() {
+        // With out-of-order data held, its SACK block follows the D-SACK.
+        let mut s = socket_recved();
+        s.remote_has_sack = true;
+        let base = REMOTE_SEQ.0 as u32 + 1;
+        send!(
+            s,
+            TcpRepr {
+                seq_number: REMOTE_SEQ + 1 + 9,
+                ack_number: Some(LOCAL_SEQ + 1),
+                payload: &b"jkl"[..],
+                ..SEND_TEMPL
+            },
+            Some(TcpRepr {
+                seq_number: LOCAL_SEQ + 1,
+                ack_number: Some(REMOTE_SEQ + 1 + 6),
+                window_len: 58,
+                sack_ranges: [Some((base + 9, base + 12)), None, None],
+                ..RECV_TEMPL
+            })
+        );
+        send!(
+            s,
+            TcpRepr {
+                seq_number: REMOTE_SEQ + 1,
+                ack_number: Some(LOCAL_SEQ + 1),
+                payload: &b"abcdef"[..],
+                ..SEND_TEMPL
+            },
+            Some(TcpRepr {
+                seq_number: LOCAL_SEQ + 1,
+                ack_number: Some(REMOTE_SEQ + 1 + 6),
+                window_len: 58,
+                sack_ranges: [Some((base, base + 6)), Some((base + 9, base + 12)), None],
+                ..RECV_TEMPL
+            })
+        );
+    }
+
+    #[test]
+    fn test_established_dsack_for_segment_overlapping_window_start() {
+        // A segment that repeats data below RCV.NXT and brings new data
+        // after it is acknowledged at once, with the repeated part as a
+        // D-SACK.
+        let mut s = socket_recved();
+        s.remote_has_sack = true;
+        let base = REMOTE_SEQ.0 as u32 + 1;
+        send!(
+            s,
+            TcpRepr {
+                seq_number: REMOTE_SEQ + 1 + 3,
+                ack_number: Some(LOCAL_SEQ + 1),
+                payload: &b"defghi"[..],
+                ..SEND_TEMPL
+            },
+            Some(TcpRepr {
+                seq_number: LOCAL_SEQ + 1,
+                ack_number: Some(REMOTE_SEQ + 1 + 9),
+                window_len: 55,
+                sack_ranges: [Some((base + 3, base + 6)), None, None],
+                ..RECV_TEMPL
+            })
+        );
+        s.recv(|data| {
+            assert_eq!(data, b"abcdefghi");
+            (data.len(), ())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn test_established_dsack_for_duplicate_out_of_order_data() {
+        // A segment that repeats out-of-order data reports the repeated part
+        // as a D-SACK, followed by the SACK block that contains it.
+        let mut s = socket_recved();
+        s.remote_has_sack = true;
+        let base = REMOTE_SEQ.0 as u32 + 1;
+        send!(
+            s,
+            TcpRepr {
+                seq_number: REMOTE_SEQ + 1 + 9,
+                ack_number: Some(LOCAL_SEQ + 1),
+                payload: &b"jkl"[..],
+                ..SEND_TEMPL
+            },
+            Some(TcpRepr {
+                seq_number: LOCAL_SEQ + 1,
+                ack_number: Some(REMOTE_SEQ + 1 + 6),
+                window_len: 58,
+                sack_ranges: [Some((base + 9, base + 12)), None, None],
+                ..RECV_TEMPL
+            })
+        );
+        send!(
+            s,
+            TcpRepr {
+                seq_number: REMOTE_SEQ + 1 + 8,
+                ack_number: Some(LOCAL_SEQ + 1),
+                payload: &b"ijklm"[..],
+                ..SEND_TEMPL
+            },
+            Some(TcpRepr {
+                seq_number: LOCAL_SEQ + 1,
+                ack_number: Some(REMOTE_SEQ + 1 + 6),
+                window_len: 58,
+                sack_ranges: [
+                    Some((base + 9, base + 12)),
+                    Some((base + 8, base + 13)),
+                    None
+                ],
+                ..RECV_TEMPL
+            })
+        );
+    }
+
+    #[test]
+    fn test_established_no_dsack_without_sack() {
+        // A peer that did not negotiate SACK gets a plain ACK for a
+        // duplicate.
+        let mut s = socket_recved();
+        send!(
+            s,
+            TcpRepr {
+                seq_number: REMOTE_SEQ + 1 + 9,
+                ack_number: Some(LOCAL_SEQ + 1),
+                payload: &b"jkl"[..],
+                ..SEND_TEMPL
+            },
+            Some(TcpRepr {
+                seq_number: LOCAL_SEQ + 1,
+                ack_number: Some(REMOTE_SEQ + 1 + 6),
+                window_len: 58,
+                ..RECV_TEMPL
+            })
+        );
+        send!(
+            s,
+            TcpRepr {
+                seq_number: REMOTE_SEQ + 1 + 9,
+                ack_number: Some(LOCAL_SEQ + 1),
+                payload: &b"jkl"[..],
+                ..SEND_TEMPL
+            },
+            Some(TcpRepr {
+                seq_number: LOCAL_SEQ + 1,
+                ack_number: Some(REMOTE_SEQ + 1 + 6),
+                window_len: 58,
+                ..RECV_TEMPL
+            })
+        );
+    }
+
+    #[test]
+    fn test_dsack_reply_is_read_as_dsack() {
+        // A SmolNet sender reads the D-SACKs a SmolNet receiver sends as
+        // such, whether below the ACK or within the second block.
+        let mut s = socket_established();
+        s.remote_has_sack = true;
+        s.remote_last_seq = LOCAL_SEQ + 1 + 20;
+        let base = LOCAL_SEQ.0 as u32 + 1;
+        let below = TcpRepr {
+            sack_ranges: [Some((base, base + 6)), None, None],
+            ..SEND_TEMPL
+        };
+        assert!(s.has_dsack(&below, LOCAL_SEQ + 1 + 6));
+        let within = TcpRepr {
+            sack_ranges: [
+                Some((base + 9, base + 12)),
+                Some((base + 8, base + 13)),
+                None,
+            ],
+            ..SEND_TEMPL
+        };
+        assert!(s.has_dsack(&within, LOCAL_SEQ + 1 + 6));
+        let plain = TcpRepr {
+            sack_ranges: [Some((base + 8, base + 13)), None, None],
+            ..SEND_TEMPL
+        };
+        assert!(!s.has_dsack(&plain, LOCAL_SEQ + 1 + 6));
     }
 
     #[test]
