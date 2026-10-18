@@ -36,7 +36,7 @@ Add `smolnet` to your dependencies:
 ```elixir
 def deps do
   [
-    {:smolnet, "~> 0.7"}
+    {:smolnet, "~> 0.8"}
   ]
 end
 ```
