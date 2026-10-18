@@ -102,7 +102,9 @@ discovery: ICMP "Fragmentation Needed" and "Packet Too Big" lower a
 connection's segment size, and it resends at once (#128). Two more patch
 its timers: the timeout applies only while a connection has something
 outstanding, which makes it RFC 5482's user timeout (#132), and keep-alive
-has Linux's idle time, probe interval and probe count (#133). The commit that
+has Linux's idle time, probe interval and probe count (#133). One patches
+the receiver: it acknowledges a duplicate segment at once with an RFC 2883
+D-SACK, so that a sender can undo a spurious retransmission (#168). The commit that
 added the directory holds the crates.io package unmodified, so
 `git log -p -- native/vendor/smoltcp` after that commit is the complete set of
 SmolNet changes. Keep any further patch small, covered by tests in the

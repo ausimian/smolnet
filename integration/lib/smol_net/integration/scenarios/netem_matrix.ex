@@ -60,6 +60,16 @@ defmodule SmolNet.Integration.Scenarios.NetemMatrix do
   a case below `--gap` times the kernel is noted as a gap, with the issues
   that explain it (`triage/2`), or as untriaged. `verdict.json` holds every
   transfer as the `transfers` result and a row per case as `matrix`.
+
+  Where the kernel here sends, in `receive` and `kernel`, each transfer
+  also records how its TCP counters moved (`kernel_counters/0`): the
+  segments it retransmitted, and the evidence it had that a
+  retransmission was needless, D-SACKs and undone window reductions. On a
+  path that reorders without loss, such as `jitter`'s, every
+  retransmission is needless (#168). They are this namespace's counters,
+  so another sender here would add to them, and under `--thin-acks` the
+  kernel that sends to SmolNet is the one in `netem-peer`, so `receive`
+  records none.
   """
 
   alias SmolNet.Integration.Network
@@ -80,6 +90,11 @@ defmodule SmolNet.Integration.Scenarios.NetemMatrix do
   # Under a profile with no delay, a SmolNet case at least this share of
   # the unimpaired ratio to the kernel is as far behind as the CPU puts it.
   @cpu_share 0.75
+  # The kernel's TCP counters a transfer records, from /proc/net/snmp and
+  # /proc/net/netstat.
+  @counters ~w(RetransSegs TCPDSACKRecv TCPDSACKUndo TCPFullUndo TCPPartialUndo
+               TCPLossUndo TCPSpuriousRTOs TCPTSReorder TCPSACKReorder)
+  @undos ~w(TCPDSACKUndo TCPFullUndo TCPPartialUndo TCPLossUndo)
   @cpu_bound "no delay on the path, so both stacks run as fast as the CPU lets them, and " <>
                "SmolNet, through its NIF and the TUN helper, costs more a packet than the " <>
                "kernel across a veth: the gap is as large unimpaired (profile none)"
@@ -121,6 +136,16 @@ defmodule SmolNet.Integration.Scenarios.NetemMatrix do
       {138,
        "SmolNet takes three duplicate ACKs as a loss, so reordering as congestion; " <>
          "RACK's reordering window would tell them apart"}
+    ],
+    {"jitter", :send} => [
+      {169,
+       "SmolNet takes a jittered path's reordering as loss and has no undo for the " <>
+         "window its spurious retransmissions cost"}
+    ],
+    {"jitter", :receive} => [
+      {103,
+       "the 256 KiB default receive buffer, without autotuning, holds a 40 ms round " <>
+         "trip to about 50 Mbit/s"}
     ],
     {"reorder", :receive} => [
       {86,
@@ -513,11 +538,15 @@ defmodule SmolNet.Integration.Scenarios.NetemMatrix do
     stall_ms = stall_limit(test_case.profile, settings.stall_rtos)
     started_at = DateTime.utc_now()
     deadline = settings.transfer_timeout + 2 * @connect_timeout + 30_000
+    counted? = kernel_sends?(settings, test_case.flow)
+    before = if counted?, do: kernel_counters()
 
     observed =
       Soak.within(context, {:transfer, test_case.id, test_case.repeat}, deadline, fn ->
         transfer(context, settings, test_case, stall_ms)
       end)
+
+    observed = Map.put(observed, :kernel_counters, counter_deltas(before, counted?))
 
     Soak.count(context, :transfers)
     if observed.intact, do: Soak.count(context, :intact)
@@ -534,7 +563,8 @@ defmodule SmolNet.Integration.Scenarios.NetemMatrix do
 
   defp describe(%{intact: true} = result) do
     "#{result.mbit_s} Mbit/s, #{result.completion_ms} ms, connect #{result.connect_ms} ms, " <>
-      "longest wait #{result.longest_wait_ms} ms#{if result.stalled, do: " (stalled)"}"
+      "longest wait #{result.longest_wait_ms} ms#{if result.stalled, do: " (stalled)"}" <>
+      describe_counters(result.kernel_counters)
   end
 
   defp describe(result), do: "#{result.outcome}: #{result.detail}"
@@ -592,6 +622,61 @@ defmodule SmolNet.Integration.Scenarios.NetemMatrix do
       do: {[family, netns: @peer_netns], Map.fetch!(@peer, family), smolnet},
       else: {[family], Network.host_address(family), smolnet}
   end
+
+  # Whether the kernel that sends in `flow` is this namespace's, whose
+  # counters `kernel_counters/0` reads.
+  defp kernel_sends?(_settings, :kernel), do: true
+  defp kernel_sends?(settings, :receive), do: settings.thin_acks == nil
+  defp kernel_sends?(_settings, :send), do: false
+
+  @doc """
+  Returns this network namespace's kernel TCP counters that show how its
+  senders took a path, by name, or an empty map where `/proc` has none.
+  """
+  @spec kernel_counters() :: %{String.t() => integer()}
+  def kernel_counters do
+    for file <- ~w(/proc/net/snmp /proc/net/netstat),
+        {:ok, text} <- [File.read(file)],
+        reduce: %{},
+        do: (counters -> Map.merge(counters, parse_counters(text)))
+  end
+
+  @doc """
+  Parses the counters the matrix records from the text of `/proc/net/snmp`
+  or `/proc/net/netstat`, where each group is a line of names and a line
+  of values, both led by the group's name.
+  """
+  @spec parse_counters(String.t()) :: %{String.t() => integer()}
+  def parse_counters(text) do
+    text
+    |> String.split("\n", trim: true)
+    |> Enum.chunk_every(2, 2, :discard)
+    |> Enum.flat_map(fn [names, values] ->
+      [_group | names] = String.split(names)
+      [_group | values] = String.split(values)
+      Enum.zip(names, values)
+    end)
+    |> Enum.filter(fn {name, _value} -> name in @counters end)
+    |> Map.new(fn {name, value} -> {name, String.to_integer(value)} end)
+  end
+
+  defp counter_deltas(_before, false), do: nil
+
+  defp counter_deltas(before, true) do
+    case kernel_counters() do
+      after_ when map_size(after_) == 0 -> nil
+      after_ -> Map.new(after_, fn {name, n} -> {name, n - Map.get(before, name, 0)} end)
+    end
+  end
+
+  defp describe_counters(nil), do: ""
+
+  defp describe_counters(counters) do
+    ", the kernel resent #{counters["RetransSegs"]} segments " <>
+      "(#{counters["TCPDSACKRecv"]} D-SACKs, #{undos(counters)} undos)"
+  end
+
+  defp undos(counters), do: @undos |> Enum.map(&Map.get(counters, &1, 0)) |> Enum.sum()
 
   defp roles(:receive), do: {:receiver, :sender}
   defp roles(_flow), do: {:sender, :receiver}
@@ -829,6 +914,9 @@ defmodule SmolNet.Integration.Scenarios.NetemMatrix do
       max_mbit_s: Enum.max(rates, fn -> nil end),
       median_completion_ms: group |> completed(:completion_ms) |> median() |> rounded(0),
       longest_wait_ms: group |> Enum.map(& &1.longest_wait_ms) |> Enum.max(fn -> nil end),
+      kernel_retransmits: counted(group, &Map.get(&1, "RetransSegs", 0)),
+      kernel_dsacks: counted(group, &Map.get(&1, "TCPDSACKRecv", 0)),
+      kernel_undos: counted(group, &undos/1),
       kernel_mbit_s: baseline,
       ratio_to_kernel: ratio,
       gap: gap?,
@@ -838,6 +926,17 @@ defmodule SmolNet.Integration.Scenarios.NetemMatrix do
 
   defp completed(group, field),
     do: for(%{intact: true} = transfer <- group, do: Map.fetch!(transfer, field))
+
+  # The median of what `count` takes from the kernel's counters over the
+  # transfers that completed and recorded them.
+  defp counted(group, count) do
+    for(
+      %{intact: true, kernel_counters: %{} = counters} <- group,
+      do: count.(counters)
+    )
+    |> median()
+    |> rounded(0)
+  end
 
   @doc "Returns the median of `values`, or `nil` for none."
   @spec median([number()]) :: number() | nil
@@ -949,8 +1048,18 @@ defmodule SmolNet.Integration.Scenarios.NetemMatrix do
           ""
       end
 
+    resent = describe_resent(row)
+
     "#{row.profile} #{row.flow} x#{row.streams} #{row.family}: " <>
       "#{row.median_mbit_s || "-"} Mbit/s in #{row.median_completion_ms || "-"} ms, " <>
-      "#{row.intact}/#{row.runs} intact, longest wait #{row.longest_wait_ms} ms#{kernel}#{triage}"
+      "#{row.intact}/#{row.runs} intact, longest wait #{row.longest_wait_ms} ms" <>
+      "#{resent}#{kernel}#{triage}"
+  end
+
+  defp describe_resent(%{kernel_retransmits: nil}), do: ""
+
+  defp describe_resent(row) do
+    ", the kernel resent #{row.kernel_retransmits} " <>
+      "(#{row.kernel_dsacks} D-SACKs, #{row.kernel_undos} undos)"
   end
 end

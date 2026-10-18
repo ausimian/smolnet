@@ -396,6 +396,29 @@ Hex packages are unaffected: they ship only precompiled NIFs and omit
     and eight segments growing congestion avoidance alike, on the
     Reno-friendly line and on the curve after a loss. A third covers one
     MSS per ACK after a timeout.
+- #168: upstream read D-SACKs as a sender but never sent one, and reported
+  a duplicate segment only with its usual SACK block. A Linux sender marks
+  a segment lost when a later one arrives a quarter of the minimum round
+  trip before it, so a path that reorders by more retransmits segments that
+  are not lost and reduces its window each time. It undoes the reduction
+  and widens its reordering window only on evidence that the
+  retransmission was spurious: a D-SACK or the timestamps (see "Later
+  configuration"). Through a WireGuard tunnel with netem `delay 20ms 5ms`
+  and no loss, a Linux sender to SmolNet made 871 spurious fast
+  retransmissions a minute and held its window at 2–7 segments: 0.5 MiB/s,
+  against 12.9 MiB/s to the macOS kernel.
+  - A segment that repeats data already received is acknowledged at once,
+    with the repeated octets as RFC 2883's D-SACK in the first SACK block:
+    data below `RCV.NXT`, whether the whole segment or the part before
+    new data, and otherwise the first range of out-of-order data it
+    repeats. The usual SACK block follows it, so a duplicate of
+    out-of-order data lies within the second block, which is how the
+    sender tells the two apart. A peer that did not negotiate SACK gets
+    the ACKs it got before.
+  - Five socket tests cover a duplicate below `RCV.NXT` with and without
+    out-of-order data held, a segment straddling `RCV.NXT`, a repeat of
+    out-of-order data, and a peer without SACK; a sixth checks that
+    SmolNet's own sender reads both forms as D-SACKs.
 
 ## Later configuration
 
@@ -413,3 +436,36 @@ than to its code:
   on the first ACK of new data, a partial ACK included, and deflates the
   window to `ssthresh` there, while the patch's `recover` keeps
   retransmitting the remaining holes.
+- #168: every TCP socket has a tsval generator, so it offers RFC 7323's
+  timestamps in its SYN and uses them when the peer's SYN has them too. A
+  Linux sender that retransmitted a segment the path only delayed sees
+  from the echoed timestamp that the original arrived, and undoes its
+  window reduction, which D-SACK (see "Later patches") also lets it do.
+  The generator is a plain function, so it cannot read a stack's clock: it
+  counts milliseconds of the system's monotonic clock from a random start,
+  shared by the process. Only the peer reads it. The option costs 12
+  bytes a segment, which smoltcp already takes off the MSS.
+- #168: `assembler-max-segment-count-32` is enabled, so a TCP receiver
+  holds up to 32 ranges of out-of-order data, where the default held 4.
+  Past the last, `process` drops a segment without acknowledging it
+  (#117), and a path that reorders a window turns into losses. Under
+  netem's `delay 20ms 5ms`, which reorders without dropping anything, a
+  capture of a Linux sender to SmolNet held 59 retransmissions, 58 of
+  segments that had reached SmolNet and been dropped there; D-SACK had
+  nothing to report. The two together are what the path needed. Medians
+  of three 8 MiB transfers on Linux 6.12:
+
+  | SmolNet receiving | 1 stream | 4 streams | resent (1 stream) |
+  | --- | --- | --- | --- |
+  | 4 ranges, no D-SACK or timestamps | 5.8 Mbit/s | | 83 |
+  | 4 ranges, D-SACK and timestamps | 7.6 Mbit/s | | 219 |
+  | 32 ranges, no D-SACK or timestamps | 6.5 Mbit/s | 20.7 Mbit/s | 25 |
+  | 32 ranges, D-SACK and timestamps | 44.5 Mbit/s | 114 Mbit/s | 3 |
+  | the kernel, to itself | 132 Mbit/s | 138 Mbit/s | 6 |
+
+  With both, what the sender still resent was D-SACKed and undone, and
+  one stream is held near what the 256 KiB receive buffer allows at a
+  40 ms round trip. Each range is 16 bytes inside the socket, so a socket
+  grows by 448 bytes; in-order data never reaches the ranges past the
+  first, and a segment out of order costs a scan of those in use and at
+  most 31 moves.

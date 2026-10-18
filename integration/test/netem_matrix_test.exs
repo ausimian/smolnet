@@ -85,6 +85,44 @@ defmodule SmolNet.Integration.NetemMatrixTest do
     assert %{gap: true, triage: []} = duplicate
   end
 
+  test "reads the kernel's retransmission counters from /proc" do
+    snmp = """
+    Ip: Forwarding DefaultTTL
+    Ip: 1 64
+    Tcp: RtoAlgorithm MaxConn RetransSegs InErrs
+    Tcp: 1 -1 871 0
+    """
+
+    netstat = """
+    TcpExt: SyncookiesSent TCPDSACKRecv TCPFullUndo TCPTSReorder
+    TcpExt: 0 23 4 15
+    """
+
+    assert NetemMatrix.parse_counters(snmp) == %{"RetransSegs" => 871}
+
+    assert NetemMatrix.parse_counters(netstat) ==
+             %{"TCPDSACKRecv" => 23, "TCPFullUndo" => 4, "TCPTSReorder" => 15}
+
+    assert is_map(NetemMatrix.kernel_counters())
+  end
+
+  test "a row has the medians of the kernel sender's retransmissions and their evidence" do
+    counters = [
+      %{"RetransSegs" => 871, "TCPDSACKRecv" => 0, "TCPFullUndo" => 0},
+      %{"RetransSegs" => 12, "TCPDSACKRecv" => 10, "TCPFullUndo" => 3, "TCPDSACKUndo" => 5},
+      %{"RetransSegs" => 20, "TCPDSACKRecv" => 18, "TCPPartialUndo" => 2}
+    ]
+
+    transfers =
+      [transfer("jitter", :send, 10.0)] ++
+        for counters <- counters,
+            do: Map.put(transfer("jitter", :receive, 10.0), :kernel_counters, counters)
+
+    [send, receive] = NetemMatrix.matrix(transfers, 0.5)
+    assert %{kernel_retransmits: nil, kernel_dsacks: nil, kernel_undos: nil} = send
+    assert %{kernel_retransmits: 20, kernel_dsacks: 10, kernel_undos: 2} = receive
+  end
+
   test "netem is the matrix's own to apply", %{tmp_dir: dir} do
     config = Keyword.put(NetemMatrix.config(), :quiet, true)
 
