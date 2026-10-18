@@ -456,6 +456,7 @@ mod tests {
     };
     use crate::socket_table::SocketError;
     use smoltcp::socket::tcp::KeepAlive;
+    use smoltcp::storage::Assembler;
     use smoltcp::time::Duration;
 
     #[test]
@@ -517,6 +518,15 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(5));
         let elapsed = tsval().wrapping_sub(first);
         assert!((5..1_000).contains(&elapsed), "ticked {elapsed} in 5 ms");
+    }
+
+    #[test]
+    fn tcp_receivers_hold_32_out_of_order_ranges() {
+        let mut assembler = Assembler::new();
+        for range in 0..32 {
+            assert_eq!(assembler.add(2 * range + 1, 1), Ok(()));
+        }
+        assert!(assembler.add(65, 1).is_err());
     }
 
     #[test]

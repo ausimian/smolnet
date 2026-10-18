@@ -445,3 +445,27 @@ than to its code:
   counts milliseconds of the system's monotonic clock from a random start,
   shared by the process. Only the peer reads it. The option costs 12
   bytes a segment, which smoltcp already takes off the MSS.
+- #168: `assembler-max-segment-count-32` is enabled, so a TCP receiver
+  holds up to 32 ranges of out-of-order data, where the default held 4.
+  Past the last, `process` drops a segment without acknowledging it
+  (#117), and a path that reorders a window turns into losses. Under
+  netem's `delay 20ms 5ms`, which reorders without dropping anything, a
+  capture of a Linux sender to SmolNet held 59 retransmissions, 58 of
+  segments that had reached SmolNet and been dropped there; D-SACK had
+  nothing to report. The two together are what the path needed. Medians
+  of three 8 MiB transfers on Linux 6.12:
+
+  | SmolNet receiving | 1 stream | 4 streams | resent (1 stream) |
+  | --- | --- | --- | --- |
+  | 4 ranges, no D-SACK or timestamps | 5.8 Mbit/s | | 83 |
+  | 4 ranges, D-SACK and timestamps | 7.6 Mbit/s | | 219 |
+  | 32 ranges, no D-SACK or timestamps | 6.5 Mbit/s | 20.7 Mbit/s | 25 |
+  | 32 ranges, D-SACK and timestamps | 44.5 Mbit/s | 114 Mbit/s | 3 |
+  | the kernel, to itself | 132 Mbit/s | 138 Mbit/s | 6 |
+
+  With both, what the sender still resent was D-SACKed and undone, and
+  one stream is held near what the 256 KiB receive buffer allows at a
+  40 ms round trip. Each range is 16 bytes inside the socket, so a socket
+  grows by 448 bytes; in-order data never reaches the ranges past the
+  first, and a segment out of order costs a scan of those in use and at
+  most 31 moves.

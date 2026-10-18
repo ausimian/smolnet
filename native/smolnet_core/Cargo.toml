@@ -25,4 +25,8 @@ smoltcp = { path = "../vendor/smoltcp", version = "=0.14.0", default-features = 
   # do by default; see docs/adr/0013.
   "socket-tcp-cubic",
   "socket-udp",
+  # A TCP receiver holds up to 32 ranges of out-of-order data, not 4: past
+  # the last it drops a segment, so a path that reorders a window turns
+  # into losses (#168, #117).
+  "assembler-max-segment-count-32",
 ] }
