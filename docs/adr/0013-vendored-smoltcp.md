@@ -436,3 +436,12 @@ than to its code:
   on the first ACK of new data, a partial ACK included, and deflates the
   window to `ssthresh` there, while the patch's `recover` keeps
   retransmitting the remaining holes.
+- #168: every TCP socket has a tsval generator, so it offers RFC 7323's
+  timestamps in its SYN and uses them when the peer's SYN has them too. A
+  Linux sender that retransmitted a segment the path only delayed sees
+  from the echoed timestamp that the original arrived, and undoes its
+  window reduction, which D-SACK (see "Later patches") also lets it do.
+  The generator is a plain function, so it cannot read a stack's clock: it
+  counts milliseconds of the system's monotonic clock from a random start,
+  shared by the process. Only the peer reads it. The option costs 12
+  bytes a segment, which smoltcp already takes off the MSS.

@@ -1,3 +1,11 @@
+### Changed
+
+- TCP connections now use timestamps (RFC 7323) when the peer offers them, as
+  Linux, macOS and Windows peers do. A sender that retransmitted a segment
+  needlessly can tell from the timestamps and undo its window reduction. The
+  option takes 12 bytes of every segment's header, so a full segment carries
+  1448 bytes of data on a 1500-byte MTU instead of 1460, as on Linux.
+
 ### Fixed
 
 - A SmolNet receiver now acknowledges a duplicate segment at once with a

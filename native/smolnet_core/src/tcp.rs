@@ -1,4 +1,6 @@
 use std::collections::{BTreeSet, VecDeque};
+use std::hash::{BuildHasher, RandomState};
+use std::sync::OnceLock;
 
 use rustler::{NifMap, NifUnitEnum};
 use smoltcp::iface::SocketHandle;
@@ -386,10 +388,32 @@ pub fn socket(rcvbuf: usize, sndbuf: usize) -> Result<tcp::Socket<'static>, Sock
         return Err(SocketError::InvalidOptions);
     }
 
-    Ok(tcp::Socket::new(
+    let mut socket = tcp::Socket::new(
         tcp::SocketBuffer::new(vec![0; rcvbuf]),
         tcp::SocketBuffer::new(vec![0; sndbuf]),
-    ))
+    );
+    socket.set_tsval_generator(Some(tsval));
+    Ok(socket)
+}
+
+/// The clock of RFC 7323's timestamps, which every TCP socket offers in its
+/// SYN and uses if the peer's SYN has them too. A peer that retransmitted a
+/// segment needlessly, because the path reordered it, sees from the echo
+/// that the original arrived, and undoes its window reduction.
+///
+/// It ticks every millisecond, as Linux's does, from a random start so that
+/// it does not tell peers how long the VM has run. smoltcp takes a plain
+/// function, which cannot read a stack's clock, so it reads the system's
+/// monotonic one; peers only echo it.
+fn tsval() -> u32 {
+    static CLOCK: OnceLock<(std::time::Instant, u32)> = OnceLock::new();
+    let (epoch, start) = CLOCK.get_or_init(|| {
+        (
+            std::time::Instant::now(),
+            RandomState::new().hash_one(0) as u32,
+        )
+    });
+    start.wrapping_add(epoch.elapsed().as_millis() as u32)
 }
 
 #[cfg(feature = "fuzzing")]
@@ -428,7 +452,7 @@ mod tests {
 
     use super::{
         DEFAULT_BUFFER_BYTES, EPHEMERAL_PORT_FIRST, EPHEMERAL_PORT_LAST, MAX_BUFFER_BYTES,
-        MIN_BUFFER_BYTES, TcpEndpoint, TcpTimers, allocate_ephemeral, socket,
+        MIN_BUFFER_BYTES, TcpEndpoint, TcpTimers, allocate_ephemeral, socket, tsval,
     };
     use crate::socket_table::SocketError;
     use smoltcp::socket::tcp::KeepAlive;
@@ -482,6 +506,17 @@ mod tests {
             socket(DEFAULT_BUFFER_BYTES, MAX_BUFFER_BYTES + 1).unwrap_err(),
             SocketError::InvalidOptions
         );
+    }
+
+    #[test]
+    fn tcp_sockets_offer_millisecond_timestamps() {
+        let configured = socket(DEFAULT_BUFFER_BYTES, DEFAULT_BUFFER_BYTES).unwrap();
+        assert!(configured.timestamp_enabled());
+
+        let first = tsval();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        let elapsed = tsval().wrapping_sub(first);
+        assert!((5..1_000).contains(&elapsed), "ticked {elapsed} in 5 ms");
     }
 
     #[test]
