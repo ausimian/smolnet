@@ -50,10 +50,20 @@ receiver, split evenly over 1 or 4 connections at once. Its completion
 time runs from the first connect to the last byte received.
 
 The baseline is a fair one for the path, not for the endpoints. The
-kernel keeps its autotuned buffers of up to 6 MiB, and its timestamps,
-DSACK, TLP and RACK, where SmolNet has 256 KiB and none of those. Where the
-path adds no delay, both stacks run as fast as the CPU lets them. SmolNet
-then pays for its NIF and the TUN helper, and the kernel for a veth.
+kernel keeps its autotuned buffers of up to 6 MiB, where SmolNet has
+256 KiB. Where the path adds no delay, both stacks run as fast as the CPU
+lets them. SmolNet then pays for its NIF and the TUN helper, and the
+kernel for a veth.
+
+The `jitter` profile, 20 ms of delay with 5 ms of jitter and no rate,
+reorders packets without dropping any (#168). Every retransmission under
+it is needless, so where the kernel here sends, in `receive` and `kernel`,
+each transfer records how this namespace's TCP counters moved: the
+segments resent (`RetransSegs`), the D-SACKs received (`TCPDSACKRecv`) and
+the window reductions undone (`TCPDSACKUndo`, `TCPFullUndo`,
+`TCPPartialUndo` and `TCPLossUndo`). Another sender in the namespace would
+add to them, and under `--thin-acks` the kernel that sends to SmolNet is
+the one in `netem-peer`, so `receive` records none.
 
 ## The verdict
 
@@ -63,7 +73,7 @@ then pays for its NIF and the TUN helper, and the kernel for a veth.
   data longer than `--stall-rtos` (5) retransmission timeouts in a row
   would take, each twice the last. The timeout is the profile's round
   trip plus the 200 ms minimum both stacks use. That limit is 6.2 s
-  without delay, 7.4 s under `reorder`, 12.4 s under `delay` and
+  without delay, 7.4 s under `reorder` and `jitter`, 12.4 s under `delay` and
   `high-bdp`, and 38 s under `bufferbloat`. Receivers wait on past the
   limit, so each stall's whole length is recorded.
 - **Stalls that are noted, not failed.** The kernel's own stalls are
@@ -280,6 +290,52 @@ answer. Under `loss-burst` they took 4,617 and 182 ms before and 990 and
 167 ms after. The one-stream figure varies widely, and the kernel's own
 medians ranged from 7 to 44 Mbit/s over the same runs.
 
+## Reordering without loss
+
+A Linux sender to SmolNet through a WireGuard tunnel with netem's
+`delay 20ms 5ms` held its window at 2 to 7 segments and sent 0.5 MiB/s,
+with no loss on the path (#168). The `jitter` profile reproduces that
+path here: 5 ms of jitter on a 20 ms delay, without the rate that keeps
+`delay`'s packets in order.
+
+The receiver dropped what the path only reordered. In a capture of
+Linux sending to SmolNet under `jitter`, 58 of its 59 retransmissions
+resent segments that had reached SmolNet: smoltcp's receiver held 4
+ranges of out-of-order data, and dropped a segment past the last without
+an ACK (#117). #168 raised that to 32 ranges, and made SmolNet send a
+D-SACK for a duplicate and use timestamps, so that Linux can undo what a
+needless retransmission cost.
+
+Before and after, on the same host as the September results (Linux 6.12,
+cores 2 to 9), every profile shown, 8 MiB transfers, 3 interleaved
+repeats. Each cell is the median in Mbit/s, SmolNet's ratio to the
+kernel's, and, where the kernel sends, the median of segments it
+resent. `none` was within noise of before in every case.
+
+| profile | flow | streams | IPv4 before | IPv4 after | IPv6 before | IPv6 after |
+| --- | --- | --- | --- | --- | --- | --- |
+| `jitter` | receive | 1 | 6.4 (0.06×), 77 resent | 43.4 (0.44×), 3 resent | 5.4 (0.04×), 61 resent | 43.9 (0.33×), 2 resent |
+| `jitter` | receive | 4 | 16.8 (0.12×), 328 resent | 119 (0.79×), 17 resent | 18.7 (0.13×), 294 resent | 124 (1.1×), 18 resent |
+| `jitter` | send | 1 | 2.5 (0.02×) | 2.6 (0.03×) | 2.5 (0.02×) | 2.5 (0.02×) |
+| `jitter` | send | 4 | 10.1 (0.07×) | 9.5 (0.06×) | 9.4 (0.07×) | 9.5 (0.08×) |
+| `reorder` | receive | 1 | 38.5 (1.87×), 249 resent | 44.7 (2.11×), 3 resent | 29.0 (0.59×), 72 resent | 44.0 (0.83×), 5 resent |
+| `reorder` | receive | 4 | 90.3 (1.35×), 291 resent | 55.4 (0.63×), 3 resent | 64.6 (0.78×), 141 resent | 53.6 (0.75×), 5 resent |
+
+- **`jitter`, receiving: #168.** What Linux still resends is D-SACKed,
+  and it undoes that many window reductions. One stream is held near
+  what the 256 KiB receive buffer allows at a 40 ms round trip (#103).
+  Each change alone was not enough: with 32 ranges and no D-SACK or
+  timestamps, one stream ran at 6.5 Mbit/s, and with D-SACK and
+  timestamps and 4 ranges, at 7.6.
+- **`reorder`, receiving four streams.** The medians of 3 fell, but the
+  case swings widely: it has two humps, about 120 Mbit/s and about 55,
+  in both builds and in the kernel's own. Over 15 repeats over IPv6 it
+  ran at a median of 49 Mbit/s before and 80 after, the kernel at 99
+  and 96; over 7 over IPv4, 102 before and 122 after.
+- **`jitter`, sending: #169.** SmolNet as the sender is unchanged, at a
+  few hundredths of the kernel: it takes the reordering as loss and has
+  no undo.
+
 ## Idle connections under netem
 
 `idle.exs` ran under `--netem delay`, `loss-burst` and `reorder`, in the
@@ -333,6 +389,10 @@ integration/netem-topology.sh isolate mix run integration/netem_matrix.exs --fam
 # stretch ACKs, sending 1 MiB as the TLS scenario's uploads do
 integration/netem-topology.sh isolate mix run integration/netem_matrix.exs --no-pcap \
   --thin-acks 3 --family inet --profiles delay,high-bdp --flows send,kernel --bytes 1048576
+
+# reordering without loss, with the kernel sender's resends
+integration/netem-topology.sh isolate mix run integration/netem_matrix.exs --no-pcap \
+  --profiles none,jitter,reorder --streams 1,4
 
 # idle connections
 integration/pmtu-topology.sh isolate mix run integration/idle.exs --netem delay \

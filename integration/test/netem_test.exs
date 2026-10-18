@@ -5,7 +5,7 @@ defmodule SmolNet.Integration.Soak.NetemTest do
 
   test "names the profiles the impairment matrix starts from" do
     assert Netem.profiles() ==
-             ~w(bufferbloat corrupt delay duplicate high-bdp loss-burst reorder)
+             ~w(bufferbloat corrupt delay duplicate high-bdp jitter loss-burst reorder)
 
     assert Netem.profile?("delay")
     refute Netem.profile?("hurricane")

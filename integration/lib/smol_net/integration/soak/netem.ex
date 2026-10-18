@@ -17,6 +17,8 @@ defmodule SmolNet.Integration.Soak.Netem do
     * `delay` - 100 ms, 20 ms normally distributed jitter, in order
     * `loss-burst` - Gilbert-Elliott loss, about 2.8% on average, in bursts
     * `reorder` - 20 ms delay, 10% of packets sent early
+    * `jitter` - 20 ms delay with 5 ms of jitter, which reorders without
+      loss (#168)
     * `duplicate` - 2% duplication
     * `corrupt` - 0.5% corruption
     * `bufferbloat` - 20 ms delay into a 10 Mbit/s bucket with a 1 s queue
@@ -34,6 +36,9 @@ defmodule SmolNet.Integration.Soak.Netem do
     # it and 0.1% loss out of it.
     "loss-burst" => {~w(loss gemodel 1% 25% 70% 0.1%), nil},
     "reorder" => {~w(delay 20ms reorder 10% 50%), nil},
+    # Without a rate, jitter reorders the packets it overtakes: a
+    # reordering no sender can tell from loss by duplicate ACKs alone.
+    "jitter" => {~w(delay 20ms 5ms), nil},
     "duplicate" => {~w(duplicate 2%), nil},
     "corrupt" => {~w(corrupt 0.5%), nil},
     "bufferbloat" => {~w(delay 20ms), ~w(rate 10mbit burst 32kbit latency 1000ms)},
@@ -47,6 +52,7 @@ defmodule SmolNet.Integration.Soak.Netem do
     "delay" => 200,
     "loss-burst" => 0,
     "reorder" => 40,
+    "jitter" => 40,
     "duplicate" => 0,
     "corrupt" => 0,
     "bufferbloat" => 40 + 1_000,

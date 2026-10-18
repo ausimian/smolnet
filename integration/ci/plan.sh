@@ -172,7 +172,7 @@ plan() {
       # loss-burst, whose one-stream sends can wait minutes on SmolNet's
       # backed-off retransmission timer (#138).
       run netem-matrix netem_matrix 10m '' both --no-pcap --repeats 1 --bytes 2097152 \
-        --profiles none,bufferbloat,corrupt,delay,duplicate,high-bdp,reorder
+        --profiles none,bufferbloat,corrupt,delay,duplicate,high-bdp,jitter,reorder
       ;;
     *) die "no runs are planned for the event '${EVENT_NAME:-}'" ;;
   esac
