@@ -1,0 +1,215 @@
+{
+ "tag": "main",
+ "verdicts": {
+  "nif": [
+   "pass",
+   "pass",
+   "pass"
+  ],
+  "spike": [
+   "pass",
+   "pass",
+   "pass"
+  ],
+  "spike-gc": [
+   "pass",
+   "pass",
+   "pass"
+  ]
+ },
+ "rows": [
+  {
+   "engine": "kernel",
+   "flow": "kernel",
+   "streams": 1,
+   "n": 27,
+   "median": 6083.52,
+   "min": 5607.01,
+   "max": 6334.76,
+   "ratio_to_nif": null
+  },
+  {
+   "engine": "kernel",
+   "flow": "kernel",
+   "streams": 4,
+   "n": 27,
+   "median": 18673.77,
+   "min": 14035.84,
+   "max": 20069.94,
+   "ratio_to_nif": null
+  },
+  {
+   "engine": "nif",
+   "flow": "receive",
+   "streams": 1,
+   "n": 9,
+   "median": 1198.37,
+   "min": 1167.75,
+   "max": 1425.01,
+   "ratio_to_nif": 1.0
+  },
+  {
+   "engine": "nif",
+   "flow": "receive",
+   "streams": 4,
+   "n": 9,
+   "median": 1211.9,
+   "min": 1157.67,
+   "max": 1333.84,
+   "ratio_to_nif": 1.0
+  },
+  {
+   "engine": "nif",
+   "flow": "send",
+   "streams": 1,
+   "n": 9,
+   "median": 2647.95,
+   "min": 2383.44,
+   "max": 2953.9,
+   "ratio_to_nif": 1.0
+  },
+  {
+   "engine": "nif",
+   "flow": "send",
+   "streams": 4,
+   "n": 9,
+   "median": 2933.72,
+   "min": 2562.63,
+   "max": 3253.76,
+   "ratio_to_nif": 1.0
+  },
+  {
+   "engine": "spike",
+   "flow": "receive",
+   "streams": 1,
+   "n": 9,
+   "median": 1434.52,
+   "min": 1419.35,
+   "max": 1484.09,
+   "ratio_to_nif": 1.1970593389353874
+  },
+  {
+   "engine": "spike",
+   "flow": "receive",
+   "streams": 4,
+   "n": 9,
+   "median": 1569.8,
+   "min": 1535.01,
+   "max": 1631.83,
+   "ratio_to_nif": 1.295321396154798
+  },
+  {
+   "engine": "spike",
+   "flow": "send",
+   "streams": 1,
+   "n": 9,
+   "median": 2913.82,
+   "min": 2878.66,
+   "max": 3081.04,
+   "ratio_to_nif": 1.100405974433052
+  },
+  {
+   "engine": "spike",
+   "flow": "send",
+   "streams": 4,
+   "n": 9,
+   "median": 2970.24,
+   "min": 2851.9,
+   "max": 3172.06,
+   "ratio_to_nif": 1.0124483590799394
+  },
+  {
+   "engine": "spike-gc",
+   "flow": "receive",
+   "streams": 1,
+   "n": 9,
+   "median": 1570.95,
+   "min": 1528.46,
+   "max": 1659.57,
+   "ratio_to_nif": 1.3109056468369538
+  },
+  {
+   "engine": "spike-gc",
+   "flow": "receive",
+   "streams": 4,
+   "n": 9,
+   "median": 1719.36,
+   "min": 1693.6,
+   "max": 1754.48,
+   "ratio_to_nif": 1.4187309183926065
+  },
+  {
+   "engine": "spike-gc",
+   "flow": "send",
+   "streams": 1,
+   "n": 9,
+   "median": 3463.68,
+   "min": 3392.55,
+   "max": 3567.25,
+   "ratio_to_nif": 1.308060952812553
+  },
+  {
+   "engine": "spike-gc",
+   "flow": "send",
+   "streams": 4,
+   "n": 9,
+   "median": 3715.37,
+   "min": 3414.12,
+   "max": 3940.34,
+   "ratio_to_nif": 1.26643646973808
+  }
+ ],
+ "cpu": {
+  "nif": [
+   [
+    27.92,
+    7.91,
+    32.37
+   ],
+   [
+    27.71,
+    7.52,
+    32.29
+   ],
+   [
+    27.57,
+    7.17,
+    32.22
+   ]
+  ],
+  "spike": [
+   [
+    25.05,
+    6.79,
+    30.24
+   ],
+   [
+    25.25,
+    6.69,
+    30.13
+   ],
+   [
+    25.25,
+    6.69,
+    30.17
+   ]
+  ],
+  "spike-gc": [
+   [
+    23.05,
+    6.48,
+    28.59
+   ],
+   [
+    23.06,
+    6.27,
+    28.82
+   ],
+   [
+    23.23,
+    6.24,
+    28.84
+   ]
+  ]
+ }
+}
