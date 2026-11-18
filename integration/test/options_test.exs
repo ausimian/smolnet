@@ -113,6 +113,13 @@ defmodule SmolNet.Integration.Soak.OptionsTest do
                Options.parse(~w(--egress-credit infinity), @config)
     end
 
+    test "selects the protocol engine, the NIF by default" do
+      assert {:ok, %{backend: :native}} = Options.parse([], @config)
+      assert {:ok, %{backend: :elixir}} = Options.parse(~w(--backend elixir), @config)
+      assert {:error, message} = Options.parse(~w(--backend rust), @config)
+      assert message =~ ~s(unknown backend "rust")
+    end
+
     test "returns the usage for --help" do
       assert {:help, usage} = Options.parse(~w(--help), @config)
       assert usage =~ "usage: mix run integration/example.exs"
