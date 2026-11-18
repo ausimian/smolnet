@@ -7,6 +7,8 @@ defmodule SmolNet.Core.Tcp.SeqTest do
 
   alias SmolNet.Core.Tcp.Seq
 
+  require SmolNet.Core.Tcp.Seq
+
   @top 0xFFFF_FFFF
 
   test "add and sub wrap at 2^32" do

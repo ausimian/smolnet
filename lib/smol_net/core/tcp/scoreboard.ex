@@ -9,6 +9,8 @@ defmodule SmolNet.Core.Tcp.Scoreboard do
 
   alias SmolNet.Core.Tcp.Seq
 
+  require SmolNet.Core.Tcp.Seq
+
   @size 32
   @dup_thresh 3
 

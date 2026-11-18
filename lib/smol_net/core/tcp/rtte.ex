@@ -12,6 +12,8 @@ defmodule SmolNet.Core.Tcp.Rtte do
 
   alias SmolNet.Core.Tcp.Seq
 
+  require SmolNet.Core.Tcp.Seq
+
   @initial_rto 1_000
   @min_margin 5
   @k 4

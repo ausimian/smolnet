@@ -19,6 +19,7 @@ defmodule SmolNet.Core.Tcp.Rack do
 
   alias SmolNet.Core.Tcp.Scoreboard
   alias SmolNet.Core.Tcp.Seq
+  require SmolNet.Core.Tcp.Seq
 
   @log_size 64
   @reo_wnd_persist 16

@@ -43,6 +43,7 @@ defmodule SmolNet.Core.Tcp.Connection do
   alias SmolNet.Core.Tcp.Scoreboard
   alias SmolNet.Core.Tcp.SendBuffer
   alias SmolNet.Core.Tcp.Seq
+  require SmolNet.Core.Tcp.Seq
   alias SmolNet.Core.Tcp.Timer
   alias SmolNet.Core.Wire.Tcp
 
@@ -1471,19 +1472,28 @@ defmodule SmolNet.Core.Tcp.Connection do
     end
   end
 
+  # The MSS is worked out only where it counts: in SACK recovery, and for
+  # Nagle's algorithm with data in flight.
   defp new_seq_to_transmit?(c, cx) do
-    effective_mss = effective_mss(c, cx, if(c.options.tsval_generator != nil, do: 12, else: 0))
     data_in_flight = c.remote_last_seq != c.local_seq_no
 
     cond do
       # A SYN not yet sent.
-      c.state in [:syn_sent, :syn_received] and not data_in_flight -> true
-      sack_retransmission(c, effective_mss) != nil -> true
-      true -> data_or_fin_to_transmit?(c, effective_mss, data_in_flight)
+      c.state in [:syn_sent, :syn_received] and not data_in_flight ->
+        true
+
+      in_sack_recovery?(c) and sack_retransmission(c, transmit_mss(c, cx)) != nil ->
+        true
+
+      true ->
+        data_or_fin_to_transmit?(c, cx, data_in_flight)
     end
   end
 
-  defp data_or_fin_to_transmit?(c, effective_mss, data_in_flight) do
+  defp transmit_mss(c, cx),
+    do: effective_mss(c, cx, if(c.options.tsval_generator != nil, do: 12, else: 0))
+
+  defp data_or_fin_to_transmit?(c, cx, data_in_flight) do
     tx_len = SendBuffer.len(c.tx_buffer)
     max_send_seq = Seq.add(c.local_seq_no, min(c.remote_win_len, tx_len))
 
@@ -1492,9 +1502,10 @@ defmodule SmolNet.Core.Tcp.Connection do
         do: Seq.diff(max_send_seq, c.remote_last_seq),
         else: 0
 
-    max_send = min(capped_send, cwnd_remaining(c))
+    # The window left is never negative, so nothing to send needs no look.
+    max_send = if capped_send == 0, do: 0, else: min(capped_send, cwnd_remaining(c))
     want_fin = c.state in [:fin_wait_1, :closing, :last_ack]
-    held = data_in_flight and not want_fin and nagle_holds?(c, max_send, effective_mss)
+    held = data_in_flight and not want_fin and nagle_holds?(c, max_send, cx)
     can_fin = want_fin and c.remote_last_seq == Seq.add(c.local_seq_no, tx_len)
     (max_send != 0 and not held) or can_fin
   end
@@ -1502,9 +1513,9 @@ defmodule SmolNet.Core.Tcp.Connection do
   # Nagle's algorithm in Minshall's variant, as Linux has it: a segment
   # short of a full MSS waits while another such is in flight, unless it
   # carries the last of the data.
-  defp nagle_holds?(c, max_send, effective_mss) do
+  defp nagle_holds?(c, max_send, cx) do
     c.options.nagle and c.nagle_small_segment_end != nil and
-      Seq.gt?(c.nagle_small_segment_end, c.local_seq_no) and max_send < effective_mss
+      Seq.gt?(c.nagle_small_segment_end, c.local_seq_no) and max_send < transmit_mss(c, cx)
   end
 
   defp delayed_ack_expired?(%__MODULE__{ack_delay_timer: {:waiting, at}}, now), do: at <= now
@@ -1530,11 +1541,13 @@ defmodule SmolNet.Core.Tcp.Connection do
        when state in [:syn_sent, :syn_received, :established, :fin_wait_1, :fin_wait_2] do
     case last_scaled_window(c) do
       nil -> false
-      last_win -> scaled_window(c) > 0 and div(scaled_window(c), 2) >= last_win
+      last_win -> window_doubled?(scaled_window(c), last_win)
     end
   end
 
   defp window_to_update?(_c), do: false
+
+  defp window_doubled?(window, last_win), do: window > 0 and div(window, 2) >= last_win
 
   @doc """
   Asks for one segment to send at `cx.now`. Returns `{:segment, out, c}`

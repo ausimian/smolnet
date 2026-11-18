@@ -1276,20 +1276,34 @@ defmodule SmolNet.Core.Tcp do
     end
   end
 
-  # Every connection, in the order its socket opened.
+  # Every connection, in the order its socket opened. Sockets, handshakes
+  # and closing connections take their numbers from one counter.
   defp connections(core) do
-    sockets =
-      for {id, %{kind: :tcp, state: %Record{conn: conn, listener: nil}}} <- core.sockets.entries,
-          Connection.remote_endpoint(conn) != nil or Connection.state(conn) != :closed,
-          do: {id, {:socket, id}}
+    sockets = :maps.fold(&socket_connection/3, [], core.sockets.entries)
 
-    embryos = for {key, embryo} <- core.tcp.embryos, do: {embryo.order, {:embryo, key}}
-    closing = for {id, _closing} <- core.tcp.closing, do: {id, {:closing, id}}
+    all =
+      sockets
+      |> maybe_add(core.tcp.embryos, fn key, embryo -> {embryo.order, {:embryo, key}} end)
+      |> maybe_add(core.tcp.closing, fn id, _closing -> {id, {:closing, id}} end)
 
-    (sockets ++ embryos ++ closing)
-    |> Enum.sort()
-    |> Enum.map(&elem(&1, 1))
+    strip_order(:lists.keysort(1, all), [])
   end
+
+  defp socket_connection(id, %{kind: :tcp, state: %Record{conn: conn, listener: nil}}, acc) do
+    if Connection.remote_endpoint(conn) != nil or Connection.state(conn) != :closed,
+      do: [{id, {:socket, id}} | acc],
+      else: acc
+  end
+
+  defp socket_connection(_id, _entry, acc), do: acc
+
+  defp maybe_add(list, map, _fun) when map_size(map) == 0, do: list
+
+  defp maybe_add(list, map, fun),
+    do: :maps.fold(fn key, value, acc -> [fun.(key, value) | acc] end, list, map)
+
+  defp strip_order([], refs), do: :lists.reverse(refs)
+  defp strip_order([{_order, ref} | rest], refs), do: strip_order(rest, [ref | refs])
 
   # Closing connections that have finished, or sent their RST, are gone.
   defp reap(%{tcp: %{closing: closing}} = core) when map_size(closing) == 0, do: core

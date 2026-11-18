@@ -169,6 +169,8 @@ defmodule SmolNet.Core.Tcp.RecvBuffer do
   defp queue_in(queue, <<>>), do: queue
   defp queue_in(queue, data), do: :queue.in(data, queue)
 
+  # One chunk is handed over as it is.
+  defp queue_take(queue, 0, [chunk]), do: {chunk, queue}
   defp queue_take(queue, 0, acc), do: {IO.iodata_to_binary(:lists.reverse(acc)), queue}
 
   defp queue_take(queue, size, acc) do
