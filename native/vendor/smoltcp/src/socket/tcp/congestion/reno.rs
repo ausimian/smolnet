@@ -111,6 +111,23 @@ impl Controller for Reno {
 }
 
 #[cfg(test)]
+impl Reno {
+    /// The state as JSON, for SmolNet's test vectors.
+    pub(crate) fn vector_json(&self) -> std::string::String {
+        use crate::socket::tcp::vectors::{bool, object, size, string};
+        object(&[
+            ("kind", string("reno")),
+            ("cwnd", size(self.cwnd)),
+            ("mss", size(self.mss)),
+            ("ssthresh", size(self.ssthresh)),
+            ("rwnd", size(self.rwnd)),
+            ("in_fast_recovery", bool(self.in_fast_recovery)),
+            ("in_rto_recovery", bool(self.in_rto_recovery)),
+        ])
+    }
+}
+
+#[cfg(test)]
 mod test {
     use crate::time::Instant;
 

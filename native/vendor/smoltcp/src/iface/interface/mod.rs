@@ -895,6 +895,12 @@ impl InterfaceInner {
 
     #[cfg(test)]
     #[allow(unused)] // unused depending on which sockets are enabled
+    pub(crate) fn ip_addrs(&self) -> &[IpCidr] {
+        &self.ip_addrs
+    }
+
+    #[cfg(test)]
+    #[allow(unused)] // unused depending on which sockets are enabled
     pub(crate) fn set_ip_addrs(&mut self, addrs: Vec<IpCidr, IFACE_MAX_ADDR_COUNT>) {
         self.ip_addrs = addrs;
     }

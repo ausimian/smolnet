@@ -645,6 +645,68 @@ impl Rack {
 }
 
 #[cfg(test)]
+impl Rack {
+    /// The state as JSON, for SmolNet's test vectors. Durations are in
+    /// microseconds, since RACK's are not always whole milliseconds.
+    pub(super) fn vector_json(&self) -> std::string::String {
+        use super::vectors::{array, bool, instant, object, option, seq, uint};
+        let micros = |d: Duration| uint(d.total_micros());
+        let log = &self.log;
+        let ranges = log.iter().map(|(start, sent)| {
+            object(&[
+                ("start", seq(start)),
+                ("end", seq(sent.end)),
+                ("at", instant(sent.at)),
+                ("retransmitted", bool(sent.retransmitted)),
+                ("lost", bool(sent.lost)),
+                ("doubled", bool(sent.doubled)),
+                ("first", uint(sent.first)),
+                ("last", uint(sent.last)),
+            ])
+        });
+        object(&[
+            (
+                "log",
+                object(&[
+                    ("start", seq(log.start)),
+                    ("ranges", array(ranges)),
+                    ("sends", uint(log.sends)),
+                ]),
+            ),
+            (
+                "xmit",
+                option(self.xmit, |x| {
+                    object(&[
+                        ("at", instant(x.at)),
+                        ("end", seq(x.end)),
+                        ("first", uint(x.first)),
+                        ("last", uint(x.last)),
+                    ])
+                }),
+            ),
+            ("rtt_us", micros(self.rtt)),
+            ("min_rtt_us", option(self.min_rtt, micros)),
+            ("reo_wnd_mult", uint(self.reo_wnd_mult.into())),
+            ("reo_wnd_persist", uint(self.reo_wnd_persist.into())),
+            ("dsack_round", option(self.dsack_round, seq)),
+            ("reo_timeout", option(self.reo_timeout, instant)),
+            ("probe_at", option(self.probe_at, instant)),
+            ("probe_pending", bool(self.probe_pending)),
+            (
+                "probe",
+                option(self.probe, |p| {
+                    object(&[
+                        ("end", seq(p.end)),
+                        ("retransmitted", bool(p.retransmitted)),
+                        ("dsacked", bool(p.dsacked)),
+                    ])
+                }),
+            ),
+        ])
+    }
+}
+
+#[cfg(test)]
 mod test {
     use super::*;
 

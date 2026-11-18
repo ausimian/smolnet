@@ -60,6 +60,7 @@ defmodule SmolNet.MixProject do
         "cmd cargo clippy --manifest-path native/Cargo.toml --workspace --all-targets -- -D warnings",
         "cmd cargo test --manifest-path native/Cargo.toml --workspace",
         "cmd cargo test --manifest-path native/vendor/smoltcp/Cargo.toml --lib --features socket-tcp-cubic --target-dir native/target/vendor",
+        "cmd elixir scripts/tcp_vectors.exs --check",
         "cmd cargo check --manifest-path native/fuzz/Cargo.toml --all-targets --locked",
         "run scripts/nif_budget.exs",
         "run examples/quickstart.exs",

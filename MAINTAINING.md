@@ -150,7 +150,11 @@ SmolNet changes. Keep any further patch small, covered by tests in the
 vendored crate, and suitable for offering upstream.
 
 `mix precommit` runs the vendored crate's library tests, with the CUBIC
-controller SmolNet enables, so that its tests run too. To run them alone:
+controller SmolNet enables, so that its tests run too. The TCP socket
+tests' harness also records each test as a test vector when
+`SMOLTCP_VECTOR_DIR` is set (`src/socket/tcp/vectors.rs`, test-only), and
+precommit checks that the committed vectors are current; see
+[Conformance assets](#conformance-assets). To run the tests alone:
 
 ```console
 cargo test --manifest-path native/vendor/smoltcp/Cargo.toml --lib --features socket-tcp-cubic --target-dir native/target/vendor
@@ -164,6 +168,19 @@ crates.io package from `~/.cargo/registry/src`, omitting `.cargo-ok` and
 `Cargo.lock`, and commit that on its own. Then reapply the patch, update the
 pinned version, and run `cargo update -p smoltcp` in both `native/` and
 `native/fuzz/`.
+
+## Conformance assets
+
+`test/conformance/` holds what the pure-Elixir engine (#173) is checked
+against after the NIF and the vendored smoltcp are deleted, generated from
+them while they exist. Its README documents each asset, its format and how
+to regenerate it:
+
+- `tcp_vectors/`: smoltcp's 238 TCP socket tests as JSON vectors, from
+  `elixir scripts/tcp_vectors.exs`, replayed by
+  `SmolNet.Conformance.TcpReplay`. `mix precommit` fails when they are
+  stale, so a change to the vendored TCP code or its tests is committed with
+  regenerated vectors.
 
 ## Fixed TCP timers, and the test-only override
 
