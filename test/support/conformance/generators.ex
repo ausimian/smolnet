@@ -118,7 +118,8 @@ defmodule SmolNet.Conformance.Generators do
        map(tuple({integer(0..1_000), integer(0..255)}), fn {at, byte} ->
          fn packet ->
            at = rem(at, byte_size(packet))
-           <<head::binary-size(at), _old, tail::binary>> = packet
+           head = binary_part(packet, 0, at)
+           tail = binary_part(packet, at + 1, byte_size(packet) - at - 1)
            <<head::binary, byte, tail::binary>>
          end
        end)}

@@ -229,11 +229,11 @@ defmodule SmolNet.Conformance.DifferentialTest do
   end
 
   defp syn(<<4::4, ihl::4, _rest::binary>> = packet), do: tcp_syn(packet, ihl * 4)
-  defp syn(<<6::4, _rest::binary>> = packet), do: tcp_syn(packet, 40)
+  defp syn(<<6::4, _rest::bitstring>> = packet), do: tcp_syn(packet, 40)
 
   defp tcp_syn(packet, header) do
-    <<_ip::binary-size(header), _ports::32, seq::32, _ack::32, _offset::4, _::4, flags,
-      _rest::binary>> = packet
+    <<_ports::32, seq::32, _ack::32, _offset::4, _::4, flags, _rest::binary>> =
+      binary_part(packet, header, byte_size(packet) - header)
 
     case Bitwise.band(flags, 0x12) do
       0x02 -> {seq, :syn}
