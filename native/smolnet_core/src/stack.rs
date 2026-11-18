@@ -146,6 +146,7 @@ pub struct NativeStack {
     scheduled_poll_at: Option<Instant>,
     next_ephemeral_port: u16,
     next_udp_ephemeral_port: u16,
+    timestamp_origin: Option<u32>,
     listener_scan_cursor: Option<ListenerMemberKey>,
     listener_scan_pending: bool,
     listener_scan_resweep: bool,
@@ -182,9 +183,14 @@ impl NativeStack {
             limits.input_packets,
             stack_config.egress_credit,
         );
+        let ephemeral_port_start = stack_config
+            .ephemeral_port_start
+            .unwrap_or(tcp_support::EPHEMERAL_PORT_FIRST);
         let mut interface_config = Config::new(HardwareAddress::Ip);
-        interface_config.random_seed = NEXT_STACK_ID.fetch_add(1, Ordering::Relaxed);
-        let id = interface_config.random_seed;
+        let id = NEXT_STACK_ID.fetch_add(1, Ordering::Relaxed);
+        // The seed draws the IPv4 identification start and then every initial
+        // sequence number, so a fixed one fixes both.
+        interface_config.random_seed = stack_config.random_seed.unwrap_or(id);
         let mut interface = Interface::new(interface_config, &mut device, now);
 
         interface.update_ip_addrs(|addresses| {
@@ -221,8 +227,9 @@ impl NativeStack {
             closing_cleanup_resweep: false,
             maintenance_cleanup_turn: false,
             scheduled_poll_at: None,
-            next_ephemeral_port: tcp_support::EPHEMERAL_PORT_FIRST,
-            next_udp_ephemeral_port: tcp_support::EPHEMERAL_PORT_FIRST,
+            next_ephemeral_port: ephemeral_port_start,
+            next_udp_ephemeral_port: ephemeral_port_start,
+            timestamp_origin: stack_config.timestamp_origin,
             listener_scan_cursor: None,
             listener_scan_pending: false,
             listener_scan_resweep: false,
@@ -3396,6 +3403,7 @@ impl NativeStack {
             self.retarget_wildcard_listener(packet);
             let reset = self.inbound_reset(packet);
             let mut device = ReceiveOne::new(&mut self.device, packet);
+            let _clock = tcp_support::TsvalClock::enter(self.timestamp_origin, now);
             let _ = self
                 .interface
                 .poll_ingress_single(now, &mut device, &mut self.sockets);
@@ -3495,6 +3503,8 @@ impl NativeStack {
 
             maintenance_work += 1;
             egress_attempted = true;
+
+            let _clock = tcp_support::TsvalClock::enter(self.timestamp_origin, now);
 
             match self
                 .interface
@@ -3717,6 +3727,9 @@ pub(crate) fn fuzz_config_and_endpoints(data: &[u8]) {
         }],
         egress_credit: None,
         tcp_timers: TcpTimers::default(),
+        random_seed: None,
+        timestamp_origin: None,
+        ephemeral_port_start: None,
     };
     let _stack_result = NativeStack::new(limits, config, Instant::ZERO);
 
@@ -3840,6 +3853,9 @@ fn fuzz_stack_config() -> StackConfig {
         ],
         egress_credit: None,
         tcp_timers: TcpTimers::default(),
+        random_seed: None,
+        timestamp_origin: None,
+        ephemeral_port_start: None,
     }
 }
 
@@ -4187,6 +4203,12 @@ pub struct StackConfig {
     routes: Vec<RouteConfig>,
     egress_credit: Option<EgressCredit>,
     tcp_timers: TcpTimers,
+    // Determinism hooks, absent unless a test sets them: the interface's
+    // random seed (initial sequence numbers), the origin of the TCP
+    // timestamp clock, and the first ephemeral port tried.
+    random_seed: Option<u64>,
+    timestamp_origin: Option<u32>,
+    ephemeral_port_start: Option<u16>,
 }
 
 impl<'a> Decoder<'a> for StackConfig {
@@ -4208,7 +4230,18 @@ impl<'a> Decoder<'a> for StackConfig {
             routes: decode_bounded_list(term.map_get(crate::atoms::routes())?, 4)?,
             egress_credit,
             tcp_timers,
+            random_seed: decode_optional(term, crate::atoms::random_seed())?,
+            timestamp_origin: decode_optional(term, crate::atoms::timestamp_origin())?,
+            ephemeral_port_start: decode_optional(term, crate::atoms::ephemeral_port_start())?,
         })
+    }
+}
+
+/// An optional configuration key: absent or nil is `None`.
+fn decode_optional<'a, T: Decoder<'a>>(term: Term<'a>, key: rustler::Atom) -> NifResult<Option<T>> {
+    match term.map_get(key) {
+        Ok(value) => value.decode(),
+        Err(_) => Ok(None),
     }
 }
 
@@ -4221,6 +4254,10 @@ impl StackConfig {
             || self.addresses.iter().any(|address| !address.valid())
             || self.routes.iter().any(|route| !route.valid())
             || !self.tcp_timers.valid()
+            || self.ephemeral_port_start.is_some_and(|port| {
+                !(tcp_support::EPHEMERAL_PORT_FIRST..=tcp_support::EPHEMERAL_PORT_LAST)
+                    .contains(&port)
+            })
         {
             return Err(StackError::InvalidStackConfig);
         }
@@ -4660,6 +4697,9 @@ mod tests {
             routes: Vec::new(),
             egress_credit: None,
             tcp_timers: TcpTimers::default(),
+            random_seed: None,
+            timestamp_origin: None,
+            ephemeral_port_start: None,
         }
     }
 
