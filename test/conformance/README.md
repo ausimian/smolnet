@@ -160,7 +160,17 @@ MIX_ENV=test mix run scripts/backend_traces.exs
 ```
 
 The scenarios are in `SmolNet.Conformance.Scenarios`: six 32 KiB transfers
-through the link simulator (below), clean and impaired, over IPv4 and IPv6,
+through the link simulator (below), clean and impaired, over IPv4 and IPv6;
+seven aimed at one loss-recovery path each, most by losing chosen packets
+(`Scenarios.losses/3`): `tcp_newreno_inet` (no SACK: limited transmit, fast
+retransmit and a resend per partial ACK), `tcp_tail_loss_inet6` (RACK-TLP's
+loss probe), `tcp_rto_backoff_inet` (the retransmission timer firing four
+times, its timeout doubling each time), `tcp_cubic_inet` (CUBIC's window
+falling at three losses, several 50 ms round trips apart, and growing
+between them), `tcp_dsack_inet6` (D-SACK blocks for duplicates),
+`tcp_lossy_probe_inet6` (a resent loss probe that repairs a loss) and
+`tcp_small_window_inet` (the server sending into a 2 KiB window with the
+client's smaller MSS); then
 `ingress_replies`, the packets a stack answers by itself (echo, Port and
 Protocol Unreachable, Parameter Problem, a RST for a closed port, an IPv4
 fragment, a datagram for a bound socket), and `stack_replies`, the same for
@@ -232,18 +242,26 @@ in the order they open. `SmolNet.Conformance.Pcg32` is that generator, and
 `SmolNet.Conformance.LinkSim` joins two stacks' backends by a simulated
 link that loses, duplicates, delays and reorders packets, as a pure fold in
 virtual time: no processes and no clock, so a run is a function of its
-options and takes a millisecond or so. A client connects, sends a stream
-and closes; the server reads to the end and closes. The run reports
-integrity (the server read exactly what was sent), liveness (it finished
-before a virtual deadline, or which call failed), and returns every call
-both backends saw, which is how the traces above are made.
+options and takes a millisecond or so. A client connects; one end, the
+client unless `sender: :server`, sends a stream and closes, and the other
+reads to the end and closes. The run reports integrity (the receiver read
+exactly what was sent), liveness (it finished before a virtual deadline, or
+which call failed), and returns every call both backends saw, which is how
+the traces above are made. Each end can have a backend of its own
+(`backend: {client, server}`), an MTU of its own (`mtu: {client, server}`,
+so an MSS of its own) and its socket buffers (`buffer`); the link can lose
+chosen packets (`drop`) besides those its profile draws, and take
+SACK-permitted out of the client's SYN (`strip_sack`), so neither end uses
+SACK; and `snapshot: true` adds both stacks' snapshots when the receiver
+closes and at the end.
 
 Time moves to the next packet's arrival or the next poll deadline. A stack
 polled at a time that names the same time again is next polled a
 millisecond on, as the shell's timer would fire as the clock moved.
 
 The simulator found #177: a lost FIN is never resent once a third
-duplicate ACK arrives after it.
+duplicate ACK arrives after it; and #189: a zero window taken from a late
+ACK, with data in flight, stops the sender until its user timeout.
 
 ## Properties
 
@@ -262,6 +280,19 @@ targets, at the backend boundary so that they hold for any backend:
   random calls and datagrams from `SmolNet.Conformance.UdpCalls`: the same
   results, packets, wakes and aborts, and the same socket and waiter
   counts. The `udp_sockets` trace keeps it.
+- `link_differential_test.exs` (`:nif`): the Elixir backend against the
+  NIF under impairment. One seeded transfer from
+  `SmolNet.Conformance.LinkDifferential` (either end sending, IPv4 or
+  IPv6, a byte to 384 KiB, MTUs from 1280 to 9000 chosen apart for each
+  end, buffers from 2 KiB to 256 KiB, loss up to 40%, duplication,
+  reordering, delays up to 300 ms and jitter in any combination, bursts of
+  one end's packets lost, SACK sometimes taken out) runs NIF to NIF, Elixir
+  to Elixir and both mixed ways, and all four must give the same calls,
+  results, packets byte for byte, wakes and aborts, deadlines and outcome,
+  and the same snapshots on the keys every backend fills. A departure is
+  reported where it starts, with the first call the Elixir backend makes
+  otherwise replaying the NIF's run. `SMOLNET_DIFFERENTIAL_RUNS` sets the
+  number of transfers (30 by default).
 - `differential_test.exs`: over random links the simulator delivers the
   stream intact and finishes, and the initial sequence numbers follow the
   PCG for random seeds. Until #177 is fixed, a close that stalls on its

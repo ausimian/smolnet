@@ -87,6 +87,7 @@ defmodule SmolNet.Conformance.Driver do
     :timer,
     :key,
     version: 0,
+    continuations: 0,
     sockets: %{},
     socket_labels: %{},
     refs: %{},
@@ -170,6 +171,13 @@ defmodule SmolNet.Conformance.Driver do
   @doc "When the shell would next poll the stack, or nil."
   def timer(driver), do: driver.timer
 
+  @doc """
+  The continuation polls the driver has made, which a backend counts
+  among its calls but no entry records.
+  """
+  @spec continuations(t()) :: non_neg_integer()
+  def continuations(driver), do: driver.continuations
+
   defp backend_args(driver, spec, args, now) do
     {backend_args, []} =
       Enum.map_reduce(spec, args, fn
@@ -232,7 +240,7 @@ defmodule SmolNet.Conformance.Driver do
   defp drain(driver, {:ok, %{more: true} = envelope}, now, effects, polls)
        when polls < @max_polls do
     {poll_reply, state, poll_effects} = driver.backend.stack_poll(checked_state(driver), now)
-    driver = advance(driver, state)
+    driver = %{advance(driver, state) | continuations: driver.continuations + 1}
 
     case poll_reply do
       {:ok, %{more: more, poll_at: poll_at}} ->
