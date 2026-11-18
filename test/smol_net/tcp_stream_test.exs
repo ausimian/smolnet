@@ -3,9 +3,11 @@ defmodule SmolNet.TcpStreamTest do
 
   alias SmolNet.Native
   alias SmolNet.Socket
+  alias SmolNet.Stack
   alias SmolNet.Stack.Ref
   alias SmolNet.Test.IPv6TcpPeer
   alias SmolNet.Test.ManualClock
+  alias SmolNet.Test.Snapshot
   alias SmolNet.Test.Timing
 
   import Bitwise
@@ -158,7 +160,7 @@ defmodule SmolNet.TcpStreamTest do
   test "waiter exhaustion never consumes send or receive bytes" do
     {stack, peer, socket} = connected_socket(sndbuf: 4_096)
     %{stack: stack_pid} = Ref.pids(stack)
-    %{native: native} = :sys.get_state(stack_pid)
+    {SmolNet.Stack.Backend.Native, native} = Stack.backend_state(stack_pid)
     assert {:ok, %{result: :ok}} = Native.test_set_waiter_capacity(native, 1)
     assert {:select, read_select} = SmolNet.recv(socket, 1, :nowait)
     assert :ok = IPv6TcpPeer.hold_acks(peer, true)
@@ -348,7 +350,8 @@ defmodule SmolNet.TcpStreamTest do
       {:ok, info} = SmolNet.stack_info(stack)
 
       info.native.result.closing_tcp_socket_count == 0 and
-        info.native.result.native_socket_count == 0
+        info.native.result.socket_count == 0 and
+        Snapshot.nif(info, &(&1.native_socket_count == 0))
     end)
   end
 
@@ -409,7 +412,8 @@ defmodule SmolNet.TcpStreamTest do
       {:ok, info} = SmolNet.stack_info(stack)
 
       info.native.result.closing_tcp_socket_count == 0 and
-        info.native.result.native_socket_count == 0
+        info.native.result.socket_count == 0 and
+        Snapshot.nif(info, &(&1.native_socket_count == 0))
     end)
 
     refute Enum.any?(IPv6TcpPeer.stats(peer).packets, &flag?(&1.flags, 0x04))
@@ -433,7 +437,8 @@ defmodule SmolNet.TcpStreamTest do
       {:ok, info} = SmolNet.stack_info(stack)
 
       info.native.result.closing_tcp_socket_count == 0 and
-        info.native.result.native_socket_count == 0
+        info.native.result.socket_count == 0 and
+        Snapshot.nif(info, &(&1.native_socket_count == 0))
     end)
 
     assert Enum.any?(IPv6TcpPeer.stats(peer).packets, &flag?(&1.flags, 0x04))
@@ -484,7 +489,8 @@ defmodule SmolNet.TcpStreamTest do
       {:ok, info} = SmolNet.stack_info(stack)
 
       info.native.result.closing_tcp_socket_count == 0 and
-        info.native.result.native_socket_count == 1
+        info.native.result.socket_count == 1 and
+        Snapshot.nif(info, &(&1.native_socket_count == 1))
     end)
 
     assert :ok = SmolNet.cancel(busy_socket, busy_select)
@@ -529,7 +535,8 @@ defmodule SmolNet.TcpStreamTest do
       {:ok, info} = SmolNet.stack_info(stack)
 
       info.native.result.closing_tcp_socket_count == 0 and
-        info.native.result.native_socket_count == 0
+        info.native.result.socket_count == 0 and
+        Snapshot.nif(info, &(&1.native_socket_count == 0))
     end)
   end
 

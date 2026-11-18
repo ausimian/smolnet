@@ -199,7 +199,7 @@ defmodule SmolNet.SocketReadinessTest do
       end)
 
     %{stack: stack_pid} = Ref.pids(stack)
-    %{native: native} = :sys.get_state(stack_pid)
+    {SmolNet.Stack.Backend.Native, native} = Stack.backend_state(stack_pid)
     assert {:ok, %{result: :ok}} = Native.test_set_budget_checkpoints(native, 1)
 
     assert :ok = GenServer.stop(stack_pid, :normal)

@@ -5,6 +5,7 @@ defmodule SmolNet.TcpListenerTest do
   alias SmolNet.Stack
   alias SmolNet.Test.IPv6Link
   alias SmolNet.Test.ManualClock
+  alias SmolNet.Test.Snapshot
 
   @server {0xFD00, 0, 0, 0, 0, 0, 0, 1}
   @client {0xFD00, 0, 0, 0, 0, 0, 0, 2}
@@ -24,11 +25,13 @@ defmodule SmolNet.TcpListenerTest do
     {server_stack, client_stack} = linked_stacks()
     listener = listener(server_stack, 4)
 
-    assert {:ok, %{native: %{result: native}}} = SmolNet.stack_info(server_stack)
+    assert {:ok, %{native: %{result: native}} = info} = SmolNet.stack_info(server_stack)
     assert native.tcp_listener_count == 1
-    assert native.listener_pool_socket_count == 4
-    assert native.listener_pool_target_count == 4
-    assert native.listener_backlog_capacity == 4
+
+    assert Snapshot.nif(info, fn native ->
+             native.listener_pool_socket_count == 4 and native.listener_pool_target_count == 4 and
+               native.listener_backlog_capacity == 4
+           end)
 
     assert {:select, select_info} = SmolNet.accept(listener, :nowait)
     assert {:select_info, :accept, _reference} = select_info
@@ -91,6 +94,7 @@ defmodule SmolNet.TcpListenerTest do
     end)
   end
 
+  @tag :nif
   test "listener scanning and replenishment obey a one-unit maintenance budget" do
     {server_stack, client_stack} = linked_stacks(limits: %{maintenance_work: 1})
     listener = listener(server_stack, 4, 40_007)
@@ -125,7 +129,7 @@ defmodule SmolNet.TcpListenerTest do
     assert_eventually(fn ->
       {:ok, info} = SmolNet.stack_info(server_stack)
       native = info.native.result
-      native.socket_count == 0 and native.native_socket_count == 0
+      native.socket_count == 0 and Snapshot.nif(info, &(&1.native_socket_count == 0))
     end)
   end
 
@@ -158,7 +162,7 @@ defmodule SmolNet.TcpListenerTest do
     assert_eventually(fn ->
       {:ok, info} = SmolNet.stack_info(server_stack)
       native = info.native.result
-      native.socket_count == 0 and native.native_socket_count == 0
+      native.socket_count == 0 and Snapshot.nif(info, &(&1.native_socket_count == 0))
     end)
   end
 
@@ -192,11 +196,14 @@ defmodule SmolNet.TcpListenerTest do
 
     :ok = ManualClock.advance(clock, 30_001)
 
+    # Only the NIF reports the expiry, as a refilled pool slot. No kept key
+    # shows it, so on another backend this waits for nothing.
     assert_eventually(fn ->
       {:ok, info} = SmolNet.stack_info(server_stack)
-      native = info.native.result
 
-      native.listener_pool_socket_count == 1 and native.counters.listener_refills >= 1
+      Snapshot.nif(info, fn native ->
+        native.listener_pool_socket_count == 1 and native.counters.listener_refills >= 1
+      end)
     end)
 
     :ok = IPv6Link.release(server_link)
@@ -228,7 +235,9 @@ defmodule SmolNet.TcpListenerTest do
     assert_eventually(fn ->
       {:ok, info} = SmolNet.stack_info(server_stack)
       native = info.native.result
-      native.tcp_listener_count == 0 and native.listener_pool_socket_count == 0
+
+      native.tcp_listener_count == 0 and
+        Snapshot.nif(info, &(&1.listener_pool_socket_count == 0))
     end)
   end
 
@@ -274,14 +283,10 @@ defmodule SmolNet.TcpListenerTest do
     end)
 
     assert {:ok, child} = Stack.socket_accept(listener, self())
-    stack_state = :sys.get_state(server_stack.stack)
-    assert map_size(stack_state.socket_owner_monitors) == 1
-    assert map_size(stack_state.socket_owner_monitors_by_identity) == 1
+    assert Stack.owner_monitor_counts(server_stack.stack) == %{by_monitor: 1, by_identity: 1}
 
     assert :ok = SmolNet.close(child)
-    stack_state = :sys.get_state(server_stack.stack)
-    assert stack_state.socket_owner_monitors == %{}
-    assert stack_state.socket_owner_monitors_by_identity == %{}
+    assert Stack.owner_monitor_counts(server_stack.stack) == %{by_monitor: 0, by_identity: 0}
   end
 
   test "backlog saturation is bounded and drops the newest established child" do
@@ -297,7 +302,7 @@ defmodule SmolNet.TcpListenerTest do
 
       native.accepted_queue_count == 1 and
         native.counters.listener_overflow_drops >= 1 and
-        native.listener_pool_socket_count == 1
+        Snapshot.nif(info, &(&1.listener_pool_socket_count == 1))
     end)
 
     assert :ok = SmolNet.send(second, "dropped", 1_000)
@@ -318,7 +323,7 @@ defmodule SmolNet.TcpListenerTest do
       native = info.native.result
 
       native.socket_count == 1 and native.accepted_queue_count == 0 and
-        native.listener_pool_socket_count == 1 and
+        Snapshot.nif(info, &(&1.listener_pool_socket_count == 1)) and
         native.counters.listener_overflow_drops >= 1
     end)
 

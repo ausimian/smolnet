@@ -41,7 +41,7 @@ defmodule SmolNet.StackSupervisor do
 
       child_options =
         config
-        |> Map.take([:egress, :link_down, :limits, :native_config])
+        |> Map.take([:egress, :link_down, :limits, :native_config, :backend])
         |> Map.to_list()
         |> Keyword.merge(
           starter: self(),
