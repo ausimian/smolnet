@@ -2,25 +2,31 @@ defmodule SmolNet.Core.Tcp.SendBuffer do
   @moduledoc false
 
   # A TCP send buffer with smoltcp's `RingBuffer` accounting, holding the
-  # binaries written rather than copying their octets into a ring: a queue
-  # of binaries, `len` octets in all, from the oldest unacknowledged octet.
+  # binaries written rather than copying their octets into a ring: `len`
+  # octets in all, from the oldest unacknowledged octet, which lies at
+  # `start` in the stream of everything ever written. The binaries are in
+  # a tree keyed by where each starts in that stream, negated, so that the
+  # one holding any octet is the first at or after its negated position,
+  # and a slice from anywhere in the buffer is found without walking the
+  # ones before it.
   #
   # `read_at` is where smoltcp's ring would hold that octet. A segment is
   # cut where the ring's storage wraps, as `RingBuffer::get_allocated`
   # cuts it, so the segments sent match smoltcp's however long the
   # connection runs; that is all it is for.
 
-  defstruct capacity: 0, len: 0, read_at: 0, queue: nil
+  defstruct capacity: 0, len: 0, read_at: 0, start: 0, chunks: nil
 
   @type t :: %__MODULE__{
           capacity: non_neg_integer(),
           len: non_neg_integer(),
           read_at: non_neg_integer(),
-          queue: :queue.queue(binary())
+          start: non_neg_integer(),
+          chunks: :gb_trees.tree(non_neg_integer(), binary())
         }
 
   @spec new(non_neg_integer()) :: t()
-  def new(capacity), do: %__MODULE__{capacity: capacity, queue: :queue.new()}
+  def new(capacity), do: %__MODULE__{capacity: capacity, chunks: :gb_trees.empty()}
 
   @spec clear(t()) :: t()
   def clear(buffer), do: new(buffer.capacity)
@@ -48,9 +54,8 @@ defmodule SmolNet.Core.Tcp.SendBuffer do
       {0, %{buffer | read_at: read_at}}
     else
       chunk = if size == byte_size(data), do: data, else: binary_part(data, 0, size)
-
-      {size,
-       %{buffer | len: buffer.len + size, read_at: read_at, queue: :queue.in(chunk, buffer.queue)}}
+      chunks = :gb_trees.insert(-(buffer.start + buffer.len), chunk, buffer.chunks)
+      {size, %{buffer | len: buffer.len + size, read_at: read_at, chunks: chunks}}
     end
   end
 
@@ -60,25 +65,25 @@ defmodule SmolNet.Core.Tcp.SendBuffer do
 
   def dequeue(buffer, count) do
     true = count <= buffer.len
-    queue = drop(buffer.queue, count)
 
     %{
       buffer
       | len: buffer.len - count,
-        queue: queue,
+        start: buffer.start + count,
+        chunks: drop(buffer.chunks, count),
         read_at: rem(buffer.read_at + count, buffer.capacity)
     }
   end
 
-  defp drop(queue, 0), do: queue
+  defp drop(chunks, 0), do: chunks
 
-  defp drop(queue, count) do
-    {{:value, chunk}, rest} = :queue.out(queue)
+  defp drop(chunks, count) do
+    {key, chunk, rest} = :gb_trees.take_largest(chunks)
     size = byte_size(chunk)
 
     if size <= count,
       do: drop(rest, count - size),
-      else: :queue.in_r(binary_part(chunk, count, size - count), rest)
+      else: :gb_trees.insert(key - count, binary_part(chunk, count, size - count), rest)
   end
 
   @doc """
@@ -92,35 +97,37 @@ defmodule SmolNet.Core.Tcp.SendBuffer do
     else
       start_at = rem(buffer.read_at + offset, buffer.capacity)
       size = size |> Kernel.min(buffer.len - offset) |> Kernel.min(buffer.capacity - start_at)
-      slice(:queue.to_list(buffer.queue), offset, size)
+      slice(buffer.chunks, buffer.start + offset, size)
     end
   end
 
-  defp slice(_chunks, _offset, 0), do: <<>>
+  defp slice(_chunks, _at, 0), do: <<>>
 
-  defp slice([chunk | rest], offset, size) do
-    chunk_size = byte_size(chunk)
+  # The chunk holding octet `at` is the last to start at or before it.
+  defp slice(chunks, at, size) do
+    {key, chunk, _iterator} = :gb_trees.next(:gb_trees.iterator_from(-at, chunks))
+    chunk_at = -key
+    offset = at - chunk_at
 
-    cond do
-      offset >= chunk_size ->
-        slice(rest, offset - chunk_size, size)
-
-      offset + size <= chunk_size ->
-        binary_part(chunk, offset, size)
-
-      true ->
-        IO.iodata_to_binary(collect([chunk | rest], offset, size, []))
-    end
+    if offset + size <= byte_size(chunk),
+      do: binary_part(chunk, offset, size),
+      else: IO.iodata_to_binary(collect(chunks, chunk_at, chunk, offset, size))
   end
 
-  defp collect(_chunks, _offset, 0, acc), do: :lists.reverse(acc)
-
-  defp collect([chunk | rest], offset, size, acc) do
+  # The chunks after one are found where it ends.
+  defp collect(chunks, chunk_at, chunk, offset, size) do
     take = Kernel.min(byte_size(chunk) - offset, size)
-    collect(rest, 0, size - take, [binary_part(chunk, offset, take) | acc])
+    part = binary_part(chunk, offset, take)
+
+    if take == size do
+      [part]
+    else
+      next_at = chunk_at + byte_size(chunk)
+      [part | collect(chunks, next_at, :gb_trees.get(-next_at, chunks), 0, size - take)]
+    end
   end
 
   @doc "Everything held, in order."
   @spec data(t()) :: binary()
-  def data(buffer), do: IO.iodata_to_binary(:queue.to_list(buffer.queue))
+  def data(buffer), do: IO.iodata_to_binary(:lists.reverse(:gb_trees.values(buffer.chunks)))
 end
