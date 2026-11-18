@@ -39,7 +39,7 @@ defmodule SmolNet.Conformance.DifferentialTest do
   end
 
   describe "the committed traces" do
-    test "cover transfers under every impairment, and the stack's own replies" do
+    test "cover transfers under every impairment, the stack's own replies and UDP" do
       assert Enum.map(Trace.all(), & &1.name) == [
                "ingress_replies",
                "stack_replies",
@@ -48,7 +48,8 @@ defmodule SmolNet.Conformance.DifferentialTest do
                "tcp_duplicate_inet",
                "tcp_impaired_inet",
                "tcp_loss_inet",
-               "tcp_reorder_inet6"
+               "tcp_reorder_inet6",
+               "udp_sockets"
              ]
     end
 
@@ -64,7 +65,8 @@ defmodule SmolNet.Conformance.DifferentialTest do
           {"tcp_duplicate_inet", 6},
           {"tcp_impaired_inet", 6},
           {"tcp_loss_inet", 6},
-          {"tcp_reorder_inet6", 6}
+          {"tcp_reorder_inet6", 6},
+          {"udp_sockets", nil}
         ] do
       if phase, do: @tag(:"elixir_phase_#{phase}")
 

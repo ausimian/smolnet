@@ -162,7 +162,11 @@ a stack with no sockets over the IP layer's corners: broadcast and multicast
 destinations, source address selection, Hop-by-Hop options, quotes
 truncated to the minimum MTU, path MTU errors, then 300 packets from
 `SmolNet.Conformance.StackPackets` with a fixed seed. `stack_replies` needs
-no socket, so it is phase 3's differential target. `differential_test.exs` replays
+no socket, so it is phase 3's differential target. `udp_sockets` is UDP
+socket calls and datagrams from `SmolNet.Conformance.UdpCalls`, each
+sequence on a stack of its own: named ones for waiters, cancel, wildcard
+rings and shutdown, then 30 random ones with a fixed seed; it is phase 4's.
+`differential_test.exs` replays
 every committed trace on the suite's backend: on the NIF it fails when the
 NIF's behaviour changes until the traces are recorded again and committed,
 and on any other backend it is the comparison itself.
@@ -248,6 +252,10 @@ targets, at the backend boundary so that they hold for any backend:
   the same random packets from `SmolNet.Conformance.StackPackets`, give the
   same results, the same replies byte for byte, and the same counters. What
   it finds is kept in the `stack_replies` trace, which outlives the NIF.
+- `udp_sockets_test.exs` (`:nif`): the same for UDP sockets, fed the same
+  random calls and datagrams from `SmolNet.Conformance.UdpCalls`: the same
+  results, packets, wakes and aborts, and the same socket and waiter
+  counts. The `udp_sockets` trace keeps it.
 - `differential_test.exs`: over random links the simulator delivers the
   stream intact and finishes, and the initial sequence numbers follow the
   PCG for random seeds. Until #177 is fixed, a close that stalls on its
