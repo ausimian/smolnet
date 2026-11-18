@@ -9,19 +9,22 @@ defmodule SmolNet.Core do
   # time the core needs a call is `deadline/1`, a value rather than an
   # effect.
   #
-  # The core is the IP layer, the socket table and UDP: it validates
+  # The core is the IP layer, the socket table, UDP and TCP: it validates
   # ingress as the NIF does, answers what an interface answers by itself
   # (echo, Port and Protocol Unreachable, Parameter Problem, RST for a
   # segment no socket takes), hands datagrams to UDP sockets
-  # (`SmolNet.Core.Udp`, over `SmolNet.Core.Sockets`), counts ICMP errors
-  # that report a path MTU, keeps the stack's lifecycle and its counters,
-  # and describes itself in the NIF's snapshot shape. Wakes and aborts for
-  # socket waiters are `{:wake, ...}` and `{:abort, ...}` effects. TCP comes
-  # in a later phase of #173; until then every segment is answered with a
-  # RST and TCP socket operations reply `{:error, :not_implemented}`.
+  # (`SmolNet.Core.Udp`) and segments to TCP connections
+  # (`SmolNet.Core.Tcp`), both over `SmolNet.Core.Sockets`, counts ICMP
+  # errors that report a path MTU, keeps the stack's lifecycle and its
+  # counters, and describes itself in the NIF's snapshot shape. Wakes and
+  # aborts for socket waiters are `{:wake, ...}` and `{:abort, ...}`
+  # effects. A call that drives the stack, as the NIF drives smoltcp after
+  # it, has every TCP connection send what it has, and reports the next
+  # deadline; one that does not reports none, as the NIF does.
 
   alias SmolNet.Core.Iface
   alias SmolNet.Core.Sockets
+  alias SmolNet.Core.Tcp
   alias SmolNet.Core.Udp
   alias SmolNet.Core.Wire.Checksum
   alias SmolNet.Core.Wire.Ipv4
@@ -50,6 +53,8 @@ defmodule SmolNet.Core do
     :timestamp_origin,
     :ephemeral_port_start,
     :sockets,
+    :tcp,
+    poll_at: nil,
     lifecycle: :running,
     notifications_delivered: 0,
     ingress_packets: 0,
@@ -93,16 +98,18 @@ defmodule SmolNet.Core do
 
       true ->
         ephemeral_port_start = Map.get(config, :ephemeral_port_start, @ephemeral_ports.first)
+        id = System.unique_integer([:positive, :monotonic])
 
         {:ok,
          %__MODULE__{
-           id: System.unique_integer([:positive, :monotonic]),
+           id: id,
            limits: limits,
            iface: Iface.new(config.mtu, addresses(config.addresses), routes(config.routes)),
            random_seed: Map.get(config, :random_seed),
            timestamp_origin: Map.get(config, :timestamp_origin),
            ephemeral_port_start: ephemeral_port_start,
-           sockets: Sockets.new(ephemeral_port_start)
+           sockets: Sockets.new(ephemeral_port_start),
+           tcp: Tcp.new(config, id)
          }}
     end
   end
@@ -186,9 +193,13 @@ defmodule SmolNet.Core do
         do: {:erlang.list_to_binary(destination), prefix_length, :erlang.list_to_binary(gateway)}
   end
 
-  @doc "When the core next needs `poll/2`, or nil. Nothing is timed yet."
+  @doc """
+  When the core next needs `poll/2`, in milliseconds, as the last call
+  reported it: nil after a call that does not drive the stack, as the NIF
+  reports none then.
+  """
   @spec deadline(t()) :: integer() | nil
-  def deadline(%__MODULE__{}), do: nil
+  def deadline(%__MODULE__{poll_at: poll_at}), do: poll_at
 
   ## Ingress
 
@@ -218,6 +229,7 @@ defmodule SmolNet.Core do
       count = length(packets)
       core = %{core | ingress_packets: core.ingress_packets + count}
       {core, effects, wakes} = process(core, packets, now, [], [])
+      {core, effects, wakes} = Tcp.drive_ingress(core, now, effects, wakes)
       core = core |> account(bytes, effects) |> account_notifications(wakes)
       core = %{core | max_input_packets: max(core.max_input_packets, count)}
 
@@ -279,11 +291,11 @@ defmodule SmolNet.Core do
   defp process(core, [], _now, effects, wakes), do: {core, :lists.reverse(effects), wakes}
 
   defp process(core, [packet | packets], now, effects, wakes) do
-    {core, effects, wakes} = receive_packet(core, packet, effects, wakes)
+    {core, effects, wakes} = receive_packet(core, packet, now, effects, wakes)
     process(core, packets, now, effects, wakes)
   end
 
-  defp receive_packet(core, packet, effects, wakes) do
+  defp receive_packet(core, packet, now, effects, wakes) do
     case Iface.receive(core.iface, packet) do
       :drop ->
         {core, effects, wakes}
@@ -300,7 +312,7 @@ defmodule SmolNet.Core do
         end
 
       {:tcp, ip, segment} ->
-        {core, tcp_unmatched(core, ip, segment, effects), wakes}
+        Tcp.ingress(core, ip, segment, now, effects, wakes)
 
       {:path_mtu, src, _dst, quoted, _mtu} ->
         {path_mtu(core, src, quoted), effects, wakes}
@@ -315,9 +327,6 @@ defmodule SmolNet.Core do
 
   defp udp_unmatched(core, ip, ip_payload, effects),
     do: emit(core, Iface.port_unreachable(core.iface, ip, ip_payload), effects)
-
-  defp tcp_unmatched(core, ip, segment, effects),
-    do: emit(core, Iface.rst_reply(ip, segment), effects)
 
   # An ICMP error reporting a path MTU counts as received; it is rejected
   # unless it quotes a TCP segment this interface sent that a connection
@@ -346,11 +355,21 @@ defmodule SmolNet.Core do
 
   ## The stack
 
-  @doc "A timer call; nothing is timed yet."
+  @doc "A timer call: drives every connection."
   @spec poll(t(), integer()) :: outcome()
-  def poll(core, _now) do
+  def poll(core, now) do
     core = observe(core)
-    {{:ok, :ok}, %{core | poll_calls: core.poll_calls + 1}, []}
+
+    case running(core) do
+      :ok ->
+        {reply, core, effects} =
+          Tcp.drive({{:ok, :ok}, %{core | poll_calls: core.poll_calls + 1}, []}, now)
+
+        {reply, core |> account(0, effects) |> account_notifications(notices(effects)), effects}
+
+      _closed ->
+        {{:ok, :ok}, %{core | poll_calls: core.poll_calls + 1}, []}
+    end
   end
 
   @doc "Egress credit from the link; the core has no credit to add to yet."
@@ -382,13 +401,13 @@ defmodule SmolNet.Core do
       for {identity, _direction, {pid, _operation, reference}} <- waiters,
           do: {:abort, pid, identity, reference, reason}
 
-    core = %{core | lifecycle: :shutdown, sockets: sockets} |> account_notifications(aborts)
+    tcp = %{core.tcp | conns: %{}, listeners: %{}, embryos: %{}, closing: %{}}
+
+    core =
+      %{core | lifecycle: :shutdown, sockets: sockets, tcp: tcp} |> account_notifications(aborts)
+
     {{:ok, :ok}, core, aborts}
   end
-
-  @doc "A refused socket operation: TCP comes in a later phase of #173."
-  @spec not_implemented(t()) :: outcome()
-  def not_implemented(core), do: {{:error, :not_implemented}, observe(core), []}
 
   defp running(%__MODULE__{lifecycle: :running}), do: :ok
   defp running(_core), do: {:error, :closed}
@@ -432,17 +451,17 @@ defmodule SmolNet.Core do
     do: call(core, &Udp.connect(&1, identity(identity), endpoint))
 
   @spec udp_sendto(t(), map(), map(), binary(), pid(), reference(), integer()) :: outcome()
-  def udp_sendto(core, identity, endpoint, data, pid, reference, _now) do
+  def udp_sendto(core, identity, endpoint, data, pid, reference, now) do
     call(
       core,
-      &Udp.sendto(&1, identity(identity), endpoint, data, pid, reference),
+      &drive(Udp.sendto(&1, identity(identity), endpoint, data, pid, reference), now),
       fn _result -> byte_size(data) end
     )
   end
 
   @spec udp_recvfrom(t(), map(), non_neg_integer(), pid(), reference(), integer()) :: outcome()
-  def udp_recvfrom(core, identity, length, pid, reference, _now) do
-    call(core, &Udp.recvfrom(&1, identity(identity), length, pid, reference), fn
+  def udp_recvfrom(core, identity, length, pid, reference, now) do
+    call(core, &drive(Udp.recvfrom(&1, identity(identity), length, pid, reference), now), fn
       {:ok, _source, _destination, data, _truncated} -> byte_size(data)
       _select -> 0
     end)
@@ -455,8 +474,82 @@ defmodule SmolNet.Core do
   def udp_peername(core, identity), do: call(core, &Udp.peername(&1, identity(identity)))
 
   @spec udp_close(t(), map(), integer()) :: outcome()
-  def udp_close(core, identity, _now),
-    do: call(core, &Udp.close(&1, identity(identity)), fn _result -> 0 end)
+  def udp_close(core, identity, now),
+    do: call(core, &drive(Udp.close(&1, identity(identity)), now), fn _result -> 0 end)
+
+  # The calls the NIF drives its interface for drive every TCP connection
+  # too, when they succeed.
+  defp drive({{:ok, _result}, _core, _effects} = outcome, now), do: Tcp.drive(outcome, now)
+  defp drive(refused, _now), do: refused
+
+  @doc "Opens a TCP socket of `family` with the given buffer sizes."
+  @spec tcp_open(t(), :inet | :inet6, pos_integer(), pos_integer()) :: outcome()
+  def tcp_open(core, family, rcvbuf, sndbuf),
+    do: call(core, &Tcp.open(&1, family, rcvbuf, sndbuf))
+
+  @spec tcp_bind(t(), map(), map()) :: outcome()
+  def tcp_bind(core, identity, endpoint),
+    do: call(core, &Tcp.bind(&1, identity(identity), endpoint))
+
+  @spec tcp_listen(t(), map(), integer(), integer()) :: outcome()
+  def tcp_listen(core, identity, backlog, now),
+    do: call(core, &Tcp.listen(&1, identity(identity), backlog, now), &no_bytes/1)
+
+  @spec tcp_accept(t(), map(), pid(), reference(), integer()) :: outcome()
+  def tcp_accept(core, identity, pid, reference, now),
+    do: call(core, &Tcp.accept(&1, identity(identity), pid, reference, now))
+
+  @spec tcp_connect(t(), map(), map(), pid(), reference(), integer()) :: outcome()
+  def tcp_connect(core, identity, endpoint, pid, reference, now),
+    do:
+      call(core, &Tcp.connect(&1, identity(identity), endpoint, pid, reference, now), &no_bytes/1)
+
+  @spec tcp_send(t(), map(), binary(), pid(), reference(), integer()) :: outcome()
+  def tcp_send(core, identity, data, pid, reference, now) do
+    call(core, &Tcp.send(&1, identity(identity), data, pid, reference, now), fn
+      :ok -> min(byte_size(data), core.limits.bytes_copied)
+      {:select, :send, _reference, accepted} -> accepted
+    end)
+  end
+
+  @spec tcp_recv(t(), map(), non_neg_integer(), pid(), reference(), integer()) :: outcome()
+  def tcp_recv(core, identity, length, pid, reference, now) do
+    call(core, &Tcp.recv(&1, identity(identity), length, pid, reference, now), fn
+      {:ok, data} -> byte_size(data)
+      {:select, :recv, _reference, data} -> byte_size(data)
+      _select -> 0
+    end)
+  end
+
+  @spec tcp_shutdown(t(), map(), :read | :write | :read_write, integer()) :: outcome()
+  def tcp_shutdown(core, identity, how, now),
+    do: call(core, &Tcp.shutdown(&1, identity(identity), how, now), &no_bytes/1)
+
+  @spec tcp_close(t(), map(), integer()) :: outcome()
+  def tcp_close(core, identity, now),
+    do: call(core, &Tcp.close(&1, identity(identity), now), &no_bytes/1)
+
+  @spec tcp_sockname(t(), map()) :: outcome()
+  def tcp_sockname(core, identity), do: call(core, &Tcp.sockname(&1, identity(identity)))
+
+  @spec tcp_peername(t(), map()) :: outcome()
+  def tcp_peername(core, identity), do: call(core, &Tcp.peername(&1, identity(identity)))
+
+  @spec tcp_set_nodelay(t(), map(), boolean(), integer()) :: outcome()
+  def tcp_set_nodelay(core, identity, nodelay, now),
+    do: call(core, &Tcp.set_nodelay(&1, identity(identity), nodelay, now), &no_bytes/1)
+
+  @spec tcp_nodelay(t(), map()) :: outcome()
+  def tcp_nodelay(core, identity), do: call(core, &Tcp.nodelay(&1, identity(identity)))
+
+  @spec tcp_set_keepalive(t(), map(), boolean(), integer()) :: outcome()
+  def tcp_set_keepalive(core, identity, keepalive, now),
+    do: call(core, &Tcp.set_keepalive(&1, identity(identity), keepalive, now), &no_bytes/1)
+
+  @spec tcp_keepalive(t(), map()) :: outcome()
+  def tcp_keepalive(core, identity), do: call(core, &Tcp.keepalive(&1, identity(identity)))
+
+  defp no_bytes(_result), do: 0
 
   # A socket call: counted, refused with `:closed` unless the stack runs,
   # and, for a call the NIF drives its interface for (`input` given), its
@@ -466,8 +559,7 @@ defmodule SmolNet.Core do
 
     with :ok <- running(core),
          {{:ok, result}, core, effects} <- fun.(core) do
-      notices = for effect <- effects, elem(effect, 0) in [:wake, :abort], do: effect
-      core = account_notifications(core, notices)
+      core = account_notifications(core, notices(effects))
       core = if input, do: account(core, input.(result), effects), else: core
       {{:ok, result}, core, effects}
     else
@@ -492,11 +584,14 @@ defmodule SmolNet.Core do
     }
   end
 
+  defp notices(effects),
+    do: for(effect <- effects, elem(effect, 0) in [:wake, :abort], do: effect)
+
   defp account_notifications(core, notices),
     do: %{core | notifications_delivered: core.notifications_delivered + length(notices)}
 
   # Every backend call but the snapshot counts, as the NIF counts its own.
-  defp observe(core), do: %{core | native_calls: core.native_calls + 1}
+  defp observe(core), do: %{core | native_calls: core.native_calls + 1, poll_at: nil}
 
   ## Snapshot
 
@@ -509,6 +604,7 @@ defmodule SmolNet.Core do
   @spec snapshot(t()) :: {{:ok, map()}, t(), []}
   def snapshot(core) do
     counts = Sockets.counts(core.sockets)
+    tcp = Tcp.snapshot(core)
     mtu = core.iface.mtu
 
     {{:ok,
@@ -518,20 +614,21 @@ defmodule SmolNet.Core do
         socket_count: counts.udp + counts.tcp,
         native_socket_count: 0,
         native_socket_capacity: core.limits.sockets,
-        socket_buffer_bytes: Udp.buffer_bytes(Sockets.states(core.sockets, :udp)),
+        socket_buffer_bytes:
+          Udp.buffer_bytes(Sockets.states(core.sockets, :udp)) + tcp.buffer_bytes,
         socket_buffer_capacity: 64 * 2 * @tcp_max_buffer_bytes,
-        tcp_socket_count: counts.tcp,
-        tcp_listener_count: 0,
+        tcp_socket_count: tcp.tcp_socket_count,
+        tcp_listener_count: tcp.tcp_listener_count,
         udp_socket_count: counts.udp,
         listener_pool_socket_count: 0,
         listener_pool_target_count: 0,
-        accepted_queue_count: 0,
-        listener_backlog_capacity: 0,
-        closing_tcp_socket_count: 0,
+        accepted_queue_count: tcp.accepted_queue_count,
+        listener_backlog_capacity: tcp.listener_backlog_capacity,
+        closing_tcp_socket_count: tcp.closing_tcp_socket_count,
         tcp_buffer_bytes: %{
           default_rcvbuf: @tcp_default_buffer_bytes,
           default_sndbuf: @tcp_default_buffer_bytes,
-          sockets: []
+          sockets: tcp.sockets
         },
         udp_packet_capacity: Udp.ring_packets(),
         udp_payload_bytes: Udp.ring_bytes(),
@@ -555,11 +652,11 @@ defmodule SmolNet.Core do
         call_target_nanoseconds: 0,
         work_budget_nanoseconds: 0,
         encoding_headroom_nanoseconds: 0,
-        counters: counters(core)
+        counters: counters(core, tcp.counters)
       }}, core, []}
   end
 
-  defp counters(core) do
+  defp counters(core, tcp) do
     %{
       max_bytes_copied: core.max_bytes_copied,
       max_input_packets: core.max_input_packets,
@@ -573,9 +670,9 @@ defmodule SmolNet.Core do
       notifications_delivered: core.notifications_delivered,
       notifications_dropped: 0,
       readiness_dropped: 0,
-      listener_promotions: 0,
-      listener_refills: 0,
-      listener_overflow_drops: 0,
+      listener_promotions: tcp.listener_promotions,
+      listener_refills: tcp.listener_refills,
+      listener_overflow_drops: tcp.listener_overflow_drops,
       native_calls: core.native_calls,
       deadline_yields: 0,
       timeslice_exhaustions: 0,

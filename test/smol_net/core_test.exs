@@ -50,7 +50,8 @@ defmodule SmolNet.CoreTest do
     assert {:ok, %{backend: :elixir, poll_at: nil, native: %{result: %{lifecycle: :running}}}} =
              SmolNet.stack_info(stack)
 
-    assert {:error, :not_implemented} = SmolNet.open(:inet, :stream, :tcp, stack: stack)
+    assert {:ok, socket} = SmolNet.open(:inet, :stream, :tcp, stack: stack)
+    assert :ok = SmolNet.close(socket)
     assert :ok = SmolNet.stop_stack(stack)
   end
 
@@ -197,7 +198,7 @@ defmodule SmolNet.CoreTest do
                Driver.call(start(), :stack_grant_egress, [1, 1], 1)
     end
 
-    test "TCP calls are not implemented yet, and UDP calls never time anything" do
+    test "socket calls with no connection to drive time nothing" do
       assert {{:ok, udp}, driver} = Driver.call(start(), :udp_open, [:inet], 0)
       bound = %{address: [192, 0, 2, 1], port: 0, scope_id: 0}
       assert {{:ok, :ok}, driver} = Driver.call(driver, :udp_bind, [udp, bound], 0)
@@ -206,8 +207,8 @@ defmodule SmolNet.CoreTest do
       assert {{:ok, {:select, :recvfrom, ^ref}}, driver} =
                Driver.call(driver, :udp_recvfrom, [udp, 0, ref], 0)
 
-      assert {{:error, :not_implemented}, driver} =
-               Driver.call(driver, :tcp_open, [:inet, 4_096, 4_096], 0)
+      assert {{:ok, tcp}, driver} = Driver.call(driver, :tcp_open, [:inet, 4_096, 4_096], 0)
+      assert {{:ok, :ok}, driver} = Driver.call(driver, :tcp_bind, [tcp, bound], 0)
 
       assert Driver.timer(driver) == nil
     end
