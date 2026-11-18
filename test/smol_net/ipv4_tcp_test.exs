@@ -1,9 +1,6 @@
 defmodule SmolNet.IPv4TcpTest do
   use ExUnit.Case, async: false
 
-  # Needs TCP sockets, which the Elixir backend gains in phase 5 of #173.
-  @moduletag :elixir_phase_5
-
   alias SmolNet.Inet.Tcp, as: InetTcp
   alias SmolNet.Inet6.Tcp, as: Inet6Tcp
   alias SmolNet.Test.RawIpLink

@@ -1,9 +1,6 @@
 defmodule SmolNet.TcpNodelayTest do
   use ExUnit.Case, async: false
 
-  # Needs TCP sockets, which the Elixir backend gains in phase 5 of #173.
-  @moduletag :elixir_phase_5
-
   alias SmolNet.Inet.Tcp
   alias SmolNet.Inet.Udp
   alias SmolNet.Test.ManualClock

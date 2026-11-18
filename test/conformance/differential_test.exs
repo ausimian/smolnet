@@ -60,8 +60,8 @@ defmodule SmolNet.Conformance.DifferentialTest do
     for {name, phase} <- [
           {"ingress_replies", nil},
           {"stack_replies", nil},
-          {"tcp_clean_inet", 5},
-          {"tcp_clean_inet6", 5},
+          {"tcp_clean_inet", nil},
+          {"tcp_clean_inet6", nil},
           {"tcp_duplicate_inet", 6},
           {"tcp_impaired_inet", 6},
           {"tcp_loss_inet", 6},
@@ -103,7 +103,6 @@ defmodule SmolNet.Conformance.DifferentialTest do
     assert Trace.replay(altered, backend, ignore: [:emitted]) == :ok
   end
 
-  @tag :elixir_phase_5
   test "a trace survives its file format", %{backend: backend} do
     dir = Path.join(System.tmp_dir!(), "smolnet-trace-#{System.unique_integer([:positive])}")
     File.mkdir_p!(dir)
@@ -150,7 +149,6 @@ defmodule SmolNet.Conformance.DifferentialTest do
       refute LinkSim.lost_fin?(LinkSim.run(seed: 1, bytes: 1_024, backend: backend))
     end
 
-    @tag :elixir_phase_5
     test "reports a transfer that cannot finish", %{backend: backend} do
       lost = [seed: 1, bytes: 4_096, backend: backend, profile: %{loss: 1.0}]
       assert {:timeout, _at} = LinkSim.run([deadline: 1_000] ++ lost).status
@@ -195,7 +193,6 @@ defmodule SmolNet.Conformance.DifferentialTest do
   end
 
   describe "the determinism hooks" do
-    @tag :elixir_phase_5
     property "a stack's initial sequence numbers follow smoltcp's PCG from its seed", %{
       backend: backend
     } do
@@ -204,7 +201,6 @@ defmodule SmolNet.Conformance.DifferentialTest do
       end
     end
 
-    @tag :elixir_phase_5
     test "a listener's SYN-ACK takes the next one", %{backend: backend} do
       result = LinkSim.run(seed: 21, bytes: 1, backend: backend)
       [server_isn] = Pcg32.isns(21 * 2 + 1, 1)

@@ -271,8 +271,6 @@ defmodule SmolNet.IPv4UdpTest do
       assert data == :binary.copy("x", 1_000)
     end
 
-    # Needs TCP, which the Elixir backend gains in phase 5 of #173.
-    @tag :elixir_phase_5
     test "IPv4 UDP connect preserves a TCP timer via #{inspect(link_module)}" do
       {server_stack, client_stack, link} = ipv4_stacks(@link_module)
       :ok = @link_module.fault(link, :drop)
@@ -624,8 +622,6 @@ defmodule SmolNet.IPv4UdpTest do
   for link_module <- [RawIpLink, IPv6Link] do
     @link_module link_module
 
-    # Needs TCP, which the Elixir backend gains in phase 5 of #173.
-    @tag :elixir_phase_5
     test "complete dual-family TCP/UDP matrix uses #{inspect(link_module)} without cross-talk" do
       exercise_complete_matrix(@link_module)
     end

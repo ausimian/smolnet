@@ -24,8 +24,6 @@ defmodule SmolNet.LoopbackTest do
     on_exit(&stop_all_stacks/0)
   end
 
-  # TCP sockets come in phase 5 of #173 on the Elixir backend.
-  @tag :elixir_phase_5
   test "completes an IPv4 connection between two sockets on one stack" do
     stack = loopback_stack()
     server = endpoint4(41_101)
@@ -49,8 +47,6 @@ defmodule SmolNet.LoopbackTest do
     assert {:ok, "response"} = SmolNet.recv(client, 8, @wait_1s)
   end
 
-  # TCP sockets come in phase 5 of #173 on the Elixir backend.
-  @tag :elixir_phase_5
   test "completes an IPv6 connection between two sockets on one stack" do
     stack = loopback_stack()
     server = endpoint6(41_102)
@@ -87,8 +83,6 @@ defmodule SmolNet.LoopbackTest do
     assert datagram.source.addr == @localhost4
   end
 
-  # TCP sockets come in phase 5 of #173 on the Elixir backend.
-  @tag :elixir_phase_5
   test "loops a connection refused by the stack's own closed port" do
     stack = loopback_stack()
 
@@ -98,8 +92,6 @@ defmodule SmolNet.LoopbackTest do
              SmolNet.connect(client, endpoint4(41_104), @wait_1s)
   end
 
-  # TCP sockets come in phase 5 of #173 on the Elixir backend.
-  @tag :elixir_phase_5
   test "reaches any address the stack holds, not only conventional localhost" do
     {:ok, _link, stack} = Loopback.start_link(addresses: [{{192, 0, 2, 1}, 24}])
     server = %{family: :inet, addr: {192, 0, 2, 1}, port: 41_105}

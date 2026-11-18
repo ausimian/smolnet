@@ -65,9 +65,10 @@ Tests of the NIF itself are tagged `:nif`, and those needing its debug
 hooks `:debug_nif`; both run only on the native backend.
 
 The Elixir backend is built in phases, and a test that needs a phase still
-to come is tagged with it: `:elixir_phase_5` (TCP) to
-`:elixir_phase_7` (keepalive, user timeout, path MTU, egress credit,
-link-down policies and the shutdown lifecycle), as `@moduletag` for a whole
+to come is tagged with it: `:elixir_phase_6` (loss recovery and
+congestion control) or `:elixir_phase_7` (keepalive, user timeout, path
+MTU, egress credit, link-down policies and the shutdown lifecycle), as
+`@moduletag` for a whole
 file and `@tag` where a file mixes phases. `test/test_helper.exs` excludes
 those tags under `SMOLNET_TEST_BACKEND=elixir` only, so the native run is
 unaffected, and CI gates whatever already passes on the Elixir backend. A
@@ -75,7 +76,7 @@ phase's exit criterion includes removing its tag from every test and from
 the exclusion list; to see what it still has to do:
 
 ```console
-SMOLNET_TEST_BACKEND=elixir mix test --only elixir_phase_5
+SMOLNET_TEST_BACKEND=elixir mix test --only elixir_phase_6
 ```
 
 A test comparing the two backends directly, such as

@@ -3,9 +3,6 @@ defmodule SmolNet.SslGuideTest do
   # written.
   use ExUnit.Case, async: false
 
-  # Needs TCP sockets, which the Elixir backend gains in phase 5 of #173.
-  @moduletag :elixir_phase_5
-
   alias SmolNet.Test.Timing
 
   @moduletag :capture_log

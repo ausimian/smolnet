@@ -22,8 +22,6 @@ defmodule SmolNet.StackDeterminismTest do
     end)
   end
 
-  # TCP comes in phase 5 of #173 on the Elixir backend.
-  @tag :elixir_phase_5
   test "fixed determinism hooks give identical SYNs from separate stacks" do
     determinism = %{random_seed: 42, timestamp_origin: 1_000, ephemeral_port_start: 50_000}
 
@@ -40,8 +38,6 @@ defmodule SmolNet.StackDeterminismTest do
     assert parse_syn(reseeded).seq != seq
   end
 
-  # TCP comes in phase 5 of #173 on the Elixir backend.
-  @tag :elixir_phase_5
   test "the largest seed and timestamp origin reach the stack, and the clock wraps" do
     determinism = %{random_seed: 0xFFFF_FFFF_FFFF_FFFF, timestamp_origin: 0xFFFF_FFFF}
 
