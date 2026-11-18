@@ -2,14 +2,13 @@
 
 ## Status
 
-Proposed. Records phase 0 of #173. The throughput floor below is the
-plan's recommendation (decision 1 of #173), which has not been confirmed.
+Accepted. Records phase 0 of #173.
 
 ## Context
 
 #173 plans to replace the vendored smoltcp NIF with an Elixir engine
 behind the same public API. One unknown decided whether to start:
-throughput. #173's decision 1 recommends a go/no-go floor. The Elixir
+throughput. #173's decision 1 sets a go/no-go floor. The Elixir
 engine must reach at least half the NIF's unimpaired single-stream rate,
 and come within 10% of the NIF on every impaired profile. Phase 0 is a
 spike that measures this against the NIF in the same harness each time,
@@ -165,7 +164,8 @@ The longest single pause was not measured.
 
 ## Decision
 
-**Go**, on the unimpaired half of the floor.
+**Go.** The prototype outperformed the NIF on the unimpaired path, which
+clears that half of the floor by a wide margin.
 
 - The floor asks for at least 0.5× the NIF's unimpaired single-stream
   rate. The prototype reached 1.10× sending and 1.20× receiving in
