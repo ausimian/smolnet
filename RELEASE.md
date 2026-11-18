@@ -15,7 +15,10 @@
   sends segment for segment: listeners with a real backlog of up to 128
   handshakes and 128 accepted children, connect that tells a refused
   connection from a reset one, graceful close with a 30 s deadline,
-  shutdown, Nagle, keep-alive and the user timeout. It does not yet act on
+  shutdown, Nagle, keep-alive and the user timeout. Its loss recovery and
+  congestion control are the NIF's too, and send what it sends under loss,
+  reordering and duplication: NewReno with limited transmit, SACK recovery,
+  RACK-TLP, D-SACK and CUBIC. It does not yet act on
   ICMP errors that report a path MTU, nor hold one call's egress to the
   `:output_packets` and `:bytes_copied` limits, and starting it with
   `:egress_credit` returns `{:error, :not_implemented}`.

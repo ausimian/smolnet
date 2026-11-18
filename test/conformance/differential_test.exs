@@ -1,28 +1,3 @@
-defmodule SmolNet.Conformance.DifferentialTest.YieldingNative do
-  @moduledoc false
-
-  # The NIF with its wall-clock budget cut to nothing for every call but
-  # the polls, so each call yields at its first checkpoint and leaves the
-  # rest to the driver's continuation polls.
-
-  alias SmolNet.Native
-  alias SmolNet.Stack.Backend, as: Behaviour
-  alias SmolNet.Stack.Backend.Native, as: Backend
-
-  defdelegate stack_new(limits, config, now), to: Backend
-  defdelegate stack_poll(resource, now), to: Backend
-
-  for {name, arity} <- Behaviour.behaviour_info(:callbacks),
-      name not in [:stack_new, :stack_poll] do
-    [resource | _rest] = args = Macro.generate_arguments(arity, __MODULE__)
-
-    def unquote(name)(unquote_splicing(args)) do
-      {:ok, %{result: :ok}} = Native.test_set_budget_checkpoints(unquote(resource), 1)
-      Backend.unquote(name)(unquote_splicing(args))
-    end
-  end
-end
-
 defmodule SmolNet.Conformance.DifferentialTest do
   use ExUnit.Case, async: true
   use ExUnitProperties
@@ -32,6 +7,7 @@ defmodule SmolNet.Conformance.DifferentialTest do
   alias SmolNet.Conformance.Packets
   alias SmolNet.Conformance.Pcg32
   alias SmolNet.Conformance.Trace
+  alias SmolNet.Conformance.YieldingNative
   alias SmolNet.Stack.Backend
 
   setup_all do
@@ -45,31 +21,41 @@ defmodule SmolNet.Conformance.DifferentialTest do
                "stack_replies",
                "tcp_clean_inet",
                "tcp_clean_inet6",
+               "tcp_cubic_inet",
+               "tcp_dsack_inet6",
                "tcp_duplicate_inet",
                "tcp_impaired_inet",
                "tcp_loss_inet",
+               "tcp_lossy_probe_inet6",
+               "tcp_newreno_inet",
                "tcp_reorder_inet6",
+               "tcp_rto_backoff_inet",
+               "tcp_small_window_inet",
+               "tcp_tail_loss_inet6",
                "udp_sockets"
              ]
     end
 
     # On the NIF this checks that the traces are current and that it is
     # deterministic; on another backend it is the differential comparison.
-    # On the Elixir backend a trace runs once the phase of #173 it needs
-    # has landed.
-    for {name, phase} <- [
-          {"ingress_replies", nil},
-          {"stack_replies", nil},
-          {"tcp_clean_inet", nil},
-          {"tcp_clean_inet6", nil},
-          {"tcp_duplicate_inet", 6},
-          {"tcp_impaired_inet", 6},
-          {"tcp_loss_inet", 6},
-          {"tcp_reorder_inet6", 6},
-          {"udp_sockets", nil}
+    for name <- [
+          "ingress_replies",
+          "stack_replies",
+          "tcp_clean_inet",
+          "tcp_clean_inet6",
+          "tcp_cubic_inet",
+          "tcp_dsack_inet6",
+          "tcp_duplicate_inet",
+          "tcp_impaired_inet",
+          "tcp_loss_inet",
+          "tcp_lossy_probe_inet6",
+          "tcp_newreno_inet",
+          "tcp_reorder_inet6",
+          "tcp_rto_backoff_inet",
+          "tcp_small_window_inet",
+          "tcp_tail_loss_inet6",
+          "udp_sockets"
         ] do
-      if phase, do: @tag(:"elixir_phase_#{phase}")
-
       test "#{name} replays call for call on this backend", %{backend: backend} do
         trace = Enum.find(Trace.all(), &(&1.name == unquote(name)))
         assert Trace.replay(trace, backend) == :ok
@@ -82,7 +68,7 @@ defmodule SmolNet.Conformance.DifferentialTest do
   @tag :debug_nif
   test "the traces do not depend on where the NIF's budget cuts a call" do
     for trace <- Trace.all() do
-      assert Trace.replay(trace, __MODULE__.YieldingNative) == :ok, trace.name
+      assert Trace.replay(trace, YieldingNative) == :ok, trace.name
     end
   end
 
@@ -115,7 +101,6 @@ defmodule SmolNet.Conformance.DifferentialTest do
   end
 
   describe "the link simulator" do
-    @tag :elixir_phase_6
     test "is a function of its options", %{backend: backend} do
       options = [
         seed: 7,
@@ -131,7 +116,6 @@ defmodule SmolNet.Conformance.DifferentialTest do
       refute LinkSim.run(Keyword.put(options, :seed, 8)).entries == first.entries
     end
 
-    @tag :elixir_phase_6
     test "recognises #177's lost FIN", %{backend: backend} do
       result = LinkSim.run(seed: 2, bytes: 16_384, backend: backend, profile: %{loss: 0.05})
       assert result.received == result.sent
@@ -162,7 +146,6 @@ defmodule SmolNet.Conformance.DifferentialTest do
     # Integrity and liveness over random links. A stack may lose a FIN for
     # good when a duplicate ACK cancels its retransmission (#177): every
     # byte still arrives, but the close never completes.
-    @tag :elixir_phase_6
     property "delivers the stream intact and finishes, whatever the link", %{backend: backend} do
       check all(
               seed <- integer(1..1_000_000),

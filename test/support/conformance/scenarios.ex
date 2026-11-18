@@ -30,20 +30,185 @@ defmodule SmolNet.Conformance.Scenarios do
      [seed: 6, family: :inet, profile: %{loss: 0.03, duplicate: 0.03, reorder: 0.05, jitter: 10}]}
   ]
 
+  # Transfers aimed at one loss-recovery path each, by losing chosen
+  # packets: `{name, description, options, losses}`, where `losses` picks
+  # the packets to lose from a run that loses none of them (see `losses/3`).
+  @recovery [
+    {"tcp_newreno_inet",
+     "A 64 KiB transfer over IPv4 without SACK, losing three segments in a row: " <>
+       "limited transmit, fast retransmit, then a resend per partial ACK (NewReno).",
+     [seed: 7, family: :inet, bytes: 65_536, strip_sack: true], [{:nth_data, :client, 15, 3}]},
+    {"tcp_tail_loss_inet6",
+     "A 48 KiB transfer over IPv6 losing its last two segments, the FIN with them: " <>
+       "RACK-TLP's loss probe resends the last MSS, and the recovery its SACK starts the rest.",
+     [seed: 8, family: :inet6, bytes: 49_152], [{:tail, :client, 2}]},
+    {"tcp_rto_backoff_inet",
+     "A 32 KiB transfer over IPv4 losing 20 segments in a row from its 12th, resends " <>
+       "included: the retransmission timer fires four times, its timeout doubling each time.",
+     [seed: 9, family: :inet, bytes: 32_768], [{:nth_data, :client, 12, 20}]},
+    {"tcp_cubic_inet",
+     "A 256 KiB transfer over IPv4 with 256 KiB buffers and 25 ms each way, losing a " <>
+       "segment of its first flight and then two more, each several round trips after " <>
+       "the last: CUBIC's window falls at each loss and grows again between them.",
+     [seed: 10, family: :inet, bytes: 262_144, buffer: 262_144, profile: %{delay: 25}],
+     [{:nth_data, :client, 8, 1}, {:nth_data, :client, 80, 1}, {:nth_data, :client, 150, 1}]},
+    {"tcp_dsack_inet6",
+     "A 32 KiB transfer over IPv6 duplicating 20% of packets and reordering 10%: " <>
+       "the receiver reports what it already had in D-SACK blocks.",
+     [seed: 11, family: :inet6, profile: %{duplicate: 0.2, reorder: 0.1, jitter: 3}], []},
+    {"tcp_lossy_probe_inet6",
+     "A 3.6 KiB transfer over IPv6 from the server, with 2 KiB buffers, losing 23% " <>
+       "and reordering 14% of packets over 100 ms each way: a resent loss probe " <>
+       "repairs a loss, and CUBIC responds to it.",
+     [
+       seed: 1_867_224_222,
+       family: :inet6,
+       bytes: 3_658,
+       sender: :server,
+       buffer: 2_048,
+       mtu: {1_280, 3_998},
+       profile: %{loss: 0.2341796875, reorder: 0.1374114990234375, delay: 100, jitter: 30}
+     ], []},
+    {"tcp_small_window_inet",
+     "A 24 KiB transfer over IPv4 from the server, with 2 KiB buffers and a 1280-byte " <>
+       "MTU at the client: the server sends at most the client's MSS, into a window " <>
+       "that fills and reopens as the client reads.",
+     [
+       seed: 12,
+       family: :inet,
+       bytes: 24_576,
+       sender: :server,
+       buffer: 2_048,
+       mtu: {1_280, 9_000}
+     ], []}
+  ]
+
   @doc "Records every scenario on `backend`, as traces."
   def record(backend) do
     transfers =
       for {name, description, options} <- @transfers do
-        result = LinkSim.run([backend: backend] ++ options)
-
-        if result.status != :ok,
-          do: raise("scenario #{name} did not complete: #{inspect(result.status)}")
-
-        Trace.new(name, description, result.entries)
+        Trace.new(name, description, transfer(name, backend, options))
       end
 
-    transfers ++ [ingress_replies(backend), stack_replies(backend), udp_sockets(backend)]
+    recovery =
+      for {name, description, options, losses} <- @recovery do
+        options = Keyword.put(options, :drop, losses(backend, options, losses))
+        Trace.new(name, description, transfer(name, backend, options))
+      end
+
+    transfers ++
+      recovery ++ [ingress_replies(backend), stack_replies(backend), udp_sockets(backend)]
   end
+
+  defp transfer(name, backend, options) do
+    result = LinkSim.run([backend: backend] ++ options)
+
+    if result.status != :ok,
+      do: raise("scenario #{name} did not complete: #{inspect(result.status)}")
+
+    result.entries
+  end
+
+  @doc """
+  A `:drop` rule for `LinkSim.run/1` that loses the packets `losses`
+  picks, each counted in a run that loses the ones picked before it, so a
+  pick names a packet as the stacks then send it:
+
+  - `{:nth_data, side, n, count}`: `side`'s `n`th segment with data and
+    the `count - 1` it sends after it.
+  - `{:tail, side, count}`: the first sending of `side`'s last `count`
+    segments, by where they end, a FIN counting as data.
+  - `{:resends, side, n, count}`: `side`'s `n`th segment with data and its
+    first `count - 1` resends.
+  """
+  def losses(backend, options, losses) do
+    dropped =
+      Enum.reduce(losses, MapSet.new(), fn loss, dropped ->
+        side = elem(loss, 1)
+
+        {dropped, _picked} =
+          Enum.reduce(1..picks(loss), {dropped, []}, fn _pick, {dropped, picked} ->
+            packets = data_packets(backend, options, dropped, side)
+            packet = pick(loss, packets, picked, dropped)
+            {MapSet.put(dropped, {side, elem(packet, 0)}), [packet | picked]}
+          end)
+
+        dropped
+      end)
+
+    fn side, n, _packet -> MapSet.member?(dropped, {side, n}) end
+  end
+
+  defp picks({:nth_data, _side, _n, count}), do: count
+  defp picks({:tail, _side, count}), do: count
+  defp picks({:resends, _side, _n, count}), do: count
+
+  # The next packet a loss picks, from those `{index, seq, length}` with
+  # data, given those it picked already, latest first.
+  defp pick({:nth_data, _side, n, _count}, packets, [], _dropped), do: Enum.at(packets, n - 1)
+
+  defp pick({:nth_data, _side, _n, _count}, packets, [{last, _seq, _length} | _picked], _dropped),
+    do: Enum.find(packets, fn {index, _seq, _length} -> index > last end)
+
+  defp pick(
+         {:tail, _side, _count},
+         [{_index, first, _length} | _rest] = packets,
+         picked,
+         _dropped
+       ) do
+    ends =
+      for {_index, seq, length} <- picked, do: Integer.mod(seq - first, 0x1_0000_0000) + length
+
+    packets
+    |> Enum.map(fn {index, seq, length} = packet ->
+      {Integer.mod(seq - first, 0x1_0000_0000) + length, -index, packet}
+    end)
+    |> Enum.reject(fn {end_, _index, _packet} -> end_ in ends end)
+    |> Enum.max()
+    |> elem(2)
+  end
+
+  defp pick({:resends, _side, n, _count}, packets, [], _dropped), do: Enum.at(packets, n - 1)
+
+  defp pick({:resends, side, _n, _count}, packets, picked, dropped) do
+    {_index, seq, _length} = List.last(picked)
+
+    Enum.find(packets, fn {index, s, _length} ->
+      s == seq and not MapSet.member?(dropped, {side, index})
+    end)
+  end
+
+  # Each segment with data or a FIN `side` sent in a run losing `dropped`,
+  # as `{index, seq, length}`, `index` counting every packet the side sent
+  # and `length` a FIN as one.
+  defp data_packets(backend, options, dropped, side) do
+    drop = fn from, n, _packet -> MapSet.member?(dropped, {from, n}) end
+    result = LinkSim.run([backend: backend, drop: drop] ++ options)
+
+    for(%{stack: ^side} = entry <- result.entries, packet <- entry.emitted, do: packet)
+    |> Enum.with_index(1)
+    |> Enum.flat_map(fn {packet, index} ->
+      case segment(packet) do
+        {seq, length} when length > 0 -> [{index, seq, length}]
+        _other -> []
+      end
+    end)
+  end
+
+  # A TCP segment's sequence number and payload length.
+  defp segment(
+         <<4::4, ihl::4, _::binary-size(1), total::16, _::binary-size(5), 6, _::binary>> = packet
+       ) do
+    tcp_segment(binary_part(packet, ihl * 4, total - ihl * 4))
+  end
+
+  defp segment(<<6::4, _::28, _length::16, 6, _hop, _addresses::binary-32, tcp::binary>>),
+    do: tcp_segment(tcp)
+
+  defp segment(_packet), do: nil
+
+  defp tcp_segment(<<_ports::32, seq::32, _ack::32, offset::4, _::4, flags, _::binary>> = tcp),
+    do: {seq, byte_size(tcp) - offset * 4 + Bitwise.band(flags, 1)}
 
   @doc """
   UDP sockets: the named sequences of `UdpCalls.scripted/0`, then 30 of

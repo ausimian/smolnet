@@ -599,7 +599,8 @@ defmodule SmolNet.Core do
   The stack's description in the shape of the NIF's snapshot, which
   `stack_info/1` reports as `native.result` (decision 4 of #173): the
   socket and waiter counts, UDP's fixed sizes, limits, lifecycle and
-  counters. The NIF's own machinery and budgets are zero.
+  counters. The NIF's own machinery and budgets are zero. Like the NIF's,
+  it names no deadline, and does not count as a call.
   """
   @spec snapshot(t()) :: {{:ok, map()}, t(), []}
   def snapshot(core) do
@@ -653,7 +654,7 @@ defmodule SmolNet.Core do
         work_budget_nanoseconds: 0,
         encoding_headroom_nanoseconds: 0,
         counters: counters(core, tcp.counters)
-      }}, core, []}
+      }}, %{core | poll_at: nil}, []}
   end
 
   defp counters(core, tcp) do
