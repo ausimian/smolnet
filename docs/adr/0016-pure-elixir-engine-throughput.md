@@ -17,8 +17,8 @@ because the floor is a ratio.
 
 ## The prototype
 
-The throwaway branch `spike/phase-0-throughput` (at c938834, not for
-merging) holds an engine of about 2,000 lines, `SmolNet.Spike.Engine`.
+The throwaway branch `spike/phase-0-throughput` (at 978ad16, not for
+merging, kept locally until phase 8 for reference) holds an engine of about 2,000 lines, `SmolNet.Spike.Engine`.
 It implements the `SmolNet.Native` functions that a `:gen_tcp` bulk
 transfer calls, so `SmolNet.Stack`, the socket API, the `:gen_tcp`
 adapter and the TUN link run in front of it unchanged. Before writing it,
@@ -36,11 +36,24 @@ It has:
   byte.
 - A 32-range out-of-order assembler.
 - Cumulative and SACK ACK processing.
-- RFC 6298 RTO with smoltcp's 200 ms floor, and a 10 ms delayed ACK
+- RFC 6298 RTO with the vendored fork's 200 ms floor (08c4c4c), and a 10 ms delayed ACK
   (every second segment at once).
 - Slow start and congestion avoidance with byte counting, fast
   retransmit with NewReno partial ACKs, Minshall's Nagle, and egress
   credit.
+
+The unimpaired runs below never exercise the loss paths (RTO, fast
+retransmit, NewReno, SACK processing, the assembler). So a separate run
+in harness 1 dropped every 20th, 100th or 1,000th packet each way, for
+32 MiB transfers, in all four pairings of the two engines. That run found
+two bugs in the prototype, which were fixed: after a timeout, a
+cumulative ACK past what had been resent misaligned the data still to
+send, and the assembler capped segments rather than ranges. Both fixes
+touch only the loss paths, so they do not change the unimpaired figures
+below, which were taken before them. After the fixes, all 24 lossy
+transfers arrived intact (`0016-results/loss.txt`). Their rates are not
+comparable, being single runs of a fixed drop pattern against an engine
+without RFC 6675 recovery or RACK.
 
 It runs in one process. The engine is a value in the Stack process's
 dictionary, keyed by the reference the Stack takes for the NIF resource,
@@ -67,7 +80,8 @@ the receiver.
   schedulers. A second pass profiled 128 MiB transfers with scheduler
   busy-waiting off (`+sbwt none`). It recorded the VM's CPU time and
   traced each Stack process's time on CPU and its garbage collections.
-- **Harness 2, the real path.** `integration/netem_matrix.exs` with
+- **Harness 2, the real path.** `0016-results/Dockerfile` and `h2.sh`
+  are the container and the runner. `integration/netem_matrix.exs` with
   `--profiles none --family inet --streams 1,4 --bytes 268435456` ran
   under `netem-topology.sh isolate`, in a privileged Linux container
   (kernel 7.0.14-linuxkit, Docker Desktop on the same host), pinned with
@@ -78,7 +92,10 @@ the receiver.
   GNU `time` measured each whole run's CPU. That kernel has no `ifb`, so
   no impaired profile could run.
 
-The raw results are in `0016-results/`. Absolute rates are this host's,
+The raw results are in `0016-results/`. The `states` and `cores`
+figures from microstate accounting in `harness1.json` and the profiles
+are wall time per scheduler state, inflated when threads outnumber
+cores. They are not CPU time, and nothing here relies on them. Absolute rates are this host's,
 and are about three times `netem.md`'s, which were taken on a 20-core NUC.
 Only the ratios carry over.
 
@@ -140,9 +157,11 @@ referenced from its heap, and they fill the default binary virtual heap.
 Setting `min_bin_vheap_size` to 1 Mi words and `min_heap_size` to
 32 Ki words on the Stack process, from inside the engine, cut its time in
 GC by 8×. It also cut its CPU per MiB by about a third, and lifted
-harness 2 from 1.01–1.30× of the NIF to 1.27–1.42×. Process heaps stayed
-under 150 KB in every case; the buffered data is off-heap. The longest
-single pause was not measured.
+harness 2 from 1.01–1.30× of the NIF to 1.27–1.42×. The cost is memory.
+Sampled once after each transfer, an untuned Stack process used at most
+110 KB, and a tuned one 1.0 to 1.4 MB. A tuned process may also hold up
+to 8 MiB of binaries it no longer references before it collects them.
+The longest single pause was not measured.
 
 ## Decision
 
@@ -178,7 +197,7 @@ Consequences for the plan:
   in one process remain a risk to measure at phase 8, with larger
   buffers and many sockets, which this spike did not try.
 - **Measuring:** harness 2 ran in a privileged container on macOS
-  (`spike/Dockerfile` and `spike/h2.sh` on the spike branch). That is
+  (`0016-results/Dockerfile` and `h2.sh`). That is
   enough for unimpaired runs; impaired runs need a kernel with `ifb`, as
   the CI runners have.
 
