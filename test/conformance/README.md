@@ -155,9 +155,14 @@ MIX_ENV=test mix run scripts/backend_traces.exs
 
 The scenarios are in `SmolNet.Conformance.Scenarios`: six 32 KiB transfers
 through the link simulator (below), clean and impaired, over IPv4 and IPv6,
-and `ingress_replies`, the packets a stack answers by itself (echo, Port and
+`ingress_replies`, the packets a stack answers by itself (echo, Port and
 Protocol Unreachable, Parameter Problem, a RST for a closed port, an IPv4
-fragment, a datagram for a bound socket). `differential_test.exs` replays
+fragment, a datagram for a bound socket), and `stack_replies`, the same for
+a stack with no sockets over the IP layer's corners: broadcast and multicast
+destinations, source address selection, Hop-by-Hop options, quotes
+truncated to the minimum MTU, path MTU errors, then 300 packets from
+`SmolNet.Conformance.StackPackets` with a fixed seed. `stack_replies` needs
+no socket, so it is phase 3's differential target. `differential_test.exs` replays
 every committed trace on the suite's backend: on the NIF it fails when the
 NIF's behaviour changes until the traces are recorded again and committed,
 and on any other backend it is the comparison itself.
@@ -237,11 +242,18 @@ targets, at the backend boundary so that they hold for any backend:
 
 - `ingress_property_test.exs`: whatever packets arrive, well formed or
   damaged (`SmolNet.Conformance.Generators`), ingress answers `:ok` or an
-  error and the stack still answers a ping.
+  error and the stack still answers a ping; and the same of the Elixir
+  backend's IP layer alone, whatever the suite's backend.
+- `stack_replies_test.exs` (`:nif`): the Elixir backend and the NIF, fed
+  the same random packets from `SmolNet.Conformance.StackPackets`, give the
+  same results, the same replies byte for byte, and the same counters. What
+  it finds is kept in the `stack_replies` trace, which outlives the NIF.
 - `differential_test.exs`: over random links the simulator delivers the
   stream intact and finishes, and the initial sequence numbers follow the
   PCG for random seeds. Until #177 is fixed, a close that stalls on its
   lost FIN (`LinkSim.lost_fin?/1`) is allowed, the data still intact.
 
-Parser round trips and the buffers and assembler against a model come with
-the Elixir modules they test, in phases 3 and 5.
+The wire parsers' properties (they never raise, and what they emit parses
+back) are in `test/smol_net/core/wire/properties_test.exs`, beside smoltcp's
+ported wire tests. The buffers and assembler against a model come with the
+Elixir modules they test, in phase 5.

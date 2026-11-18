@@ -10,6 +10,7 @@ defmodule SmolNet.Conformance.Scenarios do
   alias SmolNet.Conformance.Driver
   alias SmolNet.Conformance.LinkSim
   alias SmolNet.Conformance.Packets
+  alias SmolNet.Conformance.StackPackets
   alias SmolNet.Conformance.Trace
 
   @transfers [
@@ -40,7 +41,7 @@ defmodule SmolNet.Conformance.Scenarios do
         Trace.new(name, description, result.entries)
       end
 
-    transfers ++ [ingress_replies(backend)]
+    transfers ++ [ingress_replies(backend), stack_replies(backend)]
   end
 
   @local4 <<192, 0, 2, 1>>
@@ -109,5 +110,130 @@ defmodule SmolNet.Conformance.Scenarios do
       "What a stack answers by itself to IPv4 and IPv6 packets.",
       Driver.trace(driver)
     )
+  end
+
+  @broadcast4 <<192, 0, 2, 255>>
+  @all_nodes <<0xFF02::16, 0::96, 1::16>>
+  @link_local_peer <<0xFE80::16, 0::96, 9::16>>
+  # Not the stack's, but shares its last two bytes with fd00::1.
+  @last_two_bytes <<0x2001::16, 0xDB8::16, 0::64, 0x77::16, 1::16>>
+
+  @doc """
+  What a stack with no sockets answers by itself, the IP layer's corners
+  included: named cases first, then packets from
+  `StackPackets.packet/0` with a fixed seed. No call needs a socket, so
+  this is the trace the Elixir backend replays before it has any.
+  """
+  def stack_replies(backend) do
+    {:ok, driver} = Driver.start(:stack, backend, StackPackets.config(), 0)
+    random = StackPackets.packet() |> StreamData.seeded(173) |> Enum.take(300)
+
+    driver =
+      (named_packets() ++ random)
+      |> Enum.with_index(1)
+      |> Enum.reduce(driver, fn {packet, at}, driver ->
+        {_result, driver} = Driver.call(driver, :stack_ingress, [packet], at)
+        driver
+      end)
+
+    {_snapshot, driver} = Driver.call(driver, :stack_poll, [], 1_000)
+
+    Trace.new(
+      "stack_replies",
+      "What a stack with no sockets answers, the IP layer's corners included.",
+      Driver.trace(driver)
+    )
+  end
+
+  defp named_packets do
+    echo4 = Packets.icmpv4_echo(7, 1, "ping")
+    echo6 = &Packets.icmpv6_echo(&1, &2, 7, 1, "ping")
+    syn = %{source: 40_000, destination: 81, seq: 1_000, flags: [:syn], window: 1_000}
+
+    [
+      # Echo to the subnet's broadcast address, answered from the first
+      # IPv4 address, and to 224.0.0.1, not answered.
+      Packets.ipv4(@peer4, @broadcast4, 1, echo4),
+      Packets.ipv4(@peer4, <<224, 0, 0, 1>>, 1, echo4),
+      # A SYN to the broadcast address draws a RST from it.
+      Packets.ipv4(@peer4, @broadcast4, 6, Packets.tcp(@peer4, @broadcast4, syn)),
+      # A SYN with data, and a segment with neither SYN nor ACK.
+      Packets.ipv4(
+        @peer4,
+        @local4,
+        6,
+        Packets.tcp(@peer4, @local4, Map.put(syn, :payload, "data"))
+      ),
+      Packets.ipv4(
+        @peer4,
+        @local4,
+        6,
+        Packets.tcp(@peer4, @local4, %{syn | flags: [:psh], seq: 7})
+      ),
+      # Port Unreachable quoting a long datagram, truncated to fit 576 and
+      # 1280 bytes.
+      Packets.ipv4(
+        @peer4,
+        @local4,
+        17,
+        Packets.udp(@peer4, @local4, 40_000, 9, :binary.copy("x", 1_000))
+      ),
+      Packets.ipv6(
+        @peer6,
+        @local6,
+        17,
+        Packets.udp(@peer6, @local6, 40_000, 9, :binary.copy("x", 1_300))
+      ),
+      # Echo to all nodes, answered from the chosen source address, for a
+      # unique-local and a link-local peer.
+      Packets.ipv6(@peer6, @all_nodes, 58, echo6.(@peer6, @all_nodes)),
+      Packets.ipv6(@link_local_peer, @all_nodes, 58, echo6.(@link_local_peer, @all_nodes)),
+      # Echo to ::1, and to an address taken as a solicited-node group.
+      Packets.ipv6(@peer6, <<0::120, 1>>, 58, echo6.(@peer6, <<0::120, 1>>)),
+      Packets.ipv6(@peer6, @last_two_bytes, 58, echo6.(@peer6, @last_two_bytes)),
+      # Hop-by-Hop: an unrecognised option that asks for an error; one that
+      # asks for an error only to unicast, sent to all nodes; the fifth
+      # option, which is never read; and a second Hop-by-Hop header.
+      Packets.ipv6(
+        @peer6,
+        @local6,
+        0,
+        hop_by_hop(58, <<0x9E, 2, 0, 0>>, echo6.(@peer6, @local6))
+      ),
+      Packets.ipv6(
+        @peer6,
+        @all_nodes,
+        0,
+        hop_by_hop(58, <<0xDE, 2, 0, 0>>, echo6.(@peer6, @all_nodes))
+      ),
+      Packets.ipv6(
+        @peer6,
+        @local6,
+        0,
+        hop_by_hop(58, <<0, 0, 0, 0, 0x9E, 0, 0, 0>>, echo6.(@peer6, @local6))
+      ),
+      Packets.ipv6(
+        @peer6,
+        @local6,
+        0,
+        hop_by_hop(0, <<1, 2, 0, 0>>, hop_by_hop(58, <<1, 2, 0, 0>>, echo6.(@peer6, @local6)))
+      )
+    ]
+  end
+
+  # A Hop-by-Hop header of `options` (padded to 6 bytes with PadN), then
+  # `payload`.
+  defp hop_by_hop(next_header, options, payload) do
+    padding = 6 - rem(byte_size(options), 8)
+
+    padded =
+      case padding do
+        0 -> options
+        1 -> options <> <<0>>
+        n when n > 1 -> options <> <<1, n - 2>> <> :binary.copy(<<0>>, n - 2)
+        n -> options <> <<1, n + 6>> <> :binary.copy(<<0>>, n + 6)
+      end
+
+    <<next_header, div(byte_size(padded) + 2, 8) - 1, padded::binary, payload::binary>>
   end
 end

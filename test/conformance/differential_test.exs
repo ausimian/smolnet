@@ -42,6 +42,7 @@ defmodule SmolNet.Conformance.DifferentialTest do
     test "cover transfers under every impairment, and the stack's own replies" do
       assert Enum.map(Trace.all(), & &1.name) == [
                "ingress_replies",
+               "stack_replies",
                "tcp_clean_inet",
                "tcp_clean_inet6",
                "tcp_duplicate_inet",
@@ -53,9 +54,23 @@ defmodule SmolNet.Conformance.DifferentialTest do
 
     # On the NIF this checks that the traces are current and that it is
     # deterministic; on another backend it is the differential comparison.
-    test "replay call for call on this backend", %{backend: backend} do
-      for trace <- Trace.all() do
-        assert Trace.replay(trace, backend) == :ok, trace.name
+    # On the Elixir backend a trace runs once the phase of #173 it needs
+    # has landed.
+    for {name, phase} <- [
+          {"ingress_replies", 4},
+          {"stack_replies", nil},
+          {"tcp_clean_inet", 5},
+          {"tcp_clean_inet6", 5},
+          {"tcp_duplicate_inet", 6},
+          {"tcp_impaired_inet", 6},
+          {"tcp_loss_inet", 6},
+          {"tcp_reorder_inet6", 6}
+        ] do
+      if phase, do: @tag(:"elixir_phase_#{phase}")
+
+      test "#{name} replays call for call on this backend", %{backend: backend} do
+        trace = Enum.find(Trace.all(), &(&1.name == unquote(name)))
+        assert Trace.replay(trace, backend) == :ok
       end
     end
   end
@@ -70,7 +85,7 @@ defmodule SmolNet.Conformance.DifferentialTest do
   end
 
   test "a replay reports the first call that differs", %{backend: backend} do
-    trace = Enum.find(Trace.all(), &(&1.name == "ingress_replies"))
+    trace = Enum.find(Trace.all(), &(&1.name == "stack_replies"))
     index = Enum.find_index(trace.entries, &(&1.emitted != []))
 
     altered =
@@ -80,12 +95,13 @@ defmodule SmolNet.Conformance.DifferentialTest do
 
     assert {:error, [mismatch]} = Trace.replay(altered, backend)
 
-    assert %{trace: "ingress_replies", index: ^index, field: :emitted, expected: [<<0>>]} =
+    assert %{trace: "stack_replies", index: ^index, field: :emitted, expected: [<<0>>]} =
              mismatch
 
     assert Trace.replay(altered, backend, ignore: [:emitted]) == :ok
   end
 
+  @tag :elixir_phase_5
   test "a trace survives its file format", %{backend: backend} do
     dir = Path.join(System.tmp_dir!(), "smolnet-trace-#{System.unique_integer([:positive])}")
     File.mkdir_p!(dir)
@@ -98,6 +114,7 @@ defmodule SmolNet.Conformance.DifferentialTest do
   end
 
   describe "the link simulator" do
+    @tag :elixir_phase_6
     test "is a function of its options", %{backend: backend} do
       options = [
         seed: 7,
@@ -113,6 +130,7 @@ defmodule SmolNet.Conformance.DifferentialTest do
       refute LinkSim.run(Keyword.put(options, :seed, 8)).entries == first.entries
     end
 
+    @tag :elixir_phase_6
     test "recognises #177's lost FIN", %{backend: backend} do
       result = LinkSim.run(seed: 2, bytes: 16_384, backend: backend, profile: %{loss: 0.05})
       assert result.received == result.sent
@@ -130,6 +148,7 @@ defmodule SmolNet.Conformance.DifferentialTest do
       refute LinkSim.lost_fin?(LinkSim.run(seed: 1, bytes: 1_024, backend: backend))
     end
 
+    @tag :elixir_phase_5
     test "reports a transfer that cannot finish", %{backend: backend} do
       lost = [seed: 1, bytes: 4_096, backend: backend, profile: %{loss: 1.0}]
       assert {:timeout, _at} = LinkSim.run([deadline: 1_000] ++ lost).status
@@ -143,6 +162,7 @@ defmodule SmolNet.Conformance.DifferentialTest do
     # Integrity and liveness over random links. A stack may lose a FIN for
     # good when a duplicate ACK cancels its retransmission (#177): every
     # byte still arrives, but the close never completes.
+    @tag :elixir_phase_6
     property "delivers the stream intact and finishes, whatever the link", %{backend: backend} do
       check all(
               seed <- integer(1..1_000_000),
@@ -173,6 +193,7 @@ defmodule SmolNet.Conformance.DifferentialTest do
   end
 
   describe "the determinism hooks" do
+    @tag :elixir_phase_5
     property "a stack's initial sequence numbers follow smoltcp's PCG from its seed", %{
       backend: backend
     } do
@@ -181,6 +202,7 @@ defmodule SmolNet.Conformance.DifferentialTest do
       end
     end
 
+    @tag :elixir_phase_5
     test "a listener's SYN-ACK takes the next one", %{backend: backend} do
       result = LinkSim.run(seed: 21, bytes: 1, backend: backend)
       [server_isn] = Pcg32.isns(21 * 2 + 1, 1)
@@ -199,10 +221,10 @@ defmodule SmolNet.Conformance.DifferentialTest do
 
   test "the driver refuses a stale backend state", %{backend: backend} do
     {:ok, driver} = Driver.start(:stack, backend, [addresses: [{{192, 0, 2, 1}, 24}]], 0)
-    {{:ok, _socket}, _newer} = Driver.call(driver, :udp_open, [:inet], 0)
+    {{:ok, :ok}, _newer} = Driver.call(driver, :stack_poll, [], 0)
 
     assert_raise RuntimeError, ~r/stale backend state/, fn ->
-      Driver.call(driver, :udp_open, [:inet], 0)
+      Driver.call(driver, :stack_poll, [], 0)
     end
   end
 

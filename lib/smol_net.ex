@@ -108,8 +108,12 @@ defmodule SmolNet do
   `0xFFFF_FFFF`, is the credit the stack starts with; see `grant_egress/3`.
   An invalid value is rejected with `:invalid_egress_credit`.
 
-  `:backend` selects the protocol engine. The only one is `:native`, the
-  smoltcp NIF, which is the default; `stack_info/1` reports it as `:backend`.
+  `:backend` selects the protocol engine: `:native`, the smoltcp NIF, which
+  is the default, or `:elixir`, a pure-Elixir engine still in development,
+  which so far answers only what a stack answers by itself (echo, Port and
+  Protocol Unreachable, Parameter Problem, a RST for a closed port), has no
+  sockets (opening one returns `{:error, :not_implemented}`) and refuses
+  `:egress_credit` the same way. `stack_info/1` reports it as `:backend`.
   Any other value is rejected with `:invalid_backend`.
 
   `SmolNet.Loopback.start_link/1` starts a stack whose egress is a link back

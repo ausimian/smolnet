@@ -32,9 +32,12 @@ SMOLNET_TEST_TIMEOUT_SCALE=5 mix test
 implementing `SmolNet.Stack.Backend`, chosen per stack with the `:backend`
 option. Each callback is one stack operation and returns `{reply, state,
 effects}`; the shell keeps the state, sends the effects' packets, readiness
-and abort messages, and arms the poll timer. The only backend today is
-`:native`, the NIF behind `SmolNet.Stack.Backend.Native`, while #173
-replaces it with an Elixir one.
+and abort messages, and arms the poll timer. There are two: `:native`, the
+NIF behind `SmolNet.Stack.Backend.Native`, and `:elixir`,
+`SmolNet.Stack.Backend.Elixir`, which wraps the pure core `SmolNet.Core` that
+#173 builds in phases to replace the NIF. The Elixir backend's module is
+always written in full, never aliased, since an alias named `Elixir` would
+shadow the root namespace.
 
 The suite runs once per backend. `SMOLNET_TEST_BACKEND` names the one stacks
 start with when a test does not choose (default `native`):
@@ -59,7 +62,25 @@ each optional:
   for TCP and UDP alike.
 
 Tests of the NIF itself are tagged `:nif`, and those needing its debug
-hooks `:debug_nif`; both run only on the native backend. A test that reads a
+hooks `:debug_nif`; both run only on the native backend.
+
+The Elixir backend is built in phases, and a test that needs a phase still
+to come is tagged with it: `:elixir_phase_4` (UDP sockets) to
+`:elixir_phase_7` (keepalive, user timeout, path MTU, egress credit,
+link-down policies and the shutdown lifecycle), as `@moduletag` for a whole
+file and `@tag` where a file mixes phases. `test/test_helper.exs` excludes
+those tags under `SMOLNET_TEST_BACKEND=elixir` only, so the native run is
+unaffected, and CI gates whatever already passes on the Elixir backend. A
+phase's exit criterion includes removing its tag from every test and from
+the exclusion list; to see what it still has to do:
+
+```console
+SMOLNET_TEST_BACKEND=elixir mix test --only elixir_phase_4
+```
+
+A test comparing the two backends directly, such as
+`test/conformance/stack_replies_test.exs`, needs the NIF and is tagged
+`:nif`; the traces it feeds outlive the NIF. A test that reads a
 `stack_info/1` key only the NIF reports checks it through
 `SmolNet.Test.Snapshot.nif/2`. The compatibility job's `backend` matrix
 dimension lists the backends CI runs. Tests of the shell itself use

@@ -1,6 +1,9 @@
 defmodule SmolNet.TcpKeepaliveTest do
   use ExUnit.Case, async: false
 
+  # Needs TCP keepalive, which the Elixir backend gains in phase 7 of #173.
+  @moduletag :elixir_phase_7
+
   alias SmolNet.Inet.Tcp
   alias SmolNet.Inet.Udp
   alias SmolNet.Test.ClockedPair

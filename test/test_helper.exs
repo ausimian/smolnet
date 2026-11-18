@@ -19,8 +19,17 @@ Application.put_env(:smolnet, :backend, backend)
 # They move with the host so that scaled per-call budgets cannot be cut short
 # by an unscaled enclosing one. `refute_receive_timeout` is a quiescence
 # budget and keeps its default.
+exclude =
+  case backend do
+    :native ->
+      []
+
+    :elixir ->
+      [:nif, :debug_nif, :elixir_phase_4, :elixir_phase_5, :elixir_phase_6, :elixir_phase_7]
+  end
+
 ExUnit.start(
-  exclude: if(backend == :native, do: [], else: [:nif, :debug_nif]),
+  exclude: exclude,
   timeout: Timing.liveness(60_000),
   assert_receive_timeout: Timing.liveness(100)
 )

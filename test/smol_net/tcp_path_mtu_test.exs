@@ -1,6 +1,9 @@
 defmodule SmolNet.TcpPathMtuTest do
   use ExUnit.Case, async: false
 
+  # Needs path MTU, which the Elixir backend gains in phase 7 of #173.
+  @moduletag :elixir_phase_7
+
   import Bitwise
 
   alias SmolNet.Test.RawIpLink
