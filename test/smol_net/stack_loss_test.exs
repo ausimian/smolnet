@@ -13,6 +13,9 @@ defmodule SmolNet.StackLossTest do
   # there too (#136).
   use ExUnit.Case, async: false
 
+  # Needs the shutdown lifecycle with sockets, which the Elixir backend gains in phase 7 of #173.
+  @moduletag :elixir_phase_7
+
   alias SmolNet.Inet6.Tcp
   alias SmolNet.Inet6.Udp
   alias SmolNet.Stack.Ref

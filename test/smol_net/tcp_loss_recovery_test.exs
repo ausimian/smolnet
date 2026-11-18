@@ -1,6 +1,9 @@
 defmodule SmolNet.TcpLossRecoveryTest do
   use ExUnit.Case, async: false
 
+  # Needs TCP loss recovery, which the Elixir backend gains in phase 6 of #173.
+  @moduletag :elixir_phase_6
+
   alias SmolNet.Test.LossyLink
   alias SmolNet.Test.Timing
 

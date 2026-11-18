@@ -299,6 +299,8 @@ defmodule SmolNet.StackLinkTest do
     end)
   end
 
+  # How the Elixir backend honours the output limits is phase 7's (#173).
+  @tag :elixir_phase_7
   test "continues output past its byte budget before processing the next admitted ingress" do
     {:ok, stack} =
       SmolNet.start_stack(

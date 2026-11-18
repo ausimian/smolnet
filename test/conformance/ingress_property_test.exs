@@ -9,6 +9,7 @@ defmodule SmolNet.Conformance.IngressPropertyTest do
   alias SmolNet.Conformance.Driver
   alias SmolNet.Conformance.Generators
   alias SmolNet.Conformance.Packets
+  alias SmolNet.Conformance.StackPackets
   alias SmolNet.Stack.Backend
 
   @local4 <<192, 0, 2, 1>>
@@ -16,6 +17,9 @@ defmodule SmolNet.Conformance.IngressPropertyTest do
   @local6 <<0xFD00::16, 0::96, 1::16>>
   @peer6 <<0xFD00::16, 0::96, 9::16>>
 
+  # The listener and the UDP socket need the Elixir backend's TCP, which
+  # comes in phase 5 of #173.
+  @tag :elixir_phase_5
   property "ingress never fails on what a peer sends, and the stack still answers" do
     check all(
             packets <-
@@ -41,6 +45,32 @@ defmodule SmolNet.Conformance.IngressPropertyTest do
         end)
 
       # It still answers a ping.
+      ping = Packets.icmpv4_echo(9, 9, "still there?")
+      echo = Packets.ipv4(@peer4, @local4, 1, ping)
+      {{:ok, :ok}, driver} = Driver.call(driver, :stack_ingress, [echo], 100)
+      assert [%{emitted: [_reply]} | _rest] = driver.trace
+    end
+  end
+
+  # The same of the Elixir backend's IP layer alone, whatever the suite's
+  # backend, with the packets that reach its corners.
+  property "the Elixir backend's ingress never fails, and it still answers" do
+    check all(
+            packets <- list_of(StackPackets.packet(), min_length: 1, max_length: 8),
+            max_runs: 300
+          ) do
+      {:ok, driver} =
+        Driver.start(:stack, SmolNet.Stack.Backend.Elixir, StackPackets.config(), 0)
+
+      driver =
+        packets
+        |> Enum.with_index(1)
+        |> Enum.reduce(driver, fn {packet, at}, driver ->
+          {result, driver} = Driver.call(driver, :stack_ingress, [packet], at)
+          assert result == {:ok, :ok} or match?({:error, reason} when is_atom(reason), result)
+          driver
+        end)
+
       ping = Packets.icmpv4_echo(9, 9, "still there?")
       echo = Packets.ipv4(@peer4, @local4, 1, ping)
       {{:ok, :ok}, driver} = Driver.call(driver, :stack_ingress, [echo], 100)

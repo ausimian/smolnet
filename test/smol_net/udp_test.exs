@@ -1,6 +1,9 @@
 defmodule SmolNet.UdpTest do
   use ExUnit.Case, async: false
 
+  # Needs UDP sockets, which the Elixir backend gains in phase 4 of #173.
+  @moduletag :elixir_phase_4
+
   alias SmolNet.Inet6.Udp
   alias SmolNet.Test.RawIpLink
   alias SmolNet.Test.Timing

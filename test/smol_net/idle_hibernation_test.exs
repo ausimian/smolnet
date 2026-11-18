@@ -5,6 +5,9 @@ defmodule SmolNet.IdleHibernationTest do
   # alongside the other async modules.
   use ExUnit.Case, async: true
 
+  # Needs idle sockets, which the Elixir backend gains in phase 7 of #173.
+  @moduletag :elixir_phase_7
+
   alias SmolNet.Loopback
   alias SmolNet.Test.Timing
 

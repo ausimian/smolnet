@@ -23,8 +23,10 @@ jobs:
       matrix:
         # The suite runs once per protocol backend (SmolNet.Stack.Backend);
         # tests of the NIF itself are tagged :nif or :debug_nif and run only
-        # on `native`. See test/test_helper.exs.
-        backend: [native]
+        # on `native`, and tests the Elixir backend cannot pass until a
+        # later phase of #173 are tagged :elixir_phase_N and excluded on
+        # `elixir`. See test/test_helper.exs and MAINTAINING.md.
+        backend: [native, elixir]
         toolchain:
           - {os: ubuntu-24.04, elixir: "1.20", otp: "29"}
           - {os: ubuntu-24.04, elixir: "1.20", otp: "28"}

@@ -1,6 +1,9 @@
 defmodule SmolNet.TcpUserTimeoutTest do
   use ExUnit.Case, async: false
 
+  # Needs TCP's user timeout, which the Elixir backend gains in phase 7 of #173.
+  @moduletag :elixir_phase_7
+
   alias SmolNet.Test.ClockedPair
   alias SmolNet.Test.ManualClock
   alias SmolNet.Test.RawIpLink

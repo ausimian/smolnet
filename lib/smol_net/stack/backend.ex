@@ -141,7 +141,7 @@ defmodule SmolNet.Stack.Backend do
                       test_socket_ready: 2,
                       test_socket_close: 3
 
-  @backends %{native: SmolNet.Stack.Backend.Native}
+  @backends %{native: SmolNet.Stack.Backend.Native, elixir: SmolNet.Stack.Backend.Elixir}
 
   @doc """
   The names the `:backend` stack option accepts.
