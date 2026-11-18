@@ -2,6 +2,7 @@ defmodule SmolNet.Conformance.TcpVectorsTest do
   use ExUnit.Case, async: true
 
   alias SmolNet.Conformance.TcpReplay
+  alias SmolNet.Conformance.TcpReplay.Connection
   alias SmolNet.Conformance.TcpReplay.Recorded
   alias SmolNet.Conformance.TcpVector
 
@@ -72,6 +73,19 @@ defmodule SmolNet.Conformance.TcpVectorsTest do
 
   test "the recorded subject replays every vector", %{vectors: vectors} do
     assert TcpReplay.replay_all(vectors, Recorded, subject_args: &Recorded.args/2) == []
+  end
+
+  # Every field of every state, smoltcp's own bookkeeping included (the
+  # RACK send log, the assembler's layout, CUBIC's floats), so the
+  # connection keeps what smoltcp keeps, not just what it sends.
+  test "the Elixir connection replays every vector, field for field", %{vectors: vectors} do
+    assert Connection.compared_fields() == TcpVector.state_fields()
+
+    upstream = Enum.filter(vectors, &(&1.origin == "upstream"))
+    assert length(upstream) == 183
+    assert TcpReplay.replay_all(upstream, Connection) == []
+
+    assert TcpReplay.replay_all(vectors -- upstream, Connection) == []
   end
 
   describe "the runner reports" do
