@@ -842,19 +842,13 @@ defmodule SmolNet.Core.Tcp do
     end
   end
 
-  # Takes a connection's wakes and fires the wakers they consume.
-  defp take_wakes(core, {:socket, id}, conn) do
-    {{rx, tx}, conn} = Connection.take_wakes(conn)
-    {:ok, entry} = Map.fetch(core.sockets.entries, id)
-    identity = {id, entry.generation}
-    record = entry.state
-    {rx_ref, read} = if rx, do: {record.wakers.read, nil}, else: {nil, record.wakers.read}
-    {tx_ref, write} = if tx, do: {record.wakers.write, nil}, else: {nil, record.wakers.write}
-    record = %{record | conn: conn, wakers: %{read: read, write: write}}
-    core = put(core, identity, record)
-    {core, read_effects} = fire(core, identity, :read, rx_ref)
-    {core, write_effects} = fire(core, identity, :write, tx_ref)
-    {core, read_effects ++ write_effects}
+  # Puts a connection back in its place, taking its wakes and firing the
+  # wakers they consume.
+  defp take_wakes(core, {:socket, id} = ref, conn) do
+    case Connection.take_wakes(conn) do
+      {{false, false}, conn} -> {put_conn(core, ref, conn), []}
+      {{rx, tx}, conn} -> fire_wakes(core, id, {rx, tx}, conn)
+    end
   end
 
   defp take_wakes(core, {:embryo, key}, conn) do
@@ -875,6 +869,19 @@ defmodule SmolNet.Core.Tcp do
     closing = Map.fetch!(core.tcp.closing, id)
     closing = %{closing | record: %{closing.record | conn: conn}}
     {%{core | tcp: %{core.tcp | closing: Map.put(core.tcp.closing, id, closing)}}, []}
+  end
+
+  defp fire_wakes(core, id, {rx, tx}, conn) do
+    {:ok, entry} = Map.fetch(core.sockets.entries, id)
+    identity = {id, entry.generation}
+    record = entry.state
+    {rx_ref, read} = if rx, do: {record.wakers.read, nil}, else: {nil, record.wakers.read}
+    {tx_ref, write} = if tx, do: {record.wakers.write, nil}, else: {nil, record.wakers.write}
+    record = %{record | conn: conn, wakers: %{read: read, write: write}}
+    core = put(core, identity, record)
+    {core, read_effects} = fire(core, identity, :read, rx_ref)
+    {core, write_effects} = fire(core, identity, :write, tx_ref)
+    {core, read_effects ++ write_effects}
   end
 
   ## Ingress
@@ -1026,44 +1033,85 @@ defmodule SmolNet.Core.Tcp do
   reply's deadline is the next connection timer or close deadline.
   """
   def drive({reply, core, effects}, now) do
-    {core, promoted} = refresh_listeners(core)
-    {core, sent, wakes} = egress(core, now)
-    {core, sent, wakes} = expire_closing(core, now, sent, wakes)
-    {core, promoted_after} = refresh_listeners(core)
-    core = reap(core)
-
-    finish(
-      {reply, core, effects ++ promoted ++ :lists.reverse(sent) ++ wakes ++ promoted_after},
-      now,
-      :drive
-    )
+    {core, sent, wakes, {promoted, promoted_after}} = drive_all(core, now)
+    effects = effects ++ promoted ++ :lists.reverse(sent) ++ wakes ++ promoted_after
+    {reply, core, order_notices(effects)}
   end
 
   @doc "The same, for ingress, whose replies come first."
   def drive_ingress(core, now, effects, wakes) do
-    {core, promoted} = refresh_listeners(core)
-    {core, sent, egress_wakes} = egress(core, now)
-    {core, sent, egress_wakes} = expire_closing(core, now, sent, egress_wakes)
-    {core, promoted_after} = refresh_listeners(core)
-    core = reap(core)
-    core = %{core | poll_at: poll_at(core, now, :drive)}
+    {core, sent, egress_wakes, {promoted, promoted_after}} = drive_all(core, now)
     {core, effects ++ :lists.reverse(sent), wakes ++ promoted ++ egress_wakes ++ promoted_after}
   end
 
-  defp finish({reply, core, effects}, now, kind) do
-    {notices, others} = Enum.split_with(effects, &(elem(&1, 0) in [:wake, :abort]))
-    {aborts, wakes} = Enum.split_with(notices, &(elem(&1, 0) == :abort))
-
-    {reply, %{core | poll_at: poll_at(core, now, kind)},
-     others ++ aborts ++ Enum.sort_by(wakes, &elem(&1, 2))}
+  # With no handshake under way and no connection closing, as in a bulk
+  # transfer, no step changes which connections there are, so the list
+  # egress took serves for the deadline too.
+  defp drive_all(%{tcp: %{embryos: embryos, closing: closing}} = core, now)
+       when map_size(embryos) == 0 and map_size(closing) == 0 do
+    cx = cx(core, now)
+    refs = connections(core)
+    {core, sent, wakes, drained} = egress_pass(core, cx, refs, [], [])
+    {%{core | poll_at: drive_poll_at(core, refs, drained)}, sent, wakes, {[], []}}
   end
+
+  defp drive_all(core, now) do
+    cx = cx(core, now)
+    {core, promoted} = refresh_listeners(core)
+    {core, sent, wakes, drained} = egress_pass(core, cx, connections(core), [], [])
+    {core, sent, wakes, drained} = expire_closing(core, cx, {sent, wakes, drained})
+    {core, promoted_after} = refresh_listeners(core)
+    core = reap(core)
+    poll_at = drive_poll_at(core, connections(core), drained)
+    {%{core | poll_at: poll_at}, sent, wakes, {promoted, promoted_after}}
+  end
+
+  # A call that does not drive the stack reports the connections' timers
+  # as they stand.
+  defp finish({reply, core, effects}, now, :current) do
+    {reply, %{core | poll_at: poll_at(core, cx(core, now))}, order_notices(effects)}
+  end
+
+  # The packets first, in order, then the aborts, then the wakes in
+  # identity order (the sort is stable).
+  defp order_notices(effects), do: order_notices(effects, [], [], [])
+
+  defp order_notices([], others, [], []), do: :lists.reverse(others)
+
+  defp order_notices([], others, aborts, wakes) do
+    :lists.reverse(
+      others,
+      :lists.reverse(aborts, Enum.sort_by(:lists.reverse(wakes), &elem(&1, 2)))
+    )
+  end
+
+  defp order_notices([{:wake, _pid, _identity, _ref} = wake | effects], others, aborts, wakes),
+    do: order_notices(effects, others, aborts, [wake | wakes])
+
+  defp order_notices([{:abort, _, _, _, _} = abort | effects], others, aborts, wakes),
+    do: order_notices(effects, others, [abort | aborts], wakes)
+
+  defp order_notices([effect | effects], others, aborts, wakes),
+    do: order_notices(effects, [effect | others], aborts, wakes)
 
   # Closing connections past their deadline are aborted, once the others
   # have sent what they had, so that one sends what fell due at its deadline
   # before its RST, which a second pass sends: the NIF sweeps its closing
   # sockets after egress, and sends their RSTs in the continuation that
   # sweep asks for.
-  defp expire_closing(core, now, sent, wakes) do
+  defp expire_closing(%{tcp: %{closing: closing}} = core, _cx, {sent, wakes, drained})
+       when map_size(closing) == 0,
+       do: {core, sent, wakes, drained}
+
+  defp expire_closing(core, cx, {sent, wakes, drained}) do
+    now = div(cx.now, @ms)
+
+    if Enum.any?(core.tcp.closing, fn {_id, %{deadline: at}} -> at != nil and now >= at end),
+      do: expire_closing(core, cx, now, sent, wakes),
+      else: {core, sent, wakes, drained}
+  end
+
+  defp expire_closing(core, cx, now, sent, wakes) do
     {closing, expired} =
       Enum.map_reduce(core.tcp.closing, false, fn
         {id, %{deadline: deadline} = closing}, _expired
@@ -1084,12 +1132,15 @@ defmodule SmolNet.Core.Tcp do
     core = %{core | tcp: %{core.tcp | closing: Map.new(closing)}}
 
     if expired,
-      do: egress_pass(core, cx(core, now), sent, wakes),
-      else: {core, sent, wakes}
+      do: egress_pass(core, cx, connections(core), sent, wakes),
+      else: {core, sent, wakes, :drained}
   end
 
   # Handshakes that completed join their listener's accept queue, or are
   # dropped when it is full or the table is; those that died are dropped.
+  defp refresh_listeners(%{tcp: %{embryos: embryos}} = core) when map_size(embryos) == 0,
+    do: {core, []}
+
   defp refresh_listeners(core) do
     core.tcp.embryos
     |> Enum.sort_by(fn {_key, embryo} -> embryo.order end)
@@ -1195,33 +1246,33 @@ defmodule SmolNet.Core.Tcp do
   end
 
   # Every connection with a peer, asked in turn for one segment, until none
-  # has more. Returns the segments sent (reversed) and the wakes.
-  defp egress(core, now) do
-    cx = cx(core, now)
-    egress_pass(core, cx, [], [])
-  end
-
-  defp egress_pass(core, cx, sent, wakes) do
-    {core, sent_now, wakes} =
-      core
-      |> connections()
-      |> Enum.reduce({core, [], wakes}, fn ref, {core, sent, wakes} ->
-        conn = get_conn(core, ref)
-        {result, conn} = dispatch(conn, cx)
-        core = put_conn(core, ref, conn)
-        {core, woken} = take_wakes(core, ref, conn)
-        {core, emit(core, result, sent), woken ++ wakes}
-      end)
+  # has more. Returns the segments sent (reversed) and the wakes. The
+  # connections are listed once: a pass changes none but their own, and
+  # one that a pass leaves without a peer is asked again for nothing. One
+  # that a pass found nothing to send for, and left as it was, is not asked
+  # again: the same connection asked at the same time answers the same.
+  defp egress_pass(core, cx, refs, sent, wakes) do
+    {core, sent_now, wakes, live} = egress_each(refs, cx, core, [], wakes, [])
 
     if sent_now == [],
-      do: {core, sent, wakes},
-      else: egress_pass(core, cx, sent_now ++ sent, wakes)
+      do: {core, sent, wakes, :drained},
+      else: egress_pass(core, cx, :lists.reverse(live), sent_now ++ sent, wakes)
   end
 
-  defp dispatch(conn, cx) do
+  defp egress_each([], _cx, core, sent, wakes, live), do: {core, sent, wakes, live}
+
+  defp egress_each([ref | refs], cx, core, sent, wakes, live) do
+    conn = get_conn(core, ref)
+
     case Connection.dispatch(conn, cx) do
-      {:segment, out, conn} -> {out, conn}
-      {:nothing, conn} -> {nil, conn}
+      {:nothing, after_} ->
+        {core, woken} = take_wakes(core, ref, after_)
+        live = if after_ === conn, do: live, else: [ref | live]
+        egress_each(refs, cx, core, sent, woken ++ wakes, live)
+
+      {:segment, out, after_} ->
+        {core, woken} = take_wakes(core, ref, after_)
+        egress_each(refs, cx, core, emit(core, out, sent), woken ++ wakes, [ref | live])
     end
   end
 
@@ -1241,6 +1292,8 @@ defmodule SmolNet.Core.Tcp do
   end
 
   # Closing connections that have finished, or sent their RST, are gone.
+  defp reap(%{tcp: %{closing: closing}} = core) when map_size(closing) == 0, do: core
+
   defp reap(core) do
     Enum.reduce(core.tcp.closing, core, fn {id, %{record: %{conn: conn}}}, core ->
       if Connection.state(conn) == :closed and Connection.remote_endpoint(conn) == nil,
@@ -1252,24 +1305,32 @@ defmodule SmolNet.Core.Tcp do
   ## Deadlines
 
   # The next time the core needs a poll, in milliseconds: the earliest of
-  # the connections' timers (`:current`, as the NIF reports it after a call
-  # that does not drive the stack) and, after one that does, the closing
-  # connections' deadlines too.
-  defp poll_at(core, now, kind) do
-    cx = cx(core, now)
+  # the connections' timers, as the NIF reports it after a call that does
+  # not drive the stack.
+  defp poll_at(core, cx) do
+    earliest(
+      for ref <- connections(core), do: poll_time(Connection.poll_at(get_conn(core, ref), cx))
+    )
+  end
 
-    times =
-      for ref <- connections(core),
-          time = poll_time(Connection.poll_at(get_conn(core, ref), cx)),
-          time != nil,
-          do: time
+  # After a call that drives the stack: the closing connections' deadlines
+  # too. Egress ran until no connection had anything to send (`:drained`),
+  # so every connection was last asked for a segment and had none, and has
+  # not changed since but for its user timeout (a handshake promoted): none
+  # has data or a window update waiting, and only its timers count
+  # (`Connection.idle_poll_at/1`). An egress held back before then (by an
+  # output limit, say) would need `Connection.poll_at/2` for each instead.
+  defp drive_poll_at(core, refs, :drained) do
+    times = for ref <- refs, do: poll_time(Connection.idle_poll_at(get_conn(core, ref)))
 
     deadlines =
-      if kind == :drive,
-        do: for({_id, %{deadline: deadline}} <- core.tcp.closing, deadline != nil, do: deadline),
-        else: []
+      for {_id, %{deadline: deadline}} <- core.tcp.closing, deadline != nil, do: deadline
 
-    case times ++ deadlines do
+    earliest(times ++ deadlines)
+  end
+
+  defp earliest(times) do
+    case for(time <- times, time != nil, do: time) do
       [] -> nil
       all -> Enum.min(all)
     end
@@ -1337,7 +1398,7 @@ defmodule SmolNet.Core.Tcp do
     %{
       now: now * @ms,
       ip_mtu: iface.mtu,
-      addresses: Iface.addresses(iface, :inet) ++ Iface.addresses(iface, :inet6),
+      addresses: Iface.all_addresses(iface),
       isn: nil,
       source_address: &Iface.source_address(iface, &1)
     }

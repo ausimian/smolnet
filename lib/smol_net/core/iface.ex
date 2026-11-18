@@ -44,14 +44,15 @@ defmodule SmolNet.Core.Iface do
   alias SmolNet.Core.Wire.Udp
 
   @enforce_keys [:mtu]
-  defstruct mtu: nil, ipv4: [], ipv6: [], routes: []
+  defstruct mtu: nil, ipv4: [], ipv6: [], routes: [], all_addresses: []
 
   @type address :: <<_::32>> | <<_::128>>
   @type t :: %__MODULE__{
           mtu: pos_integer(),
           ipv4: [{<<_::32>>, 0..32}],
           ipv6: [{<<_::128>>, 0..128}],
-          routes: [{address(), non_neg_integer(), address()}]
+          routes: [{address(), non_neg_integer(), address()}],
+          all_addresses: [address()]
         }
   @type ip :: Ipv4.repr() | Ipv6.repr()
   @type received ::
@@ -78,12 +79,14 @@ defmodule SmolNet.Core.Iface do
           {address(), non_neg_integer(), address()}
         ]) :: t()
   def new(mtu, addresses, routes) do
-    %__MODULE__{
+    iface = %__MODULE__{
       mtu: mtu,
       ipv4: for({<<_::32>>, _prefix} = address <- addresses, do: address),
       ipv6: for({<<_::128>>, _prefix} = address <- addresses, do: address),
       routes: routes
     }
+
+    %{iface | all_addresses: addresses(iface, :inet) ++ addresses(iface, :inet6)}
   end
 
   @doc "How many addresses the interface has."
@@ -515,6 +518,10 @@ defmodule SmolNet.Core.Iface do
   @spec addresses(t(), :inet | :inet6) :: [address()]
   def addresses(%__MODULE__{ipv4: ipv4}, :inet), do: for({address, _prefix} <- ipv4, do: address)
   def addresses(%__MODULE__{ipv6: ipv6}, :inet6), do: for({address, _prefix} <- ipv6, do: address)
+
+  @doc "Every address, IPv4 then IPv6, as `addresses/2` lists them."
+  @spec all_addresses(t()) :: [address()]
+  def all_addresses(%__MODULE__{all_addresses: addresses}), do: addresses
 
   @doc """
   Whether smoltcp would send to `address`, its `has_neighbor`: on an IP

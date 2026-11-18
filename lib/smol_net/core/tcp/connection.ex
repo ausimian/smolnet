@@ -652,20 +652,17 @@ defmodule SmolNet.Core.Tcp.Connection do
   # hole to resend, `{seq, length}`, if the window has room. Rule (1) takes
   # the lowest octets deemed lost; a hole not yet deemed lost is resent
   # only when rule (2) has no new data to send.
-  defp sack_retransmission(c, mss, no_new_data) do
-    if in_sack_recovery?(c) and cwnd_remaining(c) > 0 do
-      case Rack.first_lost(c.rack, c.recovery.scoreboard, c.remote_last_seq) do
-        nil when no_new_data ->
-          hole_segment(c, Scoreboard.next_hole(c.recovery.scoreboard, rxt_from(c)), mss)
-
-        nil ->
-          nil
-
-        hole ->
-          hole_segment(c, hole, mss)
-      end
-    end
+  defp sack_retransmission(c, mss) do
+    if in_sack_recovery?(c) and cwnd_remaining(c) > 0,
+      do: next_resend(c, Rack.first_lost(c.rack, c.recovery.scoreboard, c.remote_last_seq), mss)
   end
+
+  defp next_resend(c, nil = _lost, mss) do
+    if no_new_data?(c),
+      do: hole_segment(c, Scoreboard.next_hole(c.recovery.scoreboard, rxt_from(c)), mss)
+  end
+
+  defp next_resend(c, hole, mss), do: hole_segment(c, hole, mss)
 
   defp rxt_from(%__MODULE__{recovery: %{recovery_rxt_end: nil}} = c), do: c.local_seq_no
   defp rxt_from(c), do: Seq.max(c.recovery.recovery_rxt_end, c.local_seq_no)
@@ -1481,7 +1478,7 @@ defmodule SmolNet.Core.Tcp.Connection do
     cond do
       # A SYN not yet sent.
       c.state in [:syn_sent, :syn_received] and not data_in_flight -> true
-      sack_retransmission(c, effective_mss, no_new_data?(c)) != nil -> true
+      sack_retransmission(c, effective_mss) != nil -> true
       true -> data_or_fin_to_transmit?(c, effective_mss, data_in_flight)
     end
   end
@@ -1744,7 +1741,7 @@ defmodule SmolNet.Core.Tcp.Connection do
   end
 
   defp data(c, cx, repr, effective_mss) do
-    case sack_retransmission(c, effective_mss, no_new_data?(c)) do
+    case sack_retransmission(c, effective_mss) do
       {seq, size} ->
         offset = Seq.diff(seq, c.local_seq_no)
         payload = SendBuffer.get(c.tx_buffer, offset, size)
@@ -1928,11 +1925,25 @@ defmodule SmolNet.Core.Tcp.Connection do
   def poll_at(c, cx) do
     if seq_to_transmit?(c, cx) or window_to_update?(c),
       do: :now,
-      else:
-        Enum.min_by(
-          [Timer.poll_at(c.timer), timeout_at(c), delayed_ack_at(c), rack_at(c)],
-          &poll_order/1
-        )
+      else: timers_poll_at(c)
+  end
+
+  @doc """
+  `poll_at/2` for a connection that `dispatch/3` has just found nothing to
+  send for, and that has not changed since: it has neither data nor a
+  window update waiting, so only its timers count.
+  """
+  @spec idle_poll_at(t()) :: :now | :ingress | {:time, integer()}
+  def idle_poll_at(%__MODULE__{tuple: nil}), do: :ingress
+  def idle_poll_at(%__MODULE__{liveness: %{remote_last_ts: nil}}), do: :now
+  def idle_poll_at(%__MODULE__{state: :closed}), do: :now
+  def idle_poll_at(c), do: timers_poll_at(c)
+
+  defp timers_poll_at(c) do
+    Timer.poll_at(c.timer)
+    |> earlier(timeout_at(c))
+    |> earlier(delayed_ack_at(c))
+    |> earlier(rack_at(c))
   end
 
   defp delayed_ack_at(c) do
@@ -1951,15 +1962,17 @@ defmodule SmolNet.Core.Tcp.Connection do
 
   defp timeout_at(_c), do: :ingress
 
-  defp rack_at(c) do
-    case Enum.reject([c.rack.reo_timeout, c.rack.probe_at], &is_nil/1) do
-      [] -> :ingress
-      times -> {:time, Enum.min(times)}
-    end
-  end
+  defp rack_at(%__MODULE__{rack: %Rack{reo_timeout: nil, probe_at: nil}}), do: :ingress
+  defp rack_at(%__MODULE__{rack: %Rack{reo_timeout: nil, probe_at: at}}), do: {:time, at}
+  defp rack_at(%__MODULE__{rack: %Rack{reo_timeout: at, probe_at: nil}}), do: {:time, at}
+  defp rack_at(%__MODULE__{rack: %Rack{reo_timeout: a, probe_at: b}}), do: {:time, min(a, b)}
 
-  # `PollAt`'s order: now, then times, then ingress.
-  defp poll_order(:now), do: {0, 0}
-  defp poll_order({:time, at}), do: {1, at}
-  defp poll_order(:ingress), do: {2, 0}
+  # The earlier of two in `PollAt`'s order: now, then times, then ingress;
+  # the first of two equal ones.
+  defp earlier(:now, _b), do: :now
+  defp earlier(_a, :now), do: :now
+  defp earlier(:ingress, b), do: b
+  defp earlier(a, :ingress), do: a
+  defp earlier({:time, a}, {:time, b}) when b < a, do: {:time, b}
+  defp earlier(a, _b), do: a
 end
