@@ -692,18 +692,24 @@ defmodule SmolNet.Core.Tcp do
         {waiters, sockets} = Sockets.close(core.sockets, identity)
         aborts = abort_effects(identity, waiters)
         core = %{core | sockets: sockets}
-        {id, _generation} = identity
+        {id, generation} = identity
 
         if record.phase == :connected do
           conn = record.conn |> Connection.close() |> Connection.take_wakes() |> elem(1)
-          closing = %{record: %{record | conn: conn}, deadline: now + @close_timeout}
+
+          closing = %{
+            record: %{record | conn: conn},
+            generation: generation,
+            deadline: now + @close_timeout
+          }
+
           core = %{core | tcp: %{core.tcp | closing: Map.put(core.tcp.closing, id, closing)}}
           core = repoint(core, record, {:closing, id})
           drive({{:ok, :ok}, core, aborts}, now)
         else
           # Aborted: the RST goes out in this call, then the socket is gone.
           conn = record.conn |> Connection.abort() |> Connection.take_wakes() |> elem(1)
-          closing = %{record: %{record | conn: conn}, deadline: nil}
+          closing = %{record: %{record | conn: conn}, generation: generation, deadline: nil}
           core = %{core | tcp: %{core.tcp | closing: Map.put(core.tcp.closing, id, closing)}}
           core = repoint(core, record, {:closing, id})
           {reply, core, effects} = drive({{:ok, :ok}, core, aborts}, now)
@@ -1014,14 +1020,16 @@ defmodule SmolNet.Core.Tcp do
 
   @doc """
   Drives the stack after a call: listeners promote their established
-  handshakes, closing connections past their deadline are aborted, every
-  connection sends what it has, and finished ones are forgotten. The
+  handshakes, every connection sends what it has, closing connections past
+  their deadline are then aborted and send their RSTs, and finished ones
+  are forgotten. The
   reply's deadline is the next connection timer or close deadline.
   """
   def drive({reply, core, effects}, now) do
-    {core, promoted} = refresh(core, now)
+    {core, promoted} = refresh_listeners(core)
     {core, sent, wakes} = egress(core, now)
-    {core, promoted_after} = refresh(core, now)
+    {core, sent, wakes} = expire_closing(core, now, sent, wakes)
+    {core, promoted_after} = refresh_listeners(core)
     core = reap(core)
 
     finish(
@@ -1033,9 +1041,10 @@ defmodule SmolNet.Core.Tcp do
 
   @doc "The same, for ingress, whose replies come first."
   def drive_ingress(core, now, effects, wakes) do
-    {core, promoted} = refresh(core, now)
+    {core, promoted} = refresh_listeners(core)
     {core, sent, egress_wakes} = egress(core, now)
-    {core, promoted_after} = refresh(core, now)
+    {core, sent, egress_wakes} = expire_closing(core, now, sent, egress_wakes)
+    {core, promoted_after} = refresh_listeners(core)
     core = reap(core)
     core = %{core | poll_at: poll_at(core, now, :drive)}
     {core, effects ++ :lists.reverse(sent), wakes ++ promoted ++ egress_wakes ++ promoted_after}
@@ -1049,16 +1058,16 @@ defmodule SmolNet.Core.Tcp do
      others ++ aborts ++ Enum.sort_by(wakes, &elem(&1, 2))}
   end
 
-  defp refresh(core, now) do
-    core = expire_closing(core, now)
-    refresh_listeners(core)
-  end
-
-  # Closing connections past their deadline are aborted.
-  defp expire_closing(core, now) do
-    closing =
-      Map.new(core.tcp.closing, fn
-        {id, %{deadline: deadline} = closing} when deadline != nil and now >= deadline ->
+  # Closing connections past their deadline are aborted, once the others
+  # have sent what they had, so that one sends what fell due at its deadline
+  # before its RST, which a second pass sends: the NIF sweeps its closing
+  # sockets after egress, and sends their RSTs in the continuation that
+  # sweep asks for.
+  defp expire_closing(core, now, sent, wakes) do
+    {closing, expired} =
+      Enum.map_reduce(core.tcp.closing, false, fn
+        {id, %{deadline: deadline} = closing}, _expired
+        when deadline != nil and now >= deadline ->
           conn = closing.record.conn
 
           conn =
@@ -1066,13 +1075,17 @@ defmodule SmolNet.Core.Tcp do
               do: conn |> Connection.abort() |> Connection.take_wakes() |> elem(1),
               else: conn
 
-          {id, %{closing | record: %{closing.record | conn: conn}, deadline: nil}}
+          {{id, %{closing | record: %{closing.record | conn: conn}, deadline: nil}}, true}
 
-        other ->
-          other
+        other, expired ->
+          {other, expired}
       end)
 
-    %{core | tcp: %{core.tcp | closing: closing}}
+    core = %{core | tcp: %{core.tcp | closing: Map.new(closing)}}
+
+    if expired,
+      do: egress_pass(core, cx(core, now), sent, wakes),
+      else: {core, sent, wakes}
   end
 
   # Handshakes that completed join their listener's accept queue, or are
@@ -1287,8 +1300,14 @@ defmodule SmolNet.Core.Tcp do
       listener_backlog_capacity: Enum.sum(for listener <- listeners, do: listener.backlog),
       closing_tcp_socket_count: map_size(core.tcp.closing),
       buffer_bytes: buffer_bytes(core),
+      # As the NIF lists its records, which a closing socket keeps until
+      # its connection is done.
       sockets:
-        records
+        (records ++
+           for(
+             {id, %{generation: generation, record: record}} <- core.tcp.closing,
+             do: {id, generation, record}
+           ))
         |> Enum.map(fn {id, generation, record} ->
           %{id: id, generation: generation, rcvbuf: record.rcvbuf, sndbuf: record.sndbuf}
         end)
