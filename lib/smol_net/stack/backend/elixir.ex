@@ -16,6 +16,19 @@ defmodule SmolNet.Stack.Backend.Elixir do
 
   alias SmolNet.Core
 
+  # The core's state, buffered data included, lives on the Stack process's
+  # heap, and the buffers are binaries it references. With the default
+  # binary virtual heap, those references force a major collection every
+  # few hundred KiB sent; these settings, from ADR 0016's phase 0 spike,
+  # cut the time spent collecting several times over, for a heap of about
+  # 256 KiB and up to 8 MiB of binaries held until the next collection.
+  @min_heap_words 32 * 1024
+  @min_bin_vheap_words 1024 * 1024
+
+  @impl true
+  def process_flags,
+    do: [min_heap_size: @min_heap_words, min_bin_vheap_size: @min_bin_vheap_words]
+
   @impl true
   def stack_new(limits, config, now) do
     case Core.new(limits, config, now) do
