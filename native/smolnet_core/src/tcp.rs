@@ -1,3 +1,4 @@
+use std::cell::Cell;
 use std::collections::{BTreeSet, VecDeque};
 use std::hash::{BuildHasher, RandomState};
 use std::sync::OnceLock;
@@ -404,8 +405,13 @@ pub fn socket(rcvbuf: usize, sndbuf: usize) -> Result<tcp::Socket<'static>, Sock
 /// It ticks every millisecond, as Linux's does, from a random start so that
 /// it does not tell peers how long the VM has run. smoltcp takes a plain
 /// function, which cannot read a stack's clock, so it reads the system's
-/// monotonic one; peers only echo it.
+/// monotonic one; peers only echo it. A stack given a timestamp origin reads
+/// its own clock instead, through `TsvalClock`.
 fn tsval() -> u32 {
+    if let Some(value) = TSVAL_NOW.with(Cell::get) {
+        return value;
+    }
+
     static CLOCK: OnceLock<(std::time::Instant, u32)> = OnceLock::new();
     let (epoch, start) = CLOCK.get_or_init(|| {
         (
@@ -414,6 +420,33 @@ fn tsval() -> u32 {
         )
     });
     start.wrapping_add(epoch.elapsed().as_millis() as u32)
+}
+
+thread_local! {
+    static TSVAL_NOW: Cell<Option<u32>> = const { Cell::new(None) };
+}
+
+/// The timestamp clock of a stack started with a timestamp origin, so that
+/// a test can fix the timestamps it sends: `origin` plus the stack call's
+/// `now` in milliseconds. It applies to the smoltcp work done on this thread
+/// while the guard lives, and restores the clock before it when dropped,
+/// panics included. Without an origin it leaves the system clock in place.
+pub struct TsvalClock {
+    previous: Option<u32>,
+}
+
+impl TsvalClock {
+    pub fn enter(origin: Option<u32>, now: Instant) -> Self {
+        let value = origin.map(|origin| origin.wrapping_add(now.total_millis() as u32));
+        let previous = TSVAL_NOW.with(|cell| cell.replace(value));
+        Self { previous }
+    }
+}
+
+impl Drop for TsvalClock {
+    fn drop(&mut self) {
+        TSVAL_NOW.with(|cell| cell.set(self.previous));
+    }
 }
 
 #[cfg(feature = "fuzzing")]
@@ -452,7 +485,7 @@ mod tests {
 
     use super::{
         DEFAULT_BUFFER_BYTES, EPHEMERAL_PORT_FIRST, EPHEMERAL_PORT_LAST, MAX_BUFFER_BYTES,
-        MIN_BUFFER_BYTES, TcpEndpoint, TcpTimers, allocate_ephemeral, socket, tsval,
+        MIN_BUFFER_BYTES, TcpEndpoint, TcpTimers, TsvalClock, allocate_ephemeral, socket, tsval,
     };
     use crate::socket_table::SocketError;
     use smoltcp::socket::tcp::KeepAlive;
@@ -518,6 +551,34 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(5));
         let elapsed = tsval().wrapping_sub(first);
         assert!((5..1_000).contains(&elapsed), "ticked {elapsed} in 5 ms");
+    }
+
+    #[test]
+    fn a_timestamp_origin_reads_the_stack_clock_while_it_lives() {
+        let instant = smoltcp::time::Instant::from_millis;
+
+        {
+            let _outer = TsvalClock::enter(Some(u32::MAX), instant(2));
+            assert_eq!(tsval(), 1);
+
+            {
+                let _inner = TsvalClock::enter(Some(1_000), instant(250));
+                assert_eq!(tsval(), 1_250);
+            }
+
+            assert_eq!(tsval(), 1);
+
+            {
+                let _none = TsvalClock::enter(None, instant(250));
+                let first = tsval();
+                std::thread::sleep(std::time::Duration::from_millis(5));
+                assert_ne!(tsval(), first);
+            }
+        }
+
+        let first = tsval();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        assert_ne!(tsval(), first);
     }
 
     #[test]

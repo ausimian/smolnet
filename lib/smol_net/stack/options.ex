@@ -23,6 +23,14 @@ defmodule SmolNet.Stack.Options do
     keepalive_probes: 9
   }
   @max_timer_ms 86_400_000
+  # `:test_determinism` fixes what a stack otherwise draws at random or from
+  # the system clock, so that tests can compare backends call for call. Like
+  # `:test_tcp_timers` it is test-only and unsupported (see MAINTAINING.md).
+  @determinism %{
+    random_seed: 0..0xFFFF_FFFF_FFFF_FFFF,
+    timestamp_origin: 0..0xFFFF_FFFF,
+    ephemeral_port_start: 49_152..50_175
+  }
   @allowed [
     :egress,
     :egress_credit,
@@ -32,7 +40,8 @@ defmodule SmolNet.Stack.Options do
     :limits,
     :link_down,
     :backend,
-    :test_tcp_timers
+    :test_tcp_timers,
+    :test_determinism
   ]
 
   @spec parse(keyword()) :: {:ok, map()} | {:error, atom()}
@@ -46,20 +55,22 @@ defmodule SmolNet.Stack.Options do
          {:ok, limits} <- limits(Keyword.get(options, :limits, %{}), mtu),
          {:ok, link_down} <- link_down(Keyword.get(options, :link_down, :stop)),
          {:ok, backend} <- backend(Keyword.fetch(options, :backend)),
-         {:ok, tcp_timers} <- tcp_timers(Keyword.get(options, :test_tcp_timers)) do
+         {:ok, tcp_timers} <- tcp_timers(Keyword.get(options, :test_tcp_timers)),
+         {:ok, determinism} <- determinism(Keyword.get(options, :test_determinism, %{})) do
       {:ok,
        %{
          egress: egress,
          backend: backend,
          link_down: link_down,
          limits: limits,
-         native_config: %{
-           mtu: mtu,
-           addresses: addresses,
-           routes: routes,
-           egress_credit: egress_credit,
-           tcp_timers: tcp_timers
-         }
+         native_config:
+           Map.merge(determinism, %{
+             mtu: mtu,
+             addresses: addresses,
+             routes: routes,
+             egress_credit: egress_credit,
+             tcp_timers: tcp_timers
+           })
        }}
     end
   end
@@ -237,6 +248,19 @@ defmodule SmolNet.Stack.Options do
   end
 
   defp tcp_timers(_overrides), do: {:error, :invalid_options}
+
+  defp determinism(values) when is_map(values) do
+    if Enum.all?(values, fn {name, value} ->
+         is_map_key(@determinism, name) and is_integer(value) and
+           value in Map.fetch!(@determinism, name)
+       end) do
+      {:ok, values}
+    else
+      {:error, :invalid_options}
+    end
+  end
+
+  defp determinism(_values), do: {:error, :invalid_options}
 
   defp map_while(values, mapper, error) do
     Enum.reduce_while(values, {:ok, []}, fn value, {:ok, acc} ->

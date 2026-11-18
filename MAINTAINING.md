@@ -43,6 +43,21 @@ start with when a test does not choose (default `native`):
 SMOLNET_TEST_BACKEND=native mix test
 ```
 
+`SmolNet.start_stack(test_determinism: %{...})` fixes what a stack
+otherwise draws at random or from the system clock, so that differential
+runs can feed two backends the same packets and times and compare what they
+emit. It is test-only and unsupported, like `:test_tcp_timers`. Its keys,
+each optional:
+
+- `:random_seed`, 0 to 2^64 - 1, seeds the stack's random source. In the
+  NIF, smoltcp's PCG draws the IPv4 identification start from it first and
+  then each initial sequence number.
+- `:timestamp_origin`, 0 to 2^32 - 1, makes the TCP timestamp clock
+  `origin + now` in milliseconds, from the stack's own clock, rather than
+  the system's monotonic clock from a random start.
+- `:ephemeral_port_start`, 49152 to 50175, is the first ephemeral port tried,
+  for TCP and UDP alike.
+
 Tests of the NIF itself are tagged `:nif`, and those needing its debug
 hooks `:debug_nif`; both run only on the native backend. A test that reads a
 `stack_info/1` key only the NIF reports checks it through

@@ -84,6 +84,9 @@ mod atoms {
         egress_credit,
         egress_credit_disabled,
         tcp_timers,
+        random_seed,
+        timestamp_origin,
+        ephemeral_port_start,
         smol_socket = "$smol_socket"
     }
 }
