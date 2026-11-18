@@ -57,7 +57,7 @@ defmodule SmolNet.Conformance.DifferentialTest do
     # On the Elixir backend a trace runs once the phase of #173 it needs
     # has landed.
     for {name, phase} <- [
-          {"ingress_replies", 4},
+          {"ingress_replies", nil},
           {"stack_replies", nil},
           {"tcp_clean_inet", 5},
           {"tcp_clean_inet6", 5},

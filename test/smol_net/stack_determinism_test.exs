@@ -49,8 +49,6 @@ defmodule SmolNet.StackDeterminismTest do
     assert tsval == @now + 1_000 - 1
   end
 
-  # UDP sockets come in phase 4 of #173 on the Elixir backend.
-  @tag :elixir_phase_4
   test "UDP takes its ephemeral ports from the same start" do
     {:ok, stack} =
       SmolNet.start_stack(

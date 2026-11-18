@@ -44,11 +44,14 @@ defmodule SmolNet.Stack.Backend.Elixir do
   @impl true
   def stack_snapshot(core), do: core |> Core.snapshot() |> outcome()
 
-  # Sockets come in later phases of #173.
   @impl true
-  def socket_cancel(core, _identity, _operation, _reference), do: not_implemented(core)
+  def socket_cancel(core, identity, operation, reference),
+    do: core |> Core.socket_cancel(identity, operation, reference) |> outcome()
+
   @impl true
-  def socket_validate(core, _identity), do: not_implemented(core)
+  def socket_validate(core, identity), do: core |> Core.socket_validate(identity) |> outcome()
+
+  # TCP comes in a later phase of #173.
   @impl true
   def tcp_open(core, _family, _rcvbuf, _sndbuf), do: not_implemented(core)
   @impl true
@@ -80,23 +83,32 @@ defmodule SmolNet.Stack.Backend.Elixir do
   @impl true
   def tcp_close(core, _identity, _now), do: not_implemented(core)
   @impl true
-  def udp_open(core, _family), do: not_implemented(core)
-  @impl true
-  def udp_bind(core, _identity, _endpoint), do: not_implemented(core)
-  @impl true
-  def udp_connect(core, _identity, _endpoint), do: not_implemented(core)
-  @impl true
-  def udp_sendto(core, _identity, _endpoint, _data, _pid, _reference, _now),
-    do: not_implemented(core)
+  def udp_open(core, family), do: core |> Core.udp_open(family) |> outcome()
 
   @impl true
-  def udp_recvfrom(core, _identity, _length, _pid, _reference, _now), do: not_implemented(core)
+  def udp_bind(core, identity, endpoint),
+    do: core |> Core.udp_bind(identity, endpoint) |> outcome()
+
   @impl true
-  def udp_sockname(core, _identity), do: not_implemented(core)
+  def udp_connect(core, identity, endpoint),
+    do: core |> Core.udp_connect(identity, endpoint) |> outcome()
+
   @impl true
-  def udp_peername(core, _identity), do: not_implemented(core)
+  def udp_sendto(core, identity, endpoint, data, pid, reference, now),
+    do: core |> Core.udp_sendto(identity, endpoint, data, pid, reference, now) |> outcome()
+
   @impl true
-  def udp_close(core, _identity, _now), do: not_implemented(core)
+  def udp_recvfrom(core, identity, length, pid, reference, now),
+    do: core |> Core.udp_recvfrom(identity, length, pid, reference, now) |> outcome()
+
+  @impl true
+  def udp_sockname(core, identity), do: core |> Core.udp_sockname(identity) |> outcome()
+
+  @impl true
+  def udp_peername(core, identity), do: core |> Core.udp_peername(identity) |> outcome()
+
+  @impl true
+  def udp_close(core, identity, now), do: core |> Core.udp_close(identity, now) |> outcome()
 
   defp not_implemented(core), do: core |> Core.not_implemented() |> outcome()
 

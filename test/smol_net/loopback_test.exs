@@ -71,8 +71,6 @@ defmodule SmolNet.LoopbackTest do
     assert {:ok, "over the loop"} = SmolNet.recv(accepted, 13, @wait_1s)
   end
 
-  # UDP sockets come in phase 4 of #173 on the Elixir backend.
-  @tag :elixir_phase_4
   test "carries UDP datagrams back to the stack that sent them" do
     stack = loopback_stack()
     server = endpoint4(41_103)
