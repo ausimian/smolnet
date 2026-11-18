@@ -1,9 +1,6 @@
 defmodule SmolNet.IPv4UdpTest do
   use ExUnit.Case, async: false
 
-  # Needs UDP sockets, which the Elixir backend gains in phase 4 of #173.
-  @moduletag :elixir_phase_4
-
   alias SmolNet.Inet.Udp, as: InetUdp
   alias SmolNet.Inet6.Udp, as: Inet6Udp
   alias SmolNet.Test.IPv6Link
@@ -161,6 +158,8 @@ defmodule SmolNet.IPv4UdpTest do
       assert {:error, :invalid_socket} = SmolNet.recvfrom(server, 0, :nowait)
     end
 
+    # Needs egress credit, which the Elixir backend gains in phase 7 of #173.
+    @tag :elixir_phase_7
     test "a full IPv4 UDP ring retries one datagram via #{inspect(link_module)}" do
       {:ok, link} = @link_module.start_link(self())
 
@@ -272,6 +271,8 @@ defmodule SmolNet.IPv4UdpTest do
       assert data == :binary.copy("x", 1_000)
     end
 
+    # Needs TCP, which the Elixir backend gains in phase 5 of #173.
+    @tag :elixir_phase_5
     test "IPv4 UDP connect preserves a TCP timer via #{inspect(link_module)}" do
       {server_stack, client_stack, link} = ipv4_stacks(@link_module)
       :ok = @link_module.fault(link, :drop)
@@ -623,6 +624,8 @@ defmodule SmolNet.IPv4UdpTest do
   for link_module <- [RawIpLink, IPv6Link] do
     @link_module link_module
 
+    # Needs TCP, which the Elixir backend gains in phase 5 of #173.
+    @tag :elixir_phase_5
     test "complete dual-family TCP/UDP matrix uses #{inspect(link_module)} without cross-talk" do
       exercise_complete_matrix(@link_module)
     end

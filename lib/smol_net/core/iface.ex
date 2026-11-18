@@ -419,6 +419,13 @@ defmodule SmolNet.Core.Iface do
     ip_packet(src, dst, @tcp, bytes)
   end
 
+  @doc "A UDP datagram in an IP packet with the hop limit smoltcp sends with."
+  @spec udp_packet(address(), address(), 0..0xFFFF, 0..0xFFFF, binary()) :: binary()
+  def udp_packet(src, dst, src_port, dst_port, payload) do
+    bytes = Udp.emit(src_port, dst_port, payload, src, dst)
+    ip_packet(src, dst, @udp, bytes)
+  end
+
   defp ip_packet(<<_::32>> = src, dst, protocol, payload) do
     header =
       Ipv4.ipv4(
@@ -490,6 +497,24 @@ defmodule SmolNet.Core.Iface do
       do: address,
       else: lookup_route(iface.routes, address)
   end
+
+  @doc """
+  Whether a socket may send to `address`, as the NIF checks before it
+  hands smoltcp a datagram or a connection: the address is on one of the
+  interface's subnets or under a static route's destination prefix.
+  """
+  @spec reachable?(t(), address()) :: boolean()
+  def reachable?(iface, address) do
+    in_same_network?(iface, address) or
+      Enum.any?(iface.routes, fn {destination, prefix_len, _gateway} ->
+        same_family?(destination, address) and contains?(destination, prefix_len, address)
+      end)
+  end
+
+  @doc "The interface's addresses of one family, in configuration order."
+  @spec addresses(t(), :inet | :inet6) :: [address()]
+  def addresses(%__MODULE__{ipv4: ipv4}, :inet), do: for({address, _prefix} <- ipv4, do: address)
+  def addresses(%__MODULE__{ipv6: ipv6}, :inet6), do: for({address, _prefix} <- ipv6, do: address)
 
   @doc """
   Whether smoltcp would send to `address`, its `has_neighbor`: on an IP

@@ -1,9 +1,6 @@
 defmodule SmolNet.UdpTest do
   use ExUnit.Case, async: false
 
-  # Needs UDP sockets, which the Elixir backend gains in phase 4 of #173.
-  @moduletag :elixir_phase_4
-
   alias SmolNet.Inet6.Udp
   alias SmolNet.Test.RawIpLink
   alias SmolNet.Test.Timing
@@ -104,6 +101,8 @@ defmodule SmolNet.UdpTest do
     assert {:error, :invalid_socket} = SmolNet.recvfrom(server, 0, :nowait)
   end
 
+  # Needs egress credit, which the Elixir backend gains in phase 7 of #173.
+  @tag :elixir_phase_7
   test "a full transmit ring retries the whole datagram exactly once" do
     {:ok, link} = RawIpLink.start_link(self())
 
@@ -400,6 +399,8 @@ defmodule SmolNet.UdpTest do
     assert :ok = :gen_udp.close(client)
   end
 
+  # Needs TCP, which the Elixir backend gains in phase 5 of #173.
+  @tag :elixir_phase_5
   test "TCP and UDP coexist on one IPv6 stack without readiness cross-talk" do
     {server_stack, client_stack, _link} = stacks()
     port = 42_005
@@ -434,6 +435,8 @@ defmodule SmolNet.UdpTest do
     assert :ok = SmolNet.close(listener)
   end
 
+  # Needs TCP, which the Elixir backend gains in phase 5 of #173.
+  @tag :elixir_phase_5
   test "non-driving UDP connect preserves a pending TCP timer" do
     {server_stack, client_stack, link} = stacks()
     :ok = RawIpLink.fault(link, :drop)
@@ -455,7 +458,7 @@ defmodule SmolNet.UdpTest do
     assert {:ok, _info} = SmolNet.stack_info(server_stack)
   end
 
-  test "UDP options, wrong-kind calls, and adapter errors are explicit" do
+  test "UDP options and adapter errors are explicit" do
     {server_stack, _client_stack, _link} = stacks()
 
     assert {:error, :eaddrnotavail} =
@@ -482,14 +485,6 @@ defmodule SmolNet.UdpTest do
     assert {:error, :invalid_socket_state} = SmolNet.send(udp, "stream", :nowait)
     assert {:error, :invalid_socket_state} = SmolNet.recv(udp, 0, :nowait)
     assert {:error, :invalid_socket_state} = SmolNet.shutdown(udp, :read)
-
-    {:ok, tcp} = SmolNet.open(:inet6, :stream, :tcp, stack: server_stack)
-
-    assert {:error, :invalid_socket_state} =
-             SmolNet.sendto(tcp, "datagram", endpoint(@server, 9), :nowait)
-
-    assert {:error, :invalid_socket_state} = SmolNet.recvfrom(tcp, 0, :nowait)
-    assert :ok = SmolNet.close(tcp)
     assert :ok = SmolNet.close(udp)
 
     {:ok, socket} = :gen_udp.open(0, options(server_stack))
@@ -499,6 +494,19 @@ defmodule SmolNet.UdpTest do
     assert {:error, :einval} = :inet.getopts(socket, [:packet])
     assert {:error, :emsgsize} = :gen_udp.send(socket, @client, 9, :binary.copy("x", 1_453))
     assert :ok = :gen_udp.close(socket)
+  end
+
+  # Needs TCP, which the Elixir backend gains in phase 5 of #173.
+  @tag :elixir_phase_5
+  test "datagram calls on a TCP socket are explicit errors" do
+    {server_stack, _client_stack, _link} = stacks()
+    {:ok, tcp} = SmolNet.open(:inet6, :stream, :tcp, stack: server_stack)
+
+    assert {:error, :invalid_socket_state} =
+             SmolNet.sendto(tcp, "datagram", endpoint(@server, 9), :nowait)
+
+    assert {:error, :invalid_socket_state} = SmolNet.recvfrom(tcp, 0, :nowait)
+    assert :ok = SmolNet.close(tcp)
   end
 
   defp stacks do

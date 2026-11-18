@@ -12,6 +12,7 @@ defmodule SmolNet.Conformance.Scenarios do
   alias SmolNet.Conformance.Packets
   alias SmolNet.Conformance.StackPackets
   alias SmolNet.Conformance.Trace
+  alias SmolNet.Conformance.UdpCalls
 
   @transfers [
     {"tcp_clean_inet", "A 32 KiB transfer and close over a clean IPv4 link.",
@@ -41,7 +42,34 @@ defmodule SmolNet.Conformance.Scenarios do
         Trace.new(name, description, result.entries)
       end
 
-    transfers ++ [ingress_replies(backend), stack_replies(backend)]
+    transfers ++ [ingress_replies(backend), stack_replies(backend), udp_sockets(backend)]
+  end
+
+  @doc """
+  UDP sockets: the named sequences of `UdpCalls.scripted/0`, then 30 of
+  its random ones with a fixed seed, each on a stack of its own.
+  """
+  def udp_sockets(backend) do
+    random =
+      StreamData.bind(StreamData.boolean(), fn two_addresses ->
+        StreamData.map(UdpCalls.sequence(two_addresses), &{two_addresses, &1})
+      end)
+      |> StreamData.seeded(173)
+      |> Enum.take(30)
+
+    scripted =
+      for {_description, two_addresses, calls} <- UdpCalls.scripted(), do: {two_addresses, calls}
+
+    entries =
+      (scripted ++ random)
+      |> Enum.with_index(1)
+      |> Enum.flat_map(fn {{stack, calls}, n} ->
+        {:ok, driver} = Driver.start(:"udp_#{n}", backend, UdpCalls.options(stack), 0)
+
+        driver |> UdpCalls.run(calls) |> Driver.trace()
+      end)
+
+    Trace.new("udp_sockets", "UDP socket calls and datagrams, named and random.", entries)
   end
 
   @local4 <<192, 0, 2, 1>>

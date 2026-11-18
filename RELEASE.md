@@ -7,6 +7,9 @@
 - `backend: :elixir` selects a pure-Elixir protocol engine, still in
   development. It answers what a stack answers by itself, as the NIF does:
   echo replies, Port and Protocol Unreachable, Parameter Problem and a RST
-  for a closed port, over IPv4 and IPv6. It has no sockets yet: opening one
-  returns `{:error, :not_implemented}`, as does starting it with
-  `:egress_credit`.
+  for a closed port, over IPv4 and IPv6. It has UDP sockets, with the NIF's
+  semantics and through the `gen_udp` adapters too: binds (wildcard
+  included), ephemeral ports, connect, truncation, `:message_too_large`,
+  waiters, `cancel/2` and the `stack_info/1` counts. It has no TCP sockets
+  yet: opening one returns `{:error, :not_implemented}`, as does starting it
+  with `:egress_credit`.
