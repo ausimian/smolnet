@@ -418,8 +418,9 @@ defmodule SmolNet.Core.Iface do
   @doc "A TCP segment in an IP packet with the hop limit smoltcp sends with."
   @spec tcp_packet(address(), address(), Tcp.repr()) :: binary()
   def tcp_packet(src, dst, segment) do
-    bytes = Tcp.emit(segment, src, dst)
-    ip_packet(src, dst, @tcp, bytes)
+    {header, payload} = Tcp.emit_header(segment, src, dst)
+    length = byte_size(header) + byte_size(payload)
+    <<ip_header(src, dst, @tcp, length)::binary, header::binary, payload::binary>>
   end
 
   @doc "A UDP datagram in an IP packet with the hop limit smoltcp sends with."
@@ -429,30 +430,31 @@ defmodule SmolNet.Core.Iface do
     ip_packet(src, dst, @udp, bytes)
   end
 
-  defp ip_packet(<<_::32>> = src, dst, protocol, payload) do
-    header =
+  defp ip_packet(src, dst, protocol, payload),
+    do: <<ip_header(src, dst, protocol, byte_size(payload))::binary, payload::binary>>
+
+  defp ip_header(<<_::32>> = src, dst, protocol, length) do
+    Ipv4.header(
       Ipv4.ipv4(
         src: src,
         dst: dst,
         protocol: protocol,
-        payload_len: byte_size(payload),
+        payload_len: length,
         hop_limit: @hop_limit
       )
-
-    Ipv4.emit(header, payload)
+    )
   end
 
-  defp ip_packet(<<_::128>> = src, dst, protocol, payload) do
-    header =
+  defp ip_header(<<_::128>> = src, dst, protocol, length) do
+    Ipv6.header(
       Ipv6.ipv6(
         src: src,
         dst: dst,
         next_header: protocol,
-        payload_len: byte_size(payload),
+        payload_len: length,
         hop_limit: @hop_limit
       )
-
-    Ipv6.emit(header, payload)
+    )
   end
 
   ## Addresses, routes and source selection

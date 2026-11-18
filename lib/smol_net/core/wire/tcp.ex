@@ -235,7 +235,17 @@ defmodule SmolNet.Core.Wire.Tcp do
   def segment_len(tcp(payload: payload)), do: byte_size(payload)
 
   @spec emit(repr(), address(), address()) :: binary()
-  def emit(
+  def emit(repr, src, dst) do
+    {header, payload} = emit_header(repr, src, dst)
+    <<header::binary, payload::binary>>
+  end
+
+  @doc """
+  `emit/3` in two parts, the header with its checksum and the payload, so
+  that a packet can be built around them copying the payload once.
+  """
+  @spec emit_header(repr(), address(), address()) :: {binary(), binary()}
+  def emit_header(
         tcp(
           src_port: src_port,
           dst_port: dst_port,
@@ -261,7 +271,7 @@ defmodule SmolNet.Core.Wire.Tcp do
     length = header_len + byte_size(payload)
     pseudo = Checksum.pseudo_header(src, dst, @protocol, length)
     checksum = Checksum.checksum(payload, Checksum.sum(rest, Checksum.sum(header, pseudo)))
-    <<header::binary, checksum::16, rest::binary, payload::binary>>
+    {<<header::binary, checksum::16, rest::binary>>, payload}
   end
 
   defp options(
