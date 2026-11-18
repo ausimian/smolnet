@@ -25,7 +25,7 @@ exclude =
       []
 
     :elixir ->
-      [:nif, :debug_nif, :elixir_phase_6, :elixir_phase_7]
+      [:nif, :debug_nif, :elixir_phase_7]
   end
 
 ExUnit.start(

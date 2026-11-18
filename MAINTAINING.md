@@ -65,26 +65,33 @@ Tests of the NIF itself are tagged `:nif`, and those needing its debug
 hooks `:debug_nif`; both run only on the native backend.
 
 The Elixir backend is built in phases, and a test that needs a phase still
-to come is tagged with it: `:elixir_phase_6` (loss recovery and
-congestion control) or `:elixir_phase_7` (keepalive, user timeout, path
-MTU, egress credit, link-down policies and the shutdown lifecycle), as
-`@moduletag` for a whole
-file and `@tag` where a file mixes phases. `test/test_helper.exs` excludes
-those tags under `SMOLNET_TEST_BACKEND=elixir` only, so the native run is
-unaffected, and CI gates whatever already passes on the Elixir backend. A
-phase's exit criterion includes removing its tag from every test and from
-the exclusion list; to see what it still has to do:
+to come is tagged with it: `:elixir_phase_7` (keepalive, user timeout,
+path MTU, egress credit, link-down policies and the shutdown lifecycle),
+as `@moduletag` for a whole file and `@tag` where a file mixes phases.
+`test/test_helper.exs` excludes those tags under
+`SMOLNET_TEST_BACKEND=elixir` only, so the native run is unaffected, and CI
+gates whatever already passes on the Elixir backend. A phase's exit
+criterion includes removing its tag from every test and from the exclusion
+list; to see what it still has to do:
 
 ```console
-SMOLNET_TEST_BACKEND=elixir mix test --only elixir_phase_6
+SMOLNET_TEST_BACKEND=elixir mix test --only elixir_phase_7
 ```
 
 A test comparing the two backends directly, such as
 `test/conformance/stack_replies_test.exs`, needs the NIF and is tagged
-`:nif`; the traces it feeds outlive the NIF. A test that reads a
-`stack_info/1` key only the NIF reports checks it through
-`SmolNet.Test.Snapshot.nif/2`. The compatibility job's `backend` matrix
-dimension lists the backends CI runs. Tests of the shell itself use
+`:nif`; the traces it feeds outlive the NIF. The widest of them,
+`test/conformance/link_differential_test.exs`, runs random transfers over
+impaired links on every pairing of the two backends; a commit tries 30, and
+a longer run sets how many:
+
+```console
+SMOLNET_DIFFERENTIAL_RUNS=20000 mix test test/conformance/link_differential_test.exs
+```
+
+A test that reads a `stack_info/1` key only the NIF reports checks it
+through `SmolNet.Test.Snapshot.nif/2`. The compatibility job's `backend`
+matrix dimension lists the backends CI runs. Tests of the shell itself use
 `SmolNet.Test.NativeDouble`, a scripted backend.
 
 ## Native development builds and work budgets
