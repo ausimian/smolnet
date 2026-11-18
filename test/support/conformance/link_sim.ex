@@ -392,7 +392,7 @@ defmodule SmolNet.Conformance.LinkSim do
   # A SYN without its SACK-permitted option, which becomes two NOPs, with
   # the TCP checksum made again; any other packet as it was.
   defp strip_sack(<<4::4, ihl::4, _::binary-size(8), 6, _rest::binary>> = packet) do
-    <<header::binary-size(ihl * 4), segment::binary>> = packet
+    {header, segment} = :erlang.split_binary(packet, ihl * 4)
     <<_::binary-12, source::binary-4, destination::binary-4, _options::binary>> = header
     header <> strip_sack(segment, source, destination)
   end
@@ -410,7 +410,7 @@ defmodule SmolNet.Conformance.LinkSim do
     <<window_checksum::binary-4, urgent::binary-2, after_urgent::binary>> = rest
     <<window::binary-2, _checksum::16>> = window_checksum
     option_bytes = offset * 4 - 20
-    <<options::binary-size(option_bytes), payload::binary>> = after_urgent
+    {options, payload} = :erlang.split_binary(after_urgent, option_bytes)
 
     if Bitwise.band(flags, 0x02) == 0x02 do
       options = without_sack_permitted(options, <<>>)
@@ -441,7 +441,7 @@ defmodule SmolNet.Conformance.LinkSim do
     do: without_sack_permitted(rest, acc <> <<kind>>)
 
   defp without_sack_permitted(<<kind, length, rest::binary>>, acc) when length >= 2 do
-    <<value::binary-size(length - 2), rest::binary>> = rest
+    {value, rest} = :erlang.split_binary(rest, length - 2)
     without_sack_permitted(rest, acc <> <<kind, length, value::binary>>)
   end
 

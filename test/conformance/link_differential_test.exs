@@ -121,8 +121,8 @@ defmodule SmolNet.Conformance.LinkDifferentialTest do
 
   # A SYN-ACK whose options include SACK-permitted (kind 4).
   defp sack_permitted_syn_ack?(<<4::4, ihl::4, _::binary-size(8), 6, _rest::binary>> = packet) do
-    <<_ip::binary-size(ihl * 4), _::binary-12, offset::4, _::4, flags, _::binary-6, rest::binary>> =
-      packet
+    {_ip, segment} = :erlang.split_binary(packet, ihl * 4)
+    <<_::binary-12, offset::4, _::4, flags, _::binary-6, rest::binary>> = segment
 
     Bitwise.band(flags, 0x12) == 0x12 and
       sack_permitted?(binary_part(rest, 0, offset * 4 - 20))
