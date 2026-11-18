@@ -13,6 +13,8 @@
 #   FAMILY    inet or inet6 (default inet)
 #   MIB       MiB per stream (default 32)
 #   STREAMS   connections (default 1)
+#   LINGER    n: n more connections, opened and closed before the transfer,
+#             wait out TIME-WAIT through it, as after earlier transfers
 #   REVERSE   1: the server sends as much back over each connection
 #   CLOSE     1: each end closes once it has sent its data and read the
 #             peer's, and the run goes on until both stacks are idle
@@ -83,20 +85,10 @@ defmodule Bench.Core do
     {w, listener} = ok(call(w, :s, &backend.tcp_open(&1, family, @buffer, @buffer), :preserve))
     {w, :ok} = ok(call(w, :s, &backend.tcp_bind(&1, listener, endpoint), :preserve))
 
-    {w, :ok} =
-      ok(call(w, :s, &backend.tcp_listen(&1, listener, min(options.streams, 128), w.now)))
-
-    # Connections open in groups of up to four at once, as many handshakes
-    # as the NIF's listener pool takes together.
-    {w, pairs} =
-      1..options.streams
-      |> Enum.chunk_every(4)
-      |> Enum.reduce({w, []}, fn group, {w, pairs} ->
-        {w, connects} = connect_group(w, family, endpoint, length(group))
-        {w, accepted} = accept_all(w, listener, length(group), [])
-        {w, pairs ++ Enum.zip(connects, accepted)}
-      end)
-
+    backlog = min(max(options.streams, options.linger), 128)
+    {w, :ok} = ok(call(w, :s, &backend.tcp_listen(&1, listener, backlog, w.now)))
+    w = linger(w, listener, family, endpoint, options.linger)
+    {w, pairs} = open_pairs(w, listener, family, endpoint, options.streams)
     connects = Enum.map(pairs, &elem(&1, 0))
     accepted = Enum.map(pairs, &elem(&1, 1))
 
@@ -147,6 +139,43 @@ defmodule Bench.Core do
       digest: digest,
       wire: wire
     }
+  end
+
+  # Connections open in groups of up to four at once, as many handshakes
+  # as the NIF's listener pool takes together.
+  defp open_pairs(w, _listener, _family, _endpoint, 0), do: {w, []}
+
+  defp open_pairs(w, listener, family, endpoint, count) do
+    1..count
+    |> Enum.chunk_every(4)
+    |> Enum.reduce({w, []}, fn group, {w, pairs} ->
+      {w, connects} = connect_group(w, family, endpoint, length(group))
+      {w, accepted} = accept_all(w, listener, length(group), [])
+      {w, pairs ++ Enum.zip(connects, accepted)}
+    end)
+  end
+
+  # Connections that the client opens and closes first, so that they wait
+  # out TIME-WAIT, which the clock standing still keeps them in for the
+  # whole transfer.
+  defp linger(w, listener, family, endpoint, count) do
+    {w, pairs} = open_pairs(w, listener, family, endpoint, count)
+
+    w =
+      Enum.reduce(pairs, w, fn {conn, _server}, w ->
+        {w, _reply} = call(w, :c, &w.backend.tcp_close(&1, conn, w.now))
+        w
+      end)
+
+    w = run_until(w, &idle_link?/1)
+
+    w =
+      Enum.reduce(pairs, w, fn {_conn, server}, w ->
+        {w, _reply} = call(w, :s, &w.backend.tcp_close(&1, server, w.now))
+        w
+      end)
+
+    run_until(w, &idle_link?/1)
   end
 
   defp connect_group(w, family, endpoint, count) do
@@ -551,6 +580,7 @@ options = %{
   family: String.to_atom(env.("FAMILY", "inet")),
   bytes: mib * 1_048_576,
   streams: streams,
+  linger: String.to_integer(env.("LINGER", "0")),
   reverse: env.("REVERSE", "0") == "1",
   close: env.("CLOSE", "0") == "1",
   drop: (drop = System.get_env("DROP")) && String.to_integer(drop),
@@ -588,9 +618,17 @@ end
 ms = fn native -> :erlang.convert_time_unit(native, :native, :nanosecond) / 1_000_000 end
 per_mib = fn value -> Float.round(value / total_mib, 2) end
 
-describe =
-  "#{options.family}, #{streams} stream(s) of #{mib} MiB#{if options.reverse, do: " each way"}" <>
-    "#{if options.close, do: ", closed"}#{if options.drop, do: ", losing 1 in #{options.drop}"}"
+notes =
+  [
+    options.reverse && " each way",
+    options.close && ", closed",
+    options.drop && ", losing one in #{options.drop}",
+    options.linger > 0 && ", #{options.linger} lingering"
+  ]
+  |> Enum.filter(&is_binary/1)
+  |> Enum.join()
+
+describe = "#{options.family}, #{streams} stream(s) of #{mib} MiB#{notes}"
 
 # The tripwire set for DIGEST=all: one and many streams, both families,
 # both directions, closes, and losses light to heavy, which reach
@@ -602,7 +640,8 @@ tripwire = [
   %{family: :inet, bytes: 2_097_152, streams: 4, reverse: true, close: true, drop: 50},
   %{family: :inet6, bytes: 2_097_152, streams: 8, reverse: true, close: true, drop: 13},
   %{family: :inet, bytes: 1_048_576, streams: 2, reverse: false, close: true, drop: 7},
-  %{family: :inet6, bytes: 262_144, streams: 1, reverse: true, close: true, drop: 3}
+  %{family: :inet6, bytes: 262_144, streams: 1, reverse: true, close: true, drop: 3},
+  %{family: :inet, bytes: 1_048_576, streams: 2, reverse: true, close: true, drop: 20, linger: 3}
 ]
 
 case env.("DIGEST", "0") do
@@ -615,10 +654,19 @@ case env.("DIGEST", "0") do
     for run <- runs, {name, module} <- backends do
       r = in_process.(module, fn -> Bench.Core.run(module, %{run | digest: true}) end)
 
+      notes =
+        [
+          run.reverse && " both ways",
+          run.close && " closed",
+          run.drop && " drop one in #{run.drop}",
+          run.linger > 0 && " linger #{run.linger}"
+        ]
+        |> Enum.filter(&is_binary/1)
+        |> Enum.join()
+
       IO.puts(
-        "#{name} #{run.family} x#{run.streams} #{div(run.bytes, 1024)} KiB" <>
-          "#{if run.reverse, do: " both ways"}#{if run.close, do: " closed"}" <>
-          "#{if run.drop, do: " drop 1/#{run.drop}"}: digest #{r.digest}, wire #{r.wire}, virtual #{r.virtual_ms} ms, " <>
+        "#{name} #{run.family} x#{run.streams} #{div(run.bytes, 1024)} KiB#{notes}" <>
+          ": digest #{r.digest}, wire #{r.wire}, virtual #{r.virtual_ms} ms, " <>
           "packets #{r.packets.c} + #{r.packets.s}, calls #{r.calls.c} + #{r.calls.s}"
       )
     end
