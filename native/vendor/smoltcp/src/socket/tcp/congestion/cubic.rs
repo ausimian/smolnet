@@ -346,6 +346,30 @@ fn cube_root(a: f64) -> f64 {
 }
 
 #[cfg(test)]
+impl Cubic {
+    /// The state as JSON, for SmolNet's test vectors.
+    pub(crate) fn vector_json(&self) -> std::string::String {
+        use crate::socket::tcp::vectors::{bool, float, instant, object, option, size, string};
+        object(&[
+            ("kind", string("cubic")),
+            ("w_max", size(self.w_max)),
+            ("cwnd", size(self.cwnd)),
+            ("mss", size(self.mss)),
+            ("ssthresh", size(self.ssthresh)),
+            ("rwnd", size(self.rwnd)),
+            ("k", float(self.k)),
+            ("w_est", float(self.w_est)),
+            ("cwnd_prior", size(self.cwnd_prior)),
+            ("recovery_start", option(self.recovery_start, instant)),
+            ("in_fast_recovery", bool(self.in_fast_recovery)),
+            ("in_rto_recovery", bool(self.in_rto_recovery)),
+            ("rto_slow_start", bool(self.rto_slow_start)),
+            ("idle_start", option(self.idle_start, instant)),
+        ])
+    }
+}
+
+#[cfg(test)]
 mod test {
     use crate::{socket::tcp::RttEstimator, time::Instant};
 

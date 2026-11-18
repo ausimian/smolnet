@@ -151,6 +151,15 @@ impl Scoreboard {
 }
 
 #[cfg(test)]
+impl Scoreboard {
+    /// The ranges as JSON, for SmolNet's test vectors.
+    pub(super) fn vector_json(&self) -> std::string::String {
+        use super::vectors::{array, seq};
+        array(self.ranges().iter().map(|&(l, r)| array([seq(l), seq(r)])))
+    }
+}
+
+#[cfg(test)]
 mod test {
     use super::*;
 

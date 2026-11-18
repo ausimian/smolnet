@@ -21,6 +21,8 @@ use crate::wire::{
 mod congestion;
 mod rack;
 mod scoreboard;
+#[cfg(test)]
+mod vectors;
 
 use rack::{Probe, Rack};
 use scoreboard::Scoreboard;
@@ -3871,6 +3873,334 @@ mod test {
     struct TestSocket {
         socket: Socket<'static>,
         cx: Context,
+        /// Records the test as a SmolNet test vector (see `vectors`).
+        vector: vectors::Recorder,
+    }
+
+    // The socket calls the tests make, recorded as `call` steps of the test
+    // vector. They shadow the socket's own methods, which `Deref` reaches.
+    impl TestSocket {
+        fn call<T>(
+            &mut self,
+            name: &str,
+            args: Vec<(&str, String)>,
+            call: impl FnOnce(&mut Socket<'static>, &mut Context) -> T,
+            result: impl FnOnce(&T) -> String,
+        ) -> T {
+            let before = self.vector.before(&self.socket, &mut self.cx);
+            let value = call(&mut self.socket, &mut self.cx);
+            let result = result(&value);
+            self.record_call(before, name, args, result);
+            value
+        }
+
+        fn record_call(
+            &mut self,
+            before: Option<vectors::Snapshot>,
+            name: &str,
+            args: Vec<(&str, String)>,
+            result: String,
+        ) {
+            use vectors::{instant, object, string};
+            let fields = vec![
+                ("op", string("call")),
+                ("at", instant(self.cx.now())),
+                ("name", string(name)),
+                ("args", object(&args)),
+                ("result", result),
+            ];
+            self.vector.step(before, &self.socket, &mut self.cx, fields);
+        }
+
+        fn unit(_: &()) -> String {
+            vectors::null()
+        }
+
+        fn send_slice(&mut self, data: &[u8]) -> Result<usize, SendError> {
+            let args = vec![("data", vectors::hex(data))];
+            self.call(
+                "send_slice",
+                args,
+                |s, _| s.send_slice(data),
+                |r| vectors::result(r, |n| vectors::uint(*n as u64)),
+            )
+        }
+
+        /// `Socket::recv`, for closures that return nothing borrowed from
+        /// the buffer, which is all the tests have. The step's `len` is how
+        /// many bytes the closure took.
+        fn recv<F, R>(&mut self, f: F) -> Result<R, RecvError>
+        where
+            F: for<'b> FnOnce(&'b mut [u8]) -> (usize, R),
+        {
+            let before = self.vector.before(&self.socket, &mut self.cx);
+            let received = self.socket.recv(|buffer| {
+                let offered = buffer.to_vec();
+                let (taken, value) = f(buffer);
+                (taken, (offered, taken, value))
+            });
+            let (args, result) = match &received {
+                Ok((offered, taken, _)) => (
+                    vec![("len", vectors::uint(*taken as u64))],
+                    vectors::object(&[(
+                        "ok",
+                        vectors::object(&[
+                            ("offered", vectors::uint(offered.len() as u64)),
+                            ("data", vectors::hex(&offered[..*taken])),
+                        ]),
+                    )]),
+                ),
+                Err(_) => (vec![], vectors::result(&received, |_| vectors::null())),
+            };
+            self.record_call(before, "recv", args, result);
+            received.map(|(_, _, value)| value)
+        }
+
+        fn recv_slice(&mut self, data: &mut [u8]) -> Result<usize, RecvError> {
+            self.slice_call("recv_slice", data, |s, buffer| s.recv_slice(buffer))
+        }
+
+        fn peek_slice(&mut self, data: &mut [u8]) -> Result<usize, RecvError> {
+            self.slice_call("peek_slice", data, |s, buffer| s.peek_slice(buffer))
+        }
+
+        fn slice_call(
+            &mut self,
+            name: &str,
+            data: &mut [u8],
+            call: impl FnOnce(&mut Socket<'static>, &mut [u8]) -> Result<usize, RecvError>,
+        ) -> Result<usize, RecvError> {
+            let args = vec![("len", vectors::uint(data.len() as u64))];
+            let n = self.call(
+                name,
+                args,
+                |s, _| {
+                    let n = call(s, data);
+                    n.map(|n| (n, data[..n].to_vec()))
+                },
+                |r| vectors::result(r, |(_, read)| vectors::hex(read)),
+            );
+            n.map(|(n, _)| n)
+        }
+
+        fn accepts(&mut self, ip_repr: &IpRepr, repr: &TcpRepr) -> bool {
+            let args = vec![
+                ("src_addr", vectors::string(&ip_repr.src_addr().to_string())),
+                ("dst_addr", vectors::string(&ip_repr.dst_addr().to_string())),
+                ("segment", vectors::segment(repr)),
+            ];
+            self.call(
+                "accepts",
+                args,
+                |s, cx| s.accepts(cx, ip_repr, repr),
+                |accepted| vectors::bool(*accepted),
+            )
+        }
+
+        /// `Socket::dispatch`, for tests that inspect or refuse what the
+        /// socket sends themselves.
+        fn dispatch<F, E>(&mut self, emit: F) -> Result<(), E>
+        where
+            F: FnOnce(&mut Context, PacketMeta, (IpRepr, TcpRepr)) -> Result<(), E>,
+        {
+            let at = self.cx.now();
+            let before = self.vector.before(&self.socket, &mut self.cx);
+            let mut emitted = None;
+            let result = self
+                .socket
+                .dispatch(&mut self.cx, |cx, meta, (ip_repr, tcp_repr)| {
+                    emitted = Some((vectors::segment(&tcp_repr), ip_repr.hop_limit()));
+                    emit(cx, meta, (ip_repr, tcp_repr))
+                });
+            let mut fields = vec![
+                ("op", vectors::string("dispatch")),
+                ("at", vectors::instant(at)),
+            ];
+            let outcome = match (&result, &emitted) {
+                (Ok(()), Some(_)) => "segment",
+                (Ok(()), None) => "nothing",
+                (Err(_), _) => "error",
+            };
+            fields.push(("result", vectors::string(outcome)));
+            // The test's closure stands in for the device, which refused the
+            // segment when it returned an error.
+            let refused = result.is_err() && emitted.is_some();
+            fields.push(("refused", vectors::bool(refused)));
+            if let Some((segment, hop_limit)) = emitted {
+                fields.push(("segment", segment));
+                fields.push(("hop_limit", vectors::uint(hop_limit.into())));
+                fields.push(("psh_compared", vectors::bool(false)));
+            }
+            self.vector.step(before, &self.socket, &mut self.cx, fields);
+            result
+        }
+
+        fn process_path_mtu(
+            &mut self,
+            local: IpEndpoint,
+            remote: IpEndpoint,
+            seq: TcpSeqNumber,
+            mtu: usize,
+        ) -> PathMtuOutcome {
+            let args = vec![
+                ("local", vectors::string(&local.to_string())),
+                ("remote", vectors::string(&remote.to_string())),
+                ("seq", vectors::seq(seq)),
+                ("mtu", vectors::uint(mtu as u64)),
+            ];
+            self.call(
+                "process_path_mtu",
+                args,
+                |s, cx| s.process_path_mtu(cx, local, remote, seq, mtu),
+                |outcome| vectors::string(&vectors::snake(&format!("{outcome:?}"))),
+            )
+        }
+
+        fn listen<T: Into<IpListenEndpoint>>(&mut self, endpoint: T) -> Result<(), ListenError> {
+            let endpoint = endpoint.into();
+            let args = vec![("local", vectors::listen_endpoint(&endpoint))];
+            self.call(
+                "listen",
+                args,
+                |s, _| s.listen(endpoint),
+                |r| vectors::result(r, Self::unit),
+            )
+        }
+
+        fn connect<T, U>(&mut self, remote: T, local: U) -> Result<(), ConnectError>
+        where
+            T: Into<IpEndpoint>,
+            U: Into<IpListenEndpoint>,
+        {
+            let (remote, local) = (remote.into(), local.into());
+            let args = vec![
+                ("remote", vectors::string(&remote.to_string())),
+                ("local", vectors::listen_endpoint(&local)),
+            ];
+            self.call(
+                "connect",
+                args,
+                |s, cx| s.connect(cx, remote, local),
+                |r| vectors::result(r, Self::unit),
+            )
+        }
+
+        fn close(&mut self) {
+            self.call("close", vec![], |s, _| s.close(), Self::unit)
+        }
+
+        fn abort(&mut self) {
+            self.call("abort", vec![], |s, _| s.abort(), Self::unit)
+        }
+
+        fn reset(&mut self) {
+            self.call("reset", vec![], |s, _| s.reset(), Self::unit)
+        }
+
+        fn set_timeout(&mut self, timeout: Option<Duration>) {
+            let args = vec![("timeout", vectors::option(timeout, vectors::duration))];
+            self.call(
+                "set_timeout",
+                args,
+                |s, _| s.set_timeout(timeout),
+                Self::unit,
+            )
+        }
+
+        fn set_ack_delay(&mut self, delay: Option<Duration>) {
+            let args = vec![("delay", vectors::option(delay, vectors::duration))];
+            self.call(
+                "set_ack_delay",
+                args,
+                |s, _| s.set_ack_delay(delay),
+                Self::unit,
+            )
+        }
+
+        fn set_nagle_enabled(&mut self, enabled: bool) {
+            let args = vec![("enabled", vectors::bool(enabled))];
+            self.call(
+                "set_nagle_enabled",
+                args,
+                |s, _| s.set_nagle_enabled(enabled),
+                Self::unit,
+            )
+        }
+
+        fn set_keep_alive(&mut self, interval: Option<Duration>) {
+            let args = vec![("interval", vectors::option(interval, vectors::duration))];
+            self.call(
+                "set_keep_alive",
+                args,
+                |s, _| s.set_keep_alive(interval),
+                Self::unit,
+            )
+        }
+
+        fn set_keep_alive_config(&mut self, config: Option<KeepAlive>) {
+            let args = vec![(
+                "config",
+                vectors::option(config, |k| {
+                    vectors::object(&[
+                        ("idle", vectors::duration(k.idle)),
+                        ("interval", vectors::duration(k.interval)),
+                        (
+                            "probes",
+                            vectors::option(k.probes, |p| vectors::uint(p.into())),
+                        ),
+                    ])
+                }),
+            )];
+            self.call(
+                "set_keep_alive_config",
+                args,
+                |s, _| s.set_keep_alive_config(config),
+                Self::unit,
+            )
+        }
+
+        fn set_hop_limit(&mut self, hop_limit: Option<u8>) {
+            let args = vec![(
+                "hop_limit",
+                vectors::option(hop_limit, |v| vectors::uint(v.into())),
+            )];
+            self.call(
+                "set_hop_limit",
+                args,
+                |s, _| s.set_hop_limit(hop_limit),
+                Self::unit,
+            )
+        }
+
+        fn set_congestion_control(&mut self, control: CongestionControl) {
+            let name = match control {
+                CongestionControl::None => "none",
+                #[cfg(feature = "socket-tcp-reno")]
+                CongestionControl::Reno => "reno",
+                #[cfg(feature = "socket-tcp-cubic")]
+                CongestionControl::Cubic => "cubic",
+            };
+            let args = vec![("control", vectors::string(name))];
+            self.call(
+                "set_congestion_control",
+                args,
+                |s, _| s.set_congestion_control(control),
+                Self::unit,
+            )
+        }
+
+        fn set_tsval_generator(&mut self, generator: Option<TcpTimestampGenerator>) {
+            let args = vec![(
+                "tsval",
+                vectors::option(generator, |generate| vectors::uint(generate().into())),
+            )];
+            self.call(
+                "set_tsval_generator",
+                args,
+                |s, _| s.set_tsval_generator(generator),
+                Self::unit,
+            )
+        }
     }
 
     impl Deref for TestSocket {
@@ -3903,25 +4233,42 @@ mod test {
         });
         net_trace!("send: {}", repr);
 
+        let before = socket.vector.before(&socket.socket, &mut socket.cx);
         assert!(socket.socket.accepts(&mut socket.cx, &ip_repr, repr));
 
-        match socket.socket.process(&mut socket.cx, &ip_repr, repr) {
+        let reply = match socket.socket.process(&mut socket.cx, &ip_repr, repr) {
             Some((_ip_repr, repr)) => {
                 net_trace!("recv: {}", repr);
                 Some(repr)
             }
             None => None,
-        }
+        };
+        let fields = vec![
+            ("op", vectors::string("input")),
+            ("at", vectors::instant(timestamp)),
+            ("src_addr", vectors::string(&ip_repr.src_addr().to_string())),
+            ("dst_addr", vectors::string(&ip_repr.dst_addr().to_string())),
+            ("segment", vectors::segment(repr)),
+            ("reply", vectors::option(reply.as_ref(), vectors::segment)),
+        ];
+        socket
+            .vector
+            .step(before, &socket.socket, &mut socket.cx, fields);
+        reply
     }
 
+    /// Dispatches one segment. `exact` is whether the test compares the PSH
+    /// flag, which most ignore.
     #[track_caller]
-    fn recv<F>(socket: &mut TestSocket, timestamp: Instant, mut f: F)
+    fn recv<F>(socket: &mut TestSocket, timestamp: Instant, exact: bool, mut f: F)
     where
         F: FnMut(Result<TcpRepr, ()>),
     {
         socket.cx.set_now(timestamp);
+        let before = socket.vector.before(&socket.socket, &mut socket.cx);
 
         let mut sent = 0;
+        let mut emitted = None;
         let result = socket
             .socket
             .dispatch(&mut socket.cx, |_, _, (ip_repr, tcp_repr)| {
@@ -3932,17 +4279,36 @@ mod test {
 
                 net_trace!("recv: {}", tcp_repr);
                 sent += 1;
+                emitted = Some((vectors::segment(&tcp_repr), ip_repr.hop_limit()));
                 Ok(f(Ok(tcp_repr)))
             });
+        let mut fields = vec![
+            ("op", vectors::string("dispatch")),
+            ("at", vectors::instant(timestamp)),
+        ];
         match result {
-            Ok(()) => assert_eq!(sent, 1, "Exactly one packet should be sent"),
-            Err(e) => f(Err(e)),
+            Ok(()) => {
+                assert_eq!(sent, 1, "Exactly one packet should be sent");
+                let (segment, hop_limit) = emitted.take().unwrap();
+                fields.push(("result", vectors::string("segment")));
+                fields.push(("segment", segment));
+                fields.push(("hop_limit", vectors::uint(hop_limit.into())));
+                fields.push(("psh_compared", vectors::bool(exact)));
+            }
+            Err(e) => {
+                fields.push(("result", vectors::string("error")));
+                f(Err(e))
+            }
         }
+        socket
+            .vector
+            .step(before, &socket.socket, &mut socket.cx, fields);
     }
 
     #[track_caller]
     fn recv_nothing(socket: &mut TestSocket, timestamp: Instant) {
         socket.cx.set_now(timestamp);
+        let before = socket.vector.before(&socket.socket, &mut socket.cx);
 
         let mut fail = false;
         let result: Result<(), ()> = socket.socket.dispatch(&mut socket.cx, |_, _, _| {
@@ -3953,7 +4319,15 @@ mod test {
             panic!("Should not send a packet")
         }
 
-        assert_eq!(result, Ok(()))
+        assert_eq!(result, Ok(()));
+        let fields = vec![
+            ("op", vectors::string("dispatch")),
+            ("at", vectors::instant(timestamp)),
+            ("result", vectors::string("nothing")),
+        ];
+        socket
+            .vector
+            .step(before, &socket.socket, &mut socket.cx, fields);
     }
 
     #[collapse_debuginfo(yes)]
@@ -3981,7 +4355,7 @@ mod test {
         ($socket:ident, $result:expr) =>
             (recv!($socket, time 0, $result));
         ($socket:ident, time $time:expr, $result:expr) =>
-            (recv(&mut $socket, Instant::from_millis($time), |result| {
+            (recv(&mut $socket, Instant::from_millis($time), false, |result| {
                 // Most of the time we don't care about the PSH flag.
                 let result = result.map(|mut repr| {
                     repr.control = repr.control.quash_psh();
@@ -3990,7 +4364,7 @@ mod test {
                 assert_eq!(result, $result)
             }));
         ($socket:ident, time $time:expr, $result:expr, exact) =>
-            (recv(&mut $socket, Instant::from_millis($time), |repr| assert_eq!(repr, $result)));
+            (recv(&mut $socket, Instant::from_millis($time), true, |repr| assert_eq!(repr, $result)));
     }
 
     #[collapse_debuginfo(yes)]
@@ -4026,10 +4400,9 @@ mod test {
         let tx_buffer = SocketBuffer::new(vec![0; tx_len]);
         let mut socket = Socket::new(rx_buffer, tx_buffer);
         socket.set_ack_delay(None);
-        TestSocket {
-            socket,
-            cx: iface.inner,
-        }
+        let mut cx = iface.inner;
+        let vector = vectors::Recorder::new(&socket, &mut cx);
+        TestSocket { socket, cx, vector }
     }
 
     fn socket_syn_received_with_buffer_sizes(tx_len: usize, rx_len: usize) -> TestSocket {
@@ -4161,7 +4534,7 @@ mod test {
             control: TcpControl::Syn,
             ..SEND_TEMPL
         };
-        assert!(!s.socket.accepts(&mut s.cx, &SEND_IP_TEMPL, &tcp_repr));
+        assert!(!s.accepts(&SEND_IP_TEMPL, &tcp_repr));
     }
 
     #[test]
@@ -4174,7 +4547,7 @@ mod test {
             control: TcpControl::Syn,
             ..SEND_TEMPL
         };
-        assert!(!s.socket.accepts(&mut s.cx, &SEND_IP_TEMPL, &tcp_repr));
+        assert!(!s.accepts(&SEND_IP_TEMPL, &tcp_repr));
     }
 
     #[test]
@@ -4372,7 +4745,7 @@ mod test {
             ack_number: Some(LOCAL_SEQ),
             ..SEND_TEMPL
         };
-        assert!(!s.socket.accepts(&mut s.cx, &SEND_IP_TEMPL, &tcp_repr));
+        assert!(!s.accepts(&SEND_IP_TEMPL, &tcp_repr));
 
         assert_eq!(s.state, State::Listen);
     }
@@ -4386,7 +4759,7 @@ mod test {
             ack_number: None,
             ..SEND_TEMPL
         };
-        assert!(!s.socket.accepts(&mut s.cx, &SEND_IP_TEMPL, &tcp_repr));
+        assert!(!s.accepts(&SEND_IP_TEMPL, &tcp_repr));
         assert_eq!(s.state, State::Listen);
     }
 
@@ -4680,22 +5053,18 @@ mod test {
     fn test_connect_validation() {
         let mut s = socket();
         assert_eq!(
-            s.socket
-                .connect(&mut s.cx, REMOTE_END, (IpvXAddress::UNSPECIFIED, 0)),
+            s.connect(REMOTE_END, (IpvXAddress::UNSPECIFIED, 0)),
             Err(ConnectError::Unaddressable)
         );
         assert_eq!(
-            s.socket
-                .connect(&mut s.cx, REMOTE_END, (IpvXAddress::UNSPECIFIED, 1024)),
+            s.connect(REMOTE_END, (IpvXAddress::UNSPECIFIED, 1024)),
             Err(ConnectError::Unaddressable)
         );
         assert_eq!(
-            s.socket
-                .connect(&mut s.cx, (IpvXAddress::UNSPECIFIED, 0), LOCAL_END),
+            s.connect((IpvXAddress::UNSPECIFIED, 0), LOCAL_END),
             Err(ConnectError::Unaddressable)
         );
-        s.socket
-            .connect(&mut s.cx, REMOTE_END, LOCAL_END)
+        s.connect(REMOTE_END, LOCAL_END)
             .expect("Connect failed with valid parameters");
         assert_eq!(s.tuple, Some(TUPLE));
     }
@@ -4704,9 +5073,7 @@ mod test {
     fn test_connect() {
         let mut s = socket();
         s.local_seq_no = LOCAL_SEQ;
-        s.socket
-            .connect(&mut s.cx, REMOTE_END, LOCAL_END.port)
-            .unwrap();
+        s.connect(REMOTE_END, LOCAL_END.port).unwrap();
         assert_eq!(s.tuple, Some(TUPLE));
         recv!(
             s,
@@ -4738,9 +5105,7 @@ mod test {
     fn test_connect_synack_tiny_mss_is_clamped() {
         let mut s = socket();
         s.local_seq_no = LOCAL_SEQ;
-        s.socket
-            .connect(&mut s.cx, REMOTE_END, LOCAL_END.port)
-            .unwrap();
+        s.connect(REMOTE_END, LOCAL_END.port).unwrap();
         recv!(
             s,
             [TcpRepr {
@@ -4772,9 +5137,7 @@ mod test {
     fn test_connect_synack_zero_mss_is_ignored() {
         let mut s = socket();
         s.local_seq_no = LOCAL_SEQ;
-        s.socket
-            .connect(&mut s.cx, REMOTE_END, LOCAL_END.port)
-            .unwrap();
+        s.connect(REMOTE_END, LOCAL_END.port).unwrap();
         recv!(
             s,
             [TcpRepr {
@@ -4805,33 +5168,27 @@ mod test {
     #[test]
     fn test_connect_unspecified_local() {
         let mut s = socket();
-        assert_eq!(s.socket.connect(&mut s.cx, REMOTE_END, 80), Ok(()));
+        assert_eq!(s.connect(REMOTE_END, 80), Ok(()));
     }
 
     #[test]
     fn test_connect_specified_local() {
         let mut s = socket();
-        assert_eq!(
-            s.socket.connect(&mut s.cx, REMOTE_END, (REMOTE_ADDR, 80)),
-            Ok(())
-        );
+        assert_eq!(s.connect(REMOTE_END, (REMOTE_ADDR, 80)), Ok(()));
     }
 
     #[test]
     fn test_connect_twice() {
         let mut s = socket();
-        assert_eq!(s.socket.connect(&mut s.cx, REMOTE_END, 80), Ok(()));
-        assert_eq!(
-            s.socket.connect(&mut s.cx, REMOTE_END, 80),
-            Err(ConnectError::InvalidState)
-        );
+        assert_eq!(s.connect(REMOTE_END, 80), Ok(()));
+        assert_eq!(s.connect(REMOTE_END, 80), Err(ConnectError::InvalidState));
     }
 
     #[test]
     fn test_syn_sent_sanity() {
         let mut s = socket();
         s.local_seq_no = LOCAL_SEQ;
-        s.socket.connect(&mut s.cx, REMOTE_END, LOCAL_END).unwrap();
+        s.connect(REMOTE_END, LOCAL_END).unwrap();
         sanity!(s, socket_syn_sent());
     }
 
@@ -5255,7 +5612,7 @@ mod test {
             let mut s = socket_with_buffer_sizes(64, *buffer_size);
             s.local_seq_no = LOCAL_SEQ;
             assert_eq!(s.remote_win_shift, *shift_amt);
-            s.socket.connect(&mut s.cx, REMOTE_END, LOCAL_END).unwrap();
+            s.connect(REMOTE_END, LOCAL_END).unwrap();
             recv!(
                 s,
                 [TcpRepr {
@@ -6344,9 +6701,7 @@ mod test {
         let mut s = socket();
         s.set_tsval_generator(Some(|| 1));
         s.local_seq_no = LOCAL_SEQ;
-        s.socket
-            .connect(&mut s.cx, REMOTE_END, LOCAL_END.port)
-            .unwrap();
+        s.connect(REMOTE_END, LOCAL_END.port).unwrap();
         recv!(
             s,
             [TcpRepr {
@@ -7663,9 +8018,7 @@ mod test {
     fn test_path_mtu_needs_a_connection_with_smaller_segments_to_send() {
         // Not while connecting: there are no segments to size.
         let mut s = socket_syn_sent();
-        let outcome = s
-            .socket
-            .process_path_mtu(&s.cx, LOCAL_END, REMOTE_END, LOCAL_SEQ, 1280);
+        let outcome = s.process_path_mtu(LOCAL_END, REMOTE_END, LOCAL_SEQ, 1280);
         assert_eq!(outcome, PathMtuOutcome::Rejected);
 
         let mut s = socket_established();
@@ -7682,15 +8035,11 @@ mod test {
 
         // Nor for another connection.
         let other = IpEndpoint::new(OTHER_ADDR.into(), REMOTE_PORT);
-        let outcome = s
-            .socket
-            .process_path_mtu(&s.cx, LOCAL_END, other, LOCAL_SEQ + 1, 1280);
+        let outcome = s.process_path_mtu(LOCAL_END, other, LOCAL_SEQ + 1, 1280);
         assert_eq!(outcome, PathMtuOutcome::NotMatched);
 
         // The remote's MSS of 536 already keeps the segments within the path.
-        let outcome = s
-            .socket
-            .process_path_mtu(&s.cx, LOCAL_END, REMOTE_END, LOCAL_SEQ + 1, 1280);
+        let outcome = s.process_path_mtu(LOCAL_END, REMOTE_END, LOCAL_SEQ + 1, 1280);
         assert_eq!(outcome, PathMtuOutcome::Unchanged);
         assert_eq!(s.path_mtu, Some(1280));
         recv_nothing!(s);
@@ -8259,7 +8608,7 @@ mod test {
     #[track_caller]
     fn dispatch_refused(s: &mut TestSocket, time: i64) {
         s.cx.set_now(Instant::from_millis(time));
-        let result: Result<(), ()> = s.socket.dispatch(&mut s.cx, |_, _, _| Err(()));
+        let result: Result<(), ()> = s.dispatch(|_, _, _| Err(()));
         assert_eq!(result, Err(()));
     }
 
@@ -8885,12 +9234,10 @@ mod test {
         // They are too big for the path, and are resent at the new size
         // from the last ACK. Resending is loss recovery of a kind, and no
         // probe is due during it.
-        let outcome = s
-            .socket
-            .process_path_mtu(&s.cx, LOCAL_END, REMOTE_END, LOCAL_SEQ + 11, 1280);
+        let outcome = s.process_path_mtu(LOCAL_END, REMOTE_END, LOCAL_SEQ + 11, 1280);
         assert_eq!(outcome, PathMtuOutcome::Reduced);
         assert_eq!(s.rack.probe_at, None);
-        recv(&mut s, Instant::from_millis(110), |repr| {
+        recv(&mut s, Instant::from_millis(110), false, |repr| {
             assert_eq!(repr.unwrap().seq_number, LOCAL_SEQ + 11)
         });
         assert!(!s.loss_probe_allowed());
@@ -10316,9 +10663,7 @@ mod test {
     fn test_connect_timeout() {
         let mut s = socket();
         s.local_seq_no = LOCAL_SEQ;
-        s.socket
-            .connect(&mut s.cx, REMOTE_END, LOCAL_END.port)
-            .unwrap();
+        s.connect(REMOTE_END, LOCAL_END.port).unwrap();
         s.set_timeout(Some(Duration::from_millis(100)));
         recv!(s, time 150, Ok(TcpRepr {
             control:    TcpControl::Syn,
@@ -10558,7 +10903,7 @@ mod test {
             }
             s.cx.set_now(at);
             let mut probed = false;
-            let _: Result<(), ()> = s.socket.dispatch(&mut s.cx, |_, _, (_, repr)| {
+            let _: Result<(), ()> = s.dispatch(|_, _, (_, repr)| {
                 probed = repr.payload.len() == 1;
                 Ok(())
             });
@@ -10617,7 +10962,7 @@ mod test {
 
             s.cx.set_now(at);
             let now = at.total_millis();
-            let _: Result<(), ()> = s.socket.dispatch(&mut s.cx, |_, _, (_, repr)| {
+            let _: Result<(), ()> = s.dispatch(|_, _, (_, repr)| {
                 sent.push((now, repr.control.quash_psh(), repr.payload.len()));
                 Ok(())
             });
@@ -10793,7 +11138,7 @@ mod test {
 
         s.set_hop_limit(Some(0x2a));
         assert_eq!(
-            s.socket.dispatch(&mut s.cx, |_, _, (ip_repr, _)| {
+            s.dispatch(|_, _, (ip_repr, _)| {
                 assert_eq!(ip_repr.hop_limit(), 0x2a);
                 Ok::<_, ()>(())
             }),
@@ -11496,7 +11841,7 @@ mod test {
         let mut s = socket_established();
         s.remote_mss = 6;
         s.send_slice(b"abcdef0").unwrap();
-        s.socket.close();
+        s.close();
 
         recv!(s, time 0, Ok(TcpRepr {
             control:    TcpControl::None,
@@ -11530,7 +11875,7 @@ mod test {
             dst_port: LOCAL_PORT + 1,
             ..SEND_TEMPL
         };
-        assert!(!s.socket.accepts(&mut s.cx, &SEND_IP_TEMPL, &tcp_repr));
+        assert!(!s.accepts(&SEND_IP_TEMPL, &tcp_repr));
 
         let tcp_repr = TcpRepr {
             seq_number: REMOTE_SEQ + 1,
@@ -11538,7 +11883,7 @@ mod test {
             src_port: REMOTE_PORT + 1,
             ..SEND_TEMPL
         };
-        assert!(!s.socket.accepts(&mut s.cx, &SEND_IP_TEMPL, &tcp_repr));
+        assert!(!s.accepts(&SEND_IP_TEMPL, &tcp_repr));
     }
 
     #[test]
@@ -11559,7 +11904,7 @@ mod test {
             payload_len: tcp_repr.buffer_len(),
             hop_limit: 64,
         });
-        assert!(s.socket.accepts(&mut s.cx, &ip_repr, &tcp_repr));
+        assert!(s.accepts(&ip_repr, &tcp_repr));
 
         let ip_repr_wrong_src = IpReprIpvX(IpvXRepr {
             src_addr: OTHER_ADDR,
@@ -11568,7 +11913,7 @@ mod test {
             payload_len: tcp_repr.buffer_len(),
             hop_limit: 64,
         });
-        assert!(!s.socket.accepts(&mut s.cx, &ip_repr_wrong_src, &tcp_repr));
+        assert!(!s.accepts(&ip_repr_wrong_src, &tcp_repr));
 
         let ip_repr_wrong_dst = IpReprIpvX(IpvXRepr {
             src_addr: REMOTE_ADDR,
@@ -11577,7 +11922,7 @@ mod test {
             payload_len: tcp_repr.buffer_len(),
             hop_limit: 64,
         });
-        assert!(!s.socket.accepts(&mut s.cx, &ip_repr_wrong_dst, &tcp_repr));
+        assert!(!s.accepts(&ip_repr_wrong_dst, &tcp_repr));
     }
 
     // =========================================================================================//
@@ -11798,9 +12143,7 @@ mod test {
         s.set_tsval_generator(Some(|| 1));
         assert!(s.timestamp_enabled());
         s.local_seq_no = LOCAL_SEQ;
-        s.socket
-            .connect(&mut s.cx, REMOTE_END, LOCAL_END.port)
-            .unwrap();
+        s.connect(REMOTE_END, LOCAL_END.port).unwrap();
         assert_eq!(s.tuple, Some(TUPLE));
         recv!(
             s,
@@ -11847,9 +12190,7 @@ mod test {
         // s.set_timestamp(false); // commented to alert if the default state changes
         assert!(!s.timestamp_enabled());
         s.local_seq_no = LOCAL_SEQ;
-        s.socket
-            .connect(&mut s.cx, REMOTE_END, LOCAL_END.port)
-            .unwrap();
+        s.connect(REMOTE_END, LOCAL_END.port).unwrap();
         assert_eq!(s.tuple, Some(TUPLE));
         recv!(
             s,
