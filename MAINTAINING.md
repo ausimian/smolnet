@@ -94,6 +94,34 @@ through `SmolNet.Test.Snapshot.nif/2`. The compatibility job's `backend`
 matrix dimension lists the backends CI runs. Tests of the shell itself use
 `SmolNet.Test.NativeDouble`, a scripted backend.
 
+### Benchmarks
+
+`bench/` holds two benchmarks, not part of the suite; each file's header
+lists its settings. Run them under `MIX_ENV=prod`, so the NIF is its release
+build, with scheduler busy-waiting off and pinned to idle cores:
+
+```console
+MIX_ENV=prod ERL_FLAGS="+S 4 +sbwt none +sbwtdcpu none +sbwtdio none" \
+  taskset -c 8-11 mix run bench/core.exs
+```
+
+- `bench/core.exs` runs the engine alone: two stacks' backend states joined
+  in one process by an in-memory link, under a virtual clock, timing only
+  the backend calls. `BACKENDS=native,elixir` compares the two engines,
+  `GC=tuned` runs with the Stack process's GC flags, and
+  `PROFILE=call_count` (or `call_time`, `call_memory`) adds a `:tprof`
+  profile. `DIGEST=all` prints a digest of everything the engine returned
+  over a fixed set of runs (several streams, both families, closes, losses):
+  a change meant to leave behaviour alone, such as an optimisation, must
+  leave every digest as it was. Its wire digest covers only the packets
+  each end sent, and is the same for both backends; the full digest is
+  reproducible for the Elixir engine only, since the NIF yields to
+  continuations by wall-clock budget.
+- `bench/loopback.exs` runs one stack carrying a transfer to itself over
+  `SmolNet.Loopback`, through the socket API, and reports the rate and the
+  CPU and GC per MiB; `TRACE=1` adds the Stack process's own time per MiB,
+  which bounds the rate.
+
 ## Native development builds and work budgets
 
 Repository checkouts and CI always compile the NIF from source so native

@@ -26,6 +26,7 @@
           "src/",
           "test/",
           "integration/",
+          "bench/",
           "web/",
           "apps/*/lib/",
           "apps/*/src/",
