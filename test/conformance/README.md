@@ -138,3 +138,110 @@ vector itself; `tcp_vectors_test.exs` replays every vector through it,
 checks that each vector is consistent (`TcpReplay.validate/1`), and that
 the runner reports a perturbed reply, segment, result or field. The Elixir
 connection (`SmolNet.Core.Tcp.Connection`) plugs in as another subject.
+
+## Backend traces
+
+`traces/` holds what the NIF backend did in a set of scenarios, call for
+call: one JSON file per scenario. `SmolNet.Conformance.Trace.replay/3` makes
+the same calls, at the same times and with the same packets, on another
+backend and reports the first call whose outcome differs. This is the
+differential run of #173: once the NIF is gone, the traces stand in for it.
+
+### Recording
+
+```console
+MIX_ENV=test mix run scripts/backend_traces.exs
+```
+
+The scenarios are in `SmolNet.Conformance.Scenarios`: six 32 KiB transfers
+through the link simulator (below), clean and impaired, over IPv4 and IPv6,
+and `ingress_replies`, the packets a stack answers by itself (echo, Port and
+Protocol Unreachable, Parameter Problem, a RST for a closed port, an IPv4
+fragment, a datagram for a bound socket). `differential_test.exs` replays
+every committed trace on the suite's backend: on the NIF it fails when the
+NIF's behaviour changes until the traces are recorded again and committed,
+and on any other backend it is the comparison itself.
+
+### Format
+
+A trace is a header line and then one line per call, so that a re-recorded
+trace diffs call by call. The header is `{"format":
+"smolnet.backend_trace", "version": 1, "name", "description"}`. Each call
+is an object:
+
+| Field | Meaning |
+| --- | --- |
+| `stack` | Which stack of the scenario, by name. |
+| `at` | The call's time, in the stack clock's milliseconds. |
+| `call` | The `SmolNet.Stack.Backend` callback, or `stack_new` for the stack's creation, whose argument is the `SmolNet.start_stack/1` options it was given. |
+| `args` | The callback's arguments, without the backend state, the caller pid or the time. |
+| `result` | `{ok, result}` or `{error, reason}`. |
+| `poll_at` | The deadline the reply named, or null. |
+| `emitted` | The packets the call emitted, in order. |
+| `events` | The readiness and abort notices it gave: `{wake, socket, ref}` and `{abort, socket, ref, reason}`. |
+
+Values are Erlang terms in JSON (`SmolNet.Conformance.TermJson`): atoms are
+strings, binaries `{"hex": ...}`, tuples `{"tuple": [...]}`, maps `{"map":
+[[key, value], ...]}`, lists arrays, and nil, true and false themselves.
+Nothing a backend chooses for itself is recorded: sockets are `{socket,
+n}` for the nth identity the stack returned, references `{ref, n}` for the
+nth the driver made, and the caller is `caller`.
+
+A call is carried to completion as the shell carries it: while the reply
+says `more: true`, the driver polls at the same time, and the entry has the
+packets of the call and those polls together, with the last reply's
+deadline. So a trace does not depend on where the NIF's wall-clock budget
+cut a call, which a `:debug_nif` test checks by having the NIF yield every
+call at once, and a backend that never sets `more` compares directly. The
+NIF sends its readiness and abort messages itself; the driver collects them
+from its mailbox, so they are events like any other backend's effects.
+
+Replay compares every field of every call, the stack's creation included, by default; `ignore: [:poll_at]` or
+`ignore: [:emitted, :poll_at]` relax it to timers or to outcomes alone,
+for the parts of #173 that are compared by outcome rather than segment for
+segment.
+
+### Determinism
+
+Stacks in traces start with `test_determinism` hooks, so a trace is a
+function of its scenario. For the initial sequence numbers to match, an
+Elixir backend must draw them as smoltcp does: sPCG32 seeded with
+`random_seed`, the IPv4 identification start drawn first (`rand_u16`
+until not zero; no packet shows it, since IPv4 is sent with DF and
+identification 0), then one `rand_u32` per connection, active or passive,
+in the order they open. `SmolNet.Conformance.Pcg32` is that generator, and
+`differential_test.exs` checks it predicts the NIF's SYNs and SYN-ACKs.
+
+## Link simulator
+
+`SmolNet.Conformance.LinkSim` joins two stacks' backends by a simulated
+link that loses, duplicates, delays and reorders packets, as a pure fold in
+virtual time: no processes and no clock, so a run is a function of its
+options and takes a millisecond or so. A client connects, sends a stream
+and closes; the server reads to the end and closes. The run reports
+integrity (the server read exactly what was sent), liveness (it finished
+before a virtual deadline, or which call failed), and returns every call
+both backends saw, which is how the traces above are made.
+
+Time moves to the next packet's arrival or the next poll deadline. A stack
+polled at a time that names the same time again is next polled a
+millisecond on, as the shell's timer would fire as the clock moved.
+
+The simulator found #177: a lost FIN is never resent once a third
+duplicate ACK arrives after it.
+
+## Properties
+
+[StreamData](https://hex.pm/packages/stream_data) replaces the NIF's fuzz
+targets, at the backend boundary so that they hold for any backend:
+
+- `ingress_property_test.exs`: whatever packets arrive, well formed or
+  damaged (`SmolNet.Conformance.Generators`), ingress answers `:ok` or an
+  error and the stack still answers a ping.
+- `differential_test.exs`: over random links the simulator delivers the
+  stream intact and finishes, and the initial sequence numbers follow the
+  PCG for random seeds. Until #177 is fixed, a close that stalls on its
+  lost FIN (`LinkSim.lost_fin?/1`) is allowed, the data still intact.
+
+Parser round trips and the buffers and assembler against a model come with
+the Elixir modules they test, in phases 3 and 5.

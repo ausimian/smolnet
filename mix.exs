@@ -78,6 +78,7 @@ defmodule SmolNet.MixProject do
       {:dialyxir, "~> 1.4", only: [:dev, :test], runtime: false},
       {:ex_doc, "~> 0.40", only: [:dev, :test], runtime: false},
       {:excoveralls, "~> 0.18", only: :test},
+      {:stream_data, "~> 1.1", only: [:dev, :test]},
       {:publisho, "~> 1.0", only: :dev, runtime: false}
     ]
   end
