@@ -133,11 +133,17 @@ socket's replay stops at its first mismatch, which names the test, socket,
 step and what differed. Segments compare whole, except a dispatched
 segment's PSH flag where the test ignored it.
 
-The only subject today is `TcpReplay.Recorded`, which answers from the
-vector itself; `tcp_vectors_test.exs` replays every vector through it,
-checks that each vector is consistent (`TcpReplay.validate/1`), and that
-the runner reports a perturbed reply, segment, result or field. The Elixir
-connection (`SmolNet.Core.Tcp.Connection`) plugs in as another subject.
+There are two subjects. `TcpReplay.Recorded` answers from the vector
+itself; `tcp_vectors_test.exs` replays every vector through it, checks
+that each vector is consistent (`TcpReplay.validate/1`), and that the
+runner reports a perturbed reply, segment, result or field.
+`TcpReplay.Connection` is the Elixir connection,
+`SmolNet.Core.Tcp.Connection`, and every vector replays on it with every
+field compared, smoltcp's own bookkeeping included: the RACK send log, the
+assembler's layout, CUBIC's floats and `recv`'s `offered`. The connection
+reproduces where smoltcp's send ring wraps, so `test_buffer_wraparound_tx`
+passes too; the subject takes a test's direct dequeue from the send buffer
+as a move of the ring.
 
 ## Backend traces
 
@@ -263,5 +269,8 @@ targets, at the backend boundary so that they hold for any backend:
 
 The wire parsers' properties (they never raise, and what they emit parses
 back) are in `test/smol_net/core/wire/properties_test.exs`, beside smoltcp's
-ported wire tests. The buffers and assembler against a model come with the
-Elixir modules they test, in phase 5.
+ported wire tests. The TCP send and receive buffers are checked against
+models in `test/smol_net/core/tcp/buffers_test.exs`, and the assembler
+against smoltcp's bitmap model in `assembler_test.exs`, beside the ported
+unit tests of the assembler, the estimator, CUBIC, the SACK scoreboard and
+RACK.
