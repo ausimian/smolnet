@@ -1,6 +1,8 @@
 defmodule SmolNet.NativeArtifactTest do
   use ExUnit.Case, async: true
 
+  @moduletag :nif
+
   alias SmolNet.NativeArtifact
 
   describe "verify_entries/2" do

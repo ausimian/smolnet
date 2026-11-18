@@ -4,6 +4,7 @@ defmodule SmolNet.TcpConnectTest do
   alias SmolNet.Socket
   alias SmolNet.Test.IPv6TcpPeer
   alias SmolNet.Test.ManualClock
+  alias SmolNet.Test.Snapshot
 
   import Bitwise
 
@@ -422,8 +423,9 @@ defmodule SmolNet.TcpConnectTest do
 
     {:ok, info} = SmolNet.stack_info(stack)
     assert info.native.result.limits.ready_events < count
-    assert info.native.result.native_socket_capacity == count
-    assert info.native.result.native_socket_count == count
+    assert info.native.result.limits.sockets == count
+    assert Snapshot.nif(info, &(&1.native_socket_capacity == count))
+    assert Snapshot.nif(info, &(&1.native_socket_count == count))
     assert info.native.result.socket_count == count
     assert info.native.result.waiter_count == count
 

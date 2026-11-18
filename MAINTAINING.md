@@ -26,6 +26,30 @@ assertion are never scaled. Set it locally only to reproduce a CI run:
 SMOLNET_TEST_TIMEOUT_SCALE=5 mix test
 ```
 
+## Protocol backends
+
+`SmolNet.Stack` is a shell around a protocol engine, its backend: a module
+implementing `SmolNet.Stack.Backend`, chosen per stack with the `:backend`
+option. Each callback is one stack operation and returns `{reply, state,
+effects}`; the shell keeps the state, sends the effects' packets, readiness
+and abort messages, and arms the poll timer. The only backend today is
+`:native`, the NIF behind `SmolNet.Stack.Backend.Native`, while #173
+replaces it with an Elixir one.
+
+The suite runs once per backend. `SMOLNET_TEST_BACKEND` names the one stacks
+start with when a test does not choose (default `native`):
+
+```console
+SMOLNET_TEST_BACKEND=native mix test
+```
+
+Tests of the NIF itself are tagged `:nif`, and those needing its debug
+hooks `:debug_nif`; both run only on the native backend. A test that reads a
+`stack_info/1` key only the NIF reports checks it through
+`SmolNet.Test.Snapshot.nif/2`. The compatibility job's `backend` matrix
+dimension lists the backends CI runs. Tests of the shell itself use
+`SmolNet.Test.NativeDouble`, a scripted backend.
+
 ## Native development builds and work budgets
 
 Repository checkouts and CI always compile the NIF from source so native

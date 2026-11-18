@@ -3,8 +3,8 @@ defmodule SmolNet.Stack do
 
   use GenServer, restart: :temporary, significant: true
 
-  alias SmolNet.Native
   alias SmolNet.Socket
+  alias SmolNet.Stack.Backend
   alias SmolNet.Stack.Clock.System, as: SystemClock
   alias SmolNet.Stack.Options
   alias SmolNet.Stack.Ref
@@ -385,6 +385,22 @@ defmodule SmolNet.Stack do
   def native_snapshot(stack), do: GenServer.call(stack, :native_snapshot)
 
   @doc false
+  # Test accessor: the stack's backend module and its current state, so a
+  # test can reach the NIF's debug hooks without reading the raw GenServer
+  # state.
+  @spec backend_state(pid()) :: {module(), term()}
+  def backend_state(stack), do: GenServer.call(stack, :backend_state)
+
+  @doc false
+  # Test accessor: how many socket owners the stack monitors, counted in both
+  # of its indexes, which must agree.
+  @spec owner_monitor_counts(pid()) :: %{
+          by_monitor: non_neg_integer(),
+          by_identity: non_neg_integer()
+        }
+  def owner_monitor_counts(stack), do: GenServer.call(stack, :owner_monitor_counts)
+
+  @doc false
   @spec test_contention(pid()) :: {:error, :ownership_invariant_violation}
   def test_contention(stack), do: GenServer.call(stack, :test_contention)
 
@@ -409,9 +425,10 @@ defmodule SmolNet.Stack do
       ready_ref: Keyword.fetch!(options, :ready_ref),
       limits: Keyword.fetch!(options, :limits),
       native_config: Keyword.get(options, :native_config, Options.default_native_config()),
-      native_module: nil,
+      backend: Keyword.get_lazy(options, :backend, &Backend.default/0),
+      backend_state: nil,
+      backend_ready: false,
       clock: Application.get_env(:smolnet, :clock_module, SystemClock),
-      native: nil,
       egress_pid: egress_pid,
       link_ref: link_ref,
       link_monitor: link_monitor,
@@ -432,21 +449,20 @@ defmodule SmolNet.Stack do
       socket_owner_monitors_by_identity: %{}
     }
 
-    {:ok, state, {:continue, :create_native_stack}}
+    {:ok, state, {:continue, :create_backend}}
   end
 
   @impl true
-  def handle_continue(:create_native_stack, state) do
-    native = Application.get_env(:smolnet, :native_module, Native)
+  def handle_continue(:create_backend, state) do
     now = state.clock.now()
 
-    case native.stack_new(state.limits, state.native_config, now) do
-      {:ok, %{result: resource} = envelope} ->
+    case state.backend.stack_new(state.limits, state.native_config, now) do
+      {{:ok, envelope}, _backend_state, _effects} = outcome ->
         send(state.starter, {:smolnet_stack_ready, state.ready_ref})
-        state = %{state | native: resource, native_module: native}
-        {:noreply, apply_effects(state, envelope)}
+        {_reply, state} = run(%{state | backend_ready: true}, outcome)
+        {:noreply, schedule(state, envelope)}
 
-      {:error, reason} ->
+      {{:error, reason}, _backend_state, _effects} ->
         send(state.starter, {:smolnet_stack_error, state.ready_ref, reason})
         {:noreply, state}
 
@@ -477,22 +493,22 @@ defmodule SmolNet.Stack do
     now = state.clock.now()
     state = %{state | timer: nil}
 
-    case state.native_module.stack_poll(state.native, now) do
-      {:ok, envelope} ->
+    case run(state, state.backend.stack_poll(state.backend_state, now)) do
+      {{:ok, envelope}, state} ->
         state
-        |> apply_effects(envelope)
+        |> schedule(envelope)
         |> continue_pending_ingress()
 
-      {:error, reason} when state.native_continuation ->
+      {{:error, reason}, state} when state.native_continuation ->
         {:stop, {:shutdown, {:native_poll_failed, reason}}, state}
 
-      {:error, _reason} ->
+      {{:error, _reason}, state} ->
         state |> replace_timer(nil) |> continue_pending_ingress()
     end
   end
 
   # A poll can go stale while a feeder's packet is held: the `more: true`
-  # branch of apply_effects/3 self-sends the poll, and any socket call queued
+  # branch of schedule/3 self-sends the poll, and any socket call queued
   # ahead of it bumps the generation again. The held packet was waiting on
   # that poll, so drain here whenever no live continuation will do it, or the
   # feeder blocks in SmolNet.ingress/2 with nothing left to release it.
@@ -566,25 +582,41 @@ defmodule SmolNet.Stack do
   end
 
   def handle_call({:grant_egress, packets, bytes}, _from, state) do
-    state.native_module.stack_grant_egress(state.native, packets, bytes, state.clock.now())
-    |> reply_native(state)
+    state.backend.stack_grant_egress(state.backend_state, packets, bytes, state.clock.now())
+    |> reply_backend(state)
   end
 
   def handle_call(:native_snapshot, _from, state) do
-    {:reply, state.native_module.stack_snapshot(state.native), state}
+    {snapshot, state} = snapshot(state)
+    {:reply, snapshot, state}
+  end
+
+  def handle_call(:backend_state, _from, state) do
+    {:reply, {state.backend, state.backend_state}, state}
+  end
+
+  def handle_call(:owner_monitor_counts, _from, state) do
+    counts = %{
+      by_monitor: map_size(state.socket_owner_monitors),
+      by_identity: map_size(state.socket_owner_monitors_by_identity)
+    }
+
+    {:reply, counts, state}
   end
 
   def handle_call(:test_contention, _from, state) do
-    {:reply, state.native_module.test_contention(state.native), state}
+    {reply, state} = run(state, state.backend.test_contention(state.backend_state))
+    {:reply, reply, state}
   end
 
   def handle_call({:test_bounded_work, requested}, _from, state) do
-    {:reply, state.native_module.test_bounded_work(state.native, requested), state}
+    {reply, state} = run(state, state.backend.test_bounded_work(state.backend_state, requested))
+    {:reply, reply, state}
   end
 
   def handle_call(:shutdown_waiters, _from, state) do
     state = state |> Map.put(:shutdown_requested, true) |> reject_pending_ingress(:closed)
-    reply = drain_native_shutdown(state, :closed)
+    {reply, state} = drain_shutdown(state, :closed)
 
     state =
       state
@@ -600,24 +632,32 @@ defmodule SmolNet.Stack do
         _from,
         state
       ) do
-    state.native_module.socket_cancel(
-      state.native,
+    state.backend.socket_cancel(
+      state.backend_state,
       %{id: id, generation: generation},
       operation,
       reference
     )
-    |> reply_native(state, &Function.identity/1, :preserve_timer)
+    |> reply_backend(state, &Function.identity/1, :preserve_timer)
   end
 
   def handle_call({:socket_open, family, kind}, _from, state) do
     result =
       case kind do
-        :stream -> state.native_module.tcp_open(state.native, family)
-        :datagram -> state.native_module.udp_open(state.native, family)
+        :stream ->
+          state.backend.tcp_open(
+            state.backend_state,
+            family,
+            @tcp_default_buffer_bytes,
+            @tcp_default_buffer_bytes
+          )
+
+        :datagram ->
+          state.backend.udp_open(state.backend_state, family)
       end
 
     result
-    |> reply_native(
+    |> reply_backend(
       state,
       fn identity -> {:ok, Socket.new(self(), identity, family, kind)} end,
       :preserve_timer
@@ -625,8 +665,8 @@ defmodule SmolNet.Stack do
   end
 
   def handle_call({:socket_open, family, :stream, rcvbuf, sndbuf}, _from, state) do
-    state.native_module.tcp_open(state.native, family, rcvbuf, sndbuf)
-    |> reply_native(
+    state.backend.tcp_open(state.backend_state, family, rcvbuf, sndbuf)
+    |> reply_backend(
       state,
       fn identity -> {:ok, Socket.new(self(), identity, family, :stream)} end,
       :preserve_timer
@@ -638,22 +678,22 @@ defmodule SmolNet.Stack do
 
     result =
       case kind do
-        :stream -> state.native_module.tcp_bind(state.native, identity, endpoint)
-        :datagram -> state.native_module.udp_bind(state.native, identity, endpoint)
+        :stream -> state.backend.tcp_bind(state.backend_state, identity, endpoint)
+        :datagram -> state.backend.udp_bind(state.backend_state, identity, endpoint)
       end
 
     result
-    |> reply_native(state, &Function.identity/1, :preserve_timer)
+    |> reply_backend(state, &Function.identity/1, :preserve_timer)
   end
 
   def handle_call({:socket_listen, id, generation, backlog}, _from, state) do
-    state.native_module.tcp_listen(
-      state.native,
+    state.backend.tcp_listen(
+      state.backend_state,
       %{id: id, generation: generation},
       backlog,
       state.clock.now()
     )
-    |> reply_native(state)
+    |> reply_backend(state)
   end
 
   def handle_call(
@@ -661,14 +701,14 @@ defmodule SmolNet.Stack do
         {caller, _tag},
         state
       ) do
-    state.native_module.tcp_accept(
-      state.native,
+    state.backend.tcp_accept(
+      state.backend_state,
       %{id: id, generation: generation},
       caller,
       reference,
       state.clock.now()
     )
-    |> reply_native(state, &normalize_accept_result(&1, self()))
+    |> reply_backend(state, &normalize_accept_result(&1, self()))
   end
 
   def handle_call(
@@ -676,8 +716,8 @@ defmodule SmolNet.Stack do
         {caller, _tag},
         state
       ) do
-    state.native_module.tcp_accept(
-      state.native,
+    state.backend.tcp_accept(
+      state.backend_state,
       %{id: id, generation: generation},
       caller,
       reference,
@@ -691,15 +731,15 @@ defmodule SmolNet.Stack do
         {caller, _tag},
         state
       ) do
-    state.native_module.tcp_connect(
-      state.native,
+    state.backend.tcp_connect(
+      state.backend_state,
       %{id: id, generation: generation},
       endpoint,
       caller,
       reference,
       state.clock.now()
     )
-    |> reply_native(state, &normalize_wait_result/1)
+    |> reply_backend(state, &normalize_wait_result/1)
   end
 
   def handle_call(
@@ -707,12 +747,12 @@ defmodule SmolNet.Stack do
         _from,
         state
       ) do
-    state.native_module.udp_connect(
-      state.native,
+    state.backend.udp_connect(
+      state.backend_state,
       %{id: id, generation: generation},
       endpoint
     )
-    |> reply_native(state, &Function.identity/1, :preserve_timer)
+    |> reply_backend(state, &Function.identity/1, :preserve_timer)
   end
 
   def handle_call(
@@ -720,15 +760,15 @@ defmodule SmolNet.Stack do
         {caller, _tag},
         state
       ) do
-    state.native_module.tcp_send(
-      state.native,
+    state.backend.tcp_send(
+      state.backend_state,
       %{id: id, generation: generation},
       data,
       caller,
       reference,
       state.clock.now()
     )
-    |> reply_native(state, &normalize_send_result(&1, data))
+    |> reply_backend(state, &normalize_send_result(&1, data))
   end
 
   def handle_call(
@@ -736,15 +776,15 @@ defmodule SmolNet.Stack do
         {caller, _tag},
         state
       ) do
-    state.native_module.tcp_recv(
-      state.native,
+    state.backend.tcp_recv(
+      state.backend_state,
       %{id: id, generation: generation},
       length,
       caller,
       reference,
       state.clock.now()
     )
-    |> reply_native(state, &normalize_recv_result/1)
+    |> reply_backend(state, &normalize_recv_result/1)
   end
 
   def handle_call(
@@ -752,8 +792,8 @@ defmodule SmolNet.Stack do
         {caller, _tag},
         state
       ) do
-    state.native_module.udp_sendto(
-      state.native,
+    state.backend.udp_sendto(
+      state.backend_state,
       %{id: id, generation: generation},
       endpoint,
       data,
@@ -761,7 +801,7 @@ defmodule SmolNet.Stack do
       reference,
       state.clock.now()
     )
-    |> reply_native(state, &normalize_datagram_wait_result/1)
+    |> reply_backend(state, &normalize_datagram_wait_result/1)
   end
 
   def handle_call(
@@ -769,25 +809,25 @@ defmodule SmolNet.Stack do
         {caller, _tag},
         state
       ) do
-    state.native_module.udp_recvfrom(
-      state.native,
+    state.backend.udp_recvfrom(
+      state.backend_state,
       %{id: id, generation: generation},
       length,
       caller,
       reference,
       state.clock.now()
     )
-    |> reply_native(state, &normalize_recvfrom_result/1)
+    |> reply_backend(state, &normalize_recvfrom_result/1)
   end
 
   def handle_call({:socket_shutdown, id, generation, how}, _from, state) do
-    state.native_module.tcp_shutdown(
-      state.native,
+    state.backend.tcp_shutdown(
+      state.backend_state,
       %{id: id, generation: generation},
       how,
       state.clock.now()
     )
-    |> reply_native(state)
+    |> reply_backend(state)
   end
 
   def handle_call({:socket_sockname, id, generation, kind}, _from, state) do
@@ -795,37 +835,37 @@ defmodule SmolNet.Stack do
     result = socket_name_call(state, kind, :sockname, identity)
 
     result
-    |> reply_native(state, &normalize_endpoint/1, :preserve_timer)
+    |> reply_backend(state, &normalize_endpoint/1, :preserve_timer)
   end
 
   def handle_call({:socket_set_nodelay, id, generation, nodelay}, _from, state) do
-    state.native_module.tcp_set_nodelay(
-      state.native,
+    state.backend.tcp_set_nodelay(
+      state.backend_state,
       %{id: id, generation: generation},
       nodelay,
       state.clock.now()
     )
-    |> reply_native(state)
+    |> reply_backend(state)
   end
 
   def handle_call({:socket_nodelay, id, generation}, _from, state) do
-    state.native_module.tcp_nodelay(state.native, %{id: id, generation: generation})
-    |> reply_native(state, &{:ok, &1}, :preserve_timer)
+    state.backend.tcp_nodelay(state.backend_state, %{id: id, generation: generation})
+    |> reply_backend(state, &{:ok, &1}, :preserve_timer)
   end
 
   def handle_call({:socket_set_keepalive, id, generation, keepalive}, _from, state) do
-    state.native_module.tcp_set_keepalive(
-      state.native,
+    state.backend.tcp_set_keepalive(
+      state.backend_state,
       %{id: id, generation: generation},
       keepalive,
       state.clock.now()
     )
-    |> reply_native(state)
+    |> reply_backend(state)
   end
 
   def handle_call({:socket_keepalive, id, generation}, _from, state) do
-    state.native_module.tcp_keepalive(state.native, %{id: id, generation: generation})
-    |> reply_native(state, &{:ok, &1}, :preserve_timer)
+    state.backend.tcp_keepalive(state.backend_state, %{id: id, generation: generation})
+    |> reply_backend(state, &{:ok, &1}, :preserve_timer)
   end
 
   def handle_call({:socket_peername, id, generation, kind}, _from, state) do
@@ -833,20 +873,18 @@ defmodule SmolNet.Stack do
     result = socket_name_call(state, kind, :peername, identity)
 
     result
-    |> reply_native(state, &normalize_endpoint/1, :preserve_timer)
+    |> reply_backend(state, &normalize_endpoint/1, :preserve_timer)
   end
 
   def handle_call({:socket_close, id, generation, kind}, _from, state) do
     identity = %{id: id, generation: generation}
 
-    result = close_socket_call(state, kind, identity)
-
-    case result do
-      {:ok, envelope} ->
-        state = state |> unwatch_socket_owner(identity) |> apply_effects(envelope)
+    case run(state, close_socket_call(state, kind, identity)) do
+      {{:ok, envelope}, state} ->
+        state = state |> unwatch_socket_owner(identity) |> schedule(envelope)
         {:reply, Map.fetch!(envelope, :result), state}
 
-      {:error, reason} ->
+      {{:error, reason}, state} ->
         {:reply, {:error, reason}, state}
     end
   end
@@ -854,24 +892,24 @@ defmodule SmolNet.Stack do
   def handle_call({:socket_watch_owner, id, generation, owner}, _from, state) do
     identity = %{id: id, generation: generation}
 
-    case state.native_module.socket_validate(state.native, identity) do
-      {:ok, %{result: native_kind} = envelope} ->
+    case run(state, state.backend.socket_validate(state.backend_state, identity)) do
+      {{:ok, %{result: native_kind} = envelope}, state} ->
         state =
           state
-          |> apply_effects(envelope, :preserve_timer)
+          |> schedule(envelope, :preserve_timer)
           |> watch_socket_owner(identity, native_kind, owner)
 
         {:reply, :ok, state}
 
-      {:error, reason} ->
+      {{:error, reason}, state} ->
         {:reply, {:error, reason}, state}
     end
   end
 
   def handle_call({:test_socket_open, internal_handle}, _from, state) do
-    result = state.native_module.test_socket_open(state.native, internal_handle)
+    result = state.backend.test_socket_open(state.backend_state, internal_handle)
 
-    reply_native(
+    reply_backend(
       result,
       state,
       fn identity -> Socket.new(self(), identity) end,
@@ -885,8 +923,8 @@ defmodule SmolNet.Stack do
         {caller, _tag},
         state
       ) do
-    state.native_module.test_socket_wait(
-      state.native,
+    state.backend.test_socket_wait(
+      state.backend_state,
       %{id: id, generation: generation},
       %{
         direction: direction,
@@ -898,12 +936,12 @@ defmodule SmolNet.Stack do
         completed: completed
       }
     )
-    |> reply_native(state, &normalize_wait_result/1, :preserve_timer)
+    |> reply_backend(state, &normalize_wait_result/1, :preserve_timer)
   end
 
   def handle_call({:test_socket_ready, keys}, _from, state) do
-    state.native_module.test_socket_ready(state.native, keys)
-    |> reply_native(state, &Function.identity/1, :preserve_timer)
+    state.backend.test_socket_ready(state.backend_state, keys)
+    |> reply_backend(state, &Function.identity/1, :preserve_timer)
   end
 
   def handle_call(
@@ -911,22 +949,25 @@ defmodule SmolNet.Stack do
         _from,
         state
       ) do
-    state.native_module.test_socket_close(
-      state.native,
+    state.backend.test_socket_close(
+      state.backend_state,
       %{id: id, generation: generation},
       wake_direction
     )
-    |> reply_native(state, &Function.identity/1, :preserve_timer)
+    |> reply_backend(state, &Function.identity/1, :preserve_timer)
   end
 
   def handle_call(:stack_info, _from, state) do
+    {snapshot, state} = snapshot(state)
+
     native =
-      case state.native_module.stack_snapshot(state.native) do
+      case snapshot do
         {:ok, envelope} -> envelope
         {:error, _reason} = error -> error
       end
 
     info = %{
+      backend: Backend.name(state.backend),
       ingress: %{mode: :single_feeder, rejected: state.rejected_ingress},
       processed_ingress: state.processed_ingress,
       failed_ingress: state.failed_ingress,
@@ -948,8 +989,8 @@ defmodule SmolNet.Stack do
       _cancel_result = state.clock.cancel_timer(state.timer.ref)
     end
 
-    if state.native_module && state.native && !state.shutdown_drain_attempted do
-      _shutdown_result = drain_native_shutdown(state, abort_reason(reason, state))
+    if state.backend_ready and not state.shutdown_drain_attempted do
+      _shutdown_result = drain_shutdown(state, abort_reason(reason, state))
     end
 
     :ok
@@ -1095,30 +1136,60 @@ defmodule SmolNet.Stack do
   end
 
   defp process_ingress(state, input, packet_count) do
-    result =
+    outcome =
       case input do
         packet when is_binary(packet) ->
-          state.native_module.stack_ingress(state.native, packet, state.clock.now())
+          state.backend.stack_ingress(state.backend_state, packet, state.clock.now())
 
         packets when is_list(packets) ->
-          state.native_module.stack_ingress_batch(state.native, packets, state.clock.now())
+          state.backend.stack_ingress_batch(state.backend_state, packets, state.clock.now())
       end
 
-    case result do
-      {:ok, envelope} ->
+    case run(state, outcome) do
+      {{:ok, envelope}, state} ->
         state
         |> Map.update!(:processed_ingress, &(&1 + packet_count))
-        |> apply_effects(envelope)
+        |> schedule(envelope)
 
-      {:error, _reason} ->
+      {{:error, _reason}, state} ->
         state
         |> Map.update!(:failed_ingress, &(&1 + packet_count))
         |> Map.put(:native_continuation, false)
     end
   end
 
-  defp apply_effects(state, envelope, timer_policy \\ :replace_timer) do
-    state = emit_packets(state, Map.get(envelope, :output, []))
+  # Takes a backend call's outcome: keeps the backend's new state, carries out
+  # its effects (see SmolNet.Stack.Backend), and returns the reply.
+  defp run(state, {reply, backend_state, effects}) do
+    state = %{state | backend_state: backend_state}
+    {reply, carry_out(state, effects, [], :emit)}
+  end
+
+  # Wakes and aborts go as they come; the packets go to the link together,
+  # in order, once the list is done. The shutdown drain passes `:drop`, as
+  # it discarded the native output before backends existed.
+  defp carry_out(state, [], [], _emit), do: state
+  defp carry_out(state, [], _packets, :drop), do: state
+
+  defp carry_out(state, [], packets, :emit),
+    do: emit_packets(state, :lists.reverse(packets))
+
+  defp carry_out(state, [{:emit, packet} | effects], packets, emit),
+    do: carry_out(state, effects, [packet | packets], emit)
+
+  defp carry_out(state, [{:wake, pid, identity, reference} | effects], packets, emit) do
+    send(pid, {:"$smol_socket", identity, :select, reference})
+    carry_out(state, effects, packets, emit)
+  end
+
+  defp carry_out(state, [{:abort, pid, identity, reference, reason} | effects], packets, emit) do
+    send(pid, {:"$smol_socket", identity, :abort, reference, reason})
+    carry_out(state, effects, packets, emit)
+  end
+
+  # Schedules the backend's next poll from a successful call's envelope: at
+  # once when it retained work (`more`), otherwise at its `poll_at`.
+  defp schedule(state, envelope, timer_policy \\ :replace_timer) do
     more = Map.get(envelope, :more, false)
     poll_at = Map.get(envelope, :poll_at)
 
@@ -1142,31 +1213,31 @@ defmodule SmolNet.Stack do
   end
 
   defp close_owned_socket(state, identity, kind) do
-    case close_socket_call(state, native_socket_kind(kind), identity) do
-      {:ok, envelope} -> {:noreply, apply_effects(state, envelope)}
-      {:error, _reason} -> {:noreply, state}
+    case run(state, close_socket_call(state, native_socket_kind(kind), identity)) do
+      {{:ok, envelope}, state} -> {:noreply, schedule(state, envelope)}
+      {{:error, _reason}, state} -> {:noreply, state}
     end
   end
 
   defp close_socket_call(state, :stream, identity) do
-    state.native_module.tcp_close(state.native, identity, state.clock.now())
+    state.backend.tcp_close(state.backend_state, identity, state.clock.now())
   end
 
   defp close_socket_call(state, :datagram, identity) do
-    state.native_module.udp_close(state.native, identity, state.clock.now())
+    state.backend.udp_close(state.backend_state, identity, state.clock.now())
   end
 
   defp socket_name_call(state, :stream, :sockname, identity),
-    do: state.native_module.tcp_sockname(state.native, identity)
+    do: state.backend.tcp_sockname(state.backend_state, identity)
 
   defp socket_name_call(state, :stream, :peername, identity),
-    do: state.native_module.tcp_peername(state.native, identity)
+    do: state.backend.tcp_peername(state.backend_state, identity)
 
   defp socket_name_call(state, :datagram, :sockname, identity),
-    do: state.native_module.udp_sockname(state.native, identity)
+    do: state.backend.udp_sockname(state.backend_state, identity)
 
   defp socket_name_call(state, :datagram, :peername, identity),
-    do: state.native_module.udp_peername(state.native, identity)
+    do: state.backend.udp_peername(state.backend_state, identity)
 
   defp native_socket_kind(:tcp), do: :stream
   defp native_socket_kind(:udp), do: :datagram
@@ -1185,7 +1256,7 @@ defmodule SmolNet.Stack do
   # The native stack returns its poll deadline after every call, and it is
   # often the deadline already armed. That timer then stays: it fires when a
   # new one would, and its message still carries the current generation. The
-  # `more: true` branch of apply_effects/3 always passes nil, so a
+  # `more: true` branch of schedule/3 always passes nil, so a
   # continuation still cancels the timer and moves to a new generation.
   defp replace_timer(%{timer: %{deadline: poll_at}} = state, poll_at), do: state
 
@@ -1267,13 +1338,13 @@ defmodule SmolNet.Stack do
   defp timer_deadline(nil), do: nil
   defp timer_deadline(timer), do: timer.deadline
 
-  defp drain_native_shutdown(state, reason) do
-    case state.native_module.stack_shutdown(state.native, reason) do
-      {:ok, envelope} ->
-        continue_native_shutdown(state, envelope, shutdown_continuation_limit(state.limits))
+  defp drain_shutdown(state, reason) do
+    case drain(state, state.backend.stack_shutdown(state.backend_state, reason)) do
+      {{:ok, envelope}, state} ->
+        continue_shutdown(state, envelope, shutdown_continuation_limit(state.limits))
 
-      {:error, reason} ->
-        {:error, reason}
+      {{:error, reason}, state} ->
+        {{:error, reason}, state}
     end
   end
 
@@ -1281,16 +1352,23 @@ defmodule SmolNet.Stack do
     @shutdown_continuation_limit + @shutdown_continuations_per_socket * limits.sockets
   end
 
-  defp continue_native_shutdown(_state, %{more: false}, _remaining), do: :ok
+  defp continue_shutdown(state, %{more: false}, _remaining), do: {:ok, state}
 
-  defp continue_native_shutdown(_state, %{more: true}, 0),
-    do: {:error, :shutdown_incomplete}
+  defp continue_shutdown(state, %{more: true}, 0),
+    do: {{:error, :shutdown_incomplete}, state}
 
-  defp continue_native_shutdown(state, %{more: true}, remaining) do
-    case state.native_module.stack_poll(state.native, state.clock.now()) do
-      {:ok, envelope} -> continue_native_shutdown(state, envelope, remaining - 1)
-      {:error, reason} -> {:error, reason}
+  defp continue_shutdown(state, %{more: true}, remaining) do
+    case drain(state, state.backend.stack_poll(state.backend_state, state.clock.now())) do
+      {{:ok, envelope}, state} -> continue_shutdown(state, envelope, remaining - 1)
+      {{:error, reason}, state} -> {{:error, reason}, state}
     end
+  end
+
+  # run/2 for the shutdown drain, which delivers wakes and aborts but never
+  # emits.
+  defp drain(state, {reply, backend_state, effects}) do
+    state = %{state | backend_state: backend_state}
+    {reply, carry_out(state, effects, [], :drop)}
   end
 
   # A try-lock collision is transient, so terminate/2 gets one more attempt.
@@ -1298,35 +1376,48 @@ defmodule SmolNet.Stack do
   defp shutdown_drain_terminal?({:error, :ownership_invariant_violation}), do: false
   defp shutdown_drain_terminal?(_result), do: true
 
-  defp reply_native(
-         result,
+  # The snapshot in the NIF's envelope shape, which `stack_info/1` documents
+  # as its `:native` key. A snapshot never emits or schedules.
+  defp snapshot(state) do
+    case run(state, state.backend.stack_snapshot(state.backend_state)) do
+      {{:ok, %{result: result}}, state} ->
+        {{:ok, %{result: result, output: [], poll_at: nil, more: false}}, state}
+
+      {{:error, _reason} = error, state} ->
+        {error, state}
+    end
+  end
+
+  defp reply_backend(
+         outcome,
          state,
          transform \\ &Function.identity/1,
          timer_policy \\ :replace_timer
        )
 
-  defp reply_native({:ok, envelope}, state, transform, timer_policy) do
-    result = envelope |> Map.fetch!(:result) |> transform.()
-    {:reply, result, apply_effects(state, envelope, timer_policy)}
-  end
+  defp reply_backend(outcome, state, transform, timer_policy) do
+    case run(state, outcome) do
+      {{:ok, envelope}, state} ->
+        result = envelope |> Map.fetch!(:result) |> transform.()
+        {:reply, result, schedule(state, envelope, timer_policy)}
 
-  defp reply_native({:error, reason}, state, _transform, _timer_policy) do
-    {:reply, {:error, reason}, state}
-  end
-
-  defp reply_owned_accept({:ok, envelope}, state, owner) do
-    case Map.fetch!(envelope, :result) do
-      {:ok, identity, family} ->
-        state = state |> apply_effects(envelope) |> watch_socket_owner(identity, :tcp, owner)
-        {:reply, {:ok, Socket.new(self(), identity, family)}, state}
-
-      result ->
-        {:reply, normalize_accept_result(result, self()), apply_effects(state, envelope)}
+      {{:error, reason}, state} ->
+        {:reply, {:error, reason}, state}
     end
   end
 
-  defp reply_owned_accept({:error, reason}, state, _owner) do
-    {:reply, {:error, reason}, state}
+  defp reply_owned_accept(outcome, state, owner) do
+    case run(state, outcome) do
+      {{:ok, %{result: {:ok, identity, family}} = envelope}, state} ->
+        state = state |> schedule(envelope) |> watch_socket_owner(identity, :tcp, owner)
+        {:reply, {:ok, Socket.new(self(), identity, family)}, state}
+
+      {{:ok, %{result: result} = envelope}, state} ->
+        {:reply, normalize_accept_result(result, self()), schedule(state, envelope)}
+
+      {{:error, reason}, state} ->
+        {:reply, {:error, reason}, state}
+    end
   end
 
   defp normalize_wait_result(:ready), do: :ready

@@ -19,11 +19,13 @@ defmodule SmolNet.StackLinkTest do
     previous_env =
       Map.new(
         [
-          :native_module,
+          :backend,
           :native_test_process,
           :native_test_result,
           :native_ingress_result,
           :native_poll_result,
+          :native_send_result,
+          :native_shutdown_result,
           :clock_module,
           :manual_clock
         ],
@@ -174,6 +176,60 @@ defmodule SmolNet.StackLinkTest do
 
     assert_receive {:smol_stack, :batch_link, :egress, [^first, ^second]}
     refute_receive {:smol_stack, :batch_link, :egress, _other}, 50
+  end
+
+  test "a call's wake and abort effects reach their pids before its packets and reply" do
+    configure_native_double(:default)
+    first = empty_ipv6_packet(1)
+    second = empty_ipv6_packet(2)
+    wake = make_ref()
+    abort = make_ref()
+
+    Application.put_env(
+      :smolnet,
+      :native_send_result,
+      NativeDouble.ok(
+        output: [first, second],
+        effects: [{:wake, self(), {1, 1}, wake}, {:abort, self(), {1, 2}, abort, :closed}]
+      )
+    )
+
+    {:ok, stack} = SmolNet.start_stack(egress: {self(), :effects})
+    %{stack: stack_pid} = Ref.pids(stack)
+    socket = Socket.new(stack_pid, %{id: 1, generation: 1})
+    assert_received {:native_stack_new, ^stack_pid}
+
+    assert :ok = SmolNet.Stack.socket_send(socket, "data")
+
+    assert {:messages, [first_message, second_message, third_message]} =
+             Process.info(self(), :messages)
+
+    assert first_message == {:"$smol_socket", {1, 1}, :select, wake}
+    assert second_message == {:"$smol_socket", {1, 2}, :abort, abort, :closed}
+    assert third_message == {:smol_stack, :effects, :egress, [first, second]}
+    assert_received {:"$smol_socket", {1, 1}, :select, ^wake}
+    assert_received {:"$smol_socket", {1, 2}, :abort, ^abort, :closed}
+    assert_received {:smol_stack, :effects, :egress, [^first, ^second]}
+  end
+
+  test "the shutdown drain delivers abort effects and drops emitted packets" do
+    configure_native_double(:default)
+    abort = make_ref()
+
+    Application.put_env(
+      :smolnet,
+      :native_shutdown_result,
+      NativeDouble.ok(
+        output: [empty_ipv6_packet()],
+        effects: [{:abort, self(), {1, 1}, abort, :closed}]
+      )
+    )
+
+    {:ok, stack} = SmolNet.start_stack(egress: {self(), :drain})
+
+    assert :ok = SmolNet.stop_stack(stack)
+    assert_received {:"$smol_socket", {1, 1}, :abort, ^abort, :closed}
+    refute_received {:smol_stack, :drain, :egress, _packets}
   end
 
   test "egress does not emit empty output envelopes" do
@@ -456,7 +512,7 @@ defmodule SmolNet.StackLinkTest do
     assert_receive {:native_stack_poll, ^stack_pid, _now}
     refute_receive {:second_ingress, _result}, 50
 
-    send(stack_pid, {:native_poll_reply, {:error, :time_overflow}})
+    send(stack_pid, {:native_poll_reply, NativeDouble.error(:time_overflow)})
 
     assert_receive {:second_ingress, {:error, :closed}}
 
@@ -841,6 +897,24 @@ defmodule SmolNet.StackLinkTest do
     assert SmolNet.start_stack(unknown: true) == {:error, :invalid_options}
   end
 
+  test "the backend option names the engine, which stack_info reports" do
+    assert SmolNet.start_stack(backend: :unknown) == {:error, :invalid_backend}
+
+    assert SmolNet.start_stack(backend: SmolNet.Stack.Backend.Native) ==
+             {:error, :invalid_backend}
+
+    {:ok, stack} = SmolNet.start_stack(backend: :native)
+    assert {:ok, %{backend: :native}} = SmolNet.stack_info(stack)
+    assert {SmolNet.Stack.Backend.Native, _resource} = SmolNet.Stack.backend_state(stack.stack)
+  end
+
+  test "a stack started without the backend option uses the configured default" do
+    configure_native_double(:default)
+
+    {:ok, stack} = SmolNet.start_stack()
+    assert {:ok, %{backend: NativeDouble}} = SmolNet.stack_info(stack)
+  end
+
   # Ingresses `input` with the wall-clock deadline lifted from the native call
   # that processes it, for a test that counts native calls: a preempted
   # runner could otherwise yield before the call's work is done and leave the
@@ -850,40 +924,30 @@ defmodule SmolNet.StackLinkTest do
   # `handle_continue/2`, so the next call to the stack waits for it.
   defp ingress_without_deadline(stack, input) do
     %{stack: stack_pid} = Ref.pids(stack)
-    %{native: native} = :sys.get_state(stack_pid)
+    {SmolNet.Stack.Backend.Native, native} = SmolNet.Stack.backend_state(stack_pid)
     without_deadline(native)
     result = SmolNet.ingress(stack, input)
-    _state = :sys.get_state(stack_pid)
+    _backend = SmolNet.Stack.backend_state(stack_pid)
     result
   end
 
   defp configure_native_double(ingress_result, options \\ []) do
-    Application.put_env(:smolnet, :native_module, NativeDouble)
+    Application.put_env(:smolnet, :backend, NativeDouble)
     Application.put_env(:smolnet, :native_test_process, self())
     Application.put_env(:smolnet, :native_ingress_result, ingress_result)
 
     Application.put_env(
       :smolnet,
       :native_test_result,
-      {:ok,
-       %{
-         result: make_ref(),
-         output: Keyword.get(options, :output, []),
-         poll_at: Keyword.get(options, :poll_at),
-         more: false
-       }}
+      NativeDouble.ok(
+        result: make_ref(),
+        output: Keyword.get(options, :output, []),
+        poll_at: Keyword.get(options, :poll_at)
+      )
     )
   end
 
-  defp empty_effects(options \\ []) do
-    {:ok,
-     %{
-       result: :ok,
-       output: Keyword.get(options, :output, []),
-       poll_at: Keyword.get(options, :poll_at),
-       more: Keyword.get(options, :more, false)
-     }}
-  end
+  defp empty_effects(options \\ []), do: NativeDouble.ok(options)
 
   defp manual_timers(clock), do: Agent.get(clock, &Map.keys(&1.timers))
 

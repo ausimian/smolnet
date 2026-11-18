@@ -10,13 +10,13 @@ defmodule SmolNet.StackSupervisorTest do
   import SmolNet.Test.Monitoring, only: [monitor_in_place: 1]
 
   setup do
-    previous_native = Application.get_env(:smolnet, :native_module)
+    previous_backend = Application.get_env(:smolnet, :backend)
     previous_process = Application.get_env(:smolnet, :native_test_process)
     previous_result = Application.get_env(:smolnet, :native_test_result)
     previous_shutdown_result = Application.get_env(:smolnet, :native_shutdown_result)
 
     on_exit(fn ->
-      restore_env(:native_module, previous_native)
+      restore_env(:backend, previous_backend)
       restore_env(:native_test_process, previous_process)
       restore_env(:native_test_result, previous_result)
       restore_env(:native_shutdown_result, previous_shutdown_result)
@@ -95,7 +95,7 @@ defmodule SmolNet.StackSupervisorTest do
   end
 
   test "shutdown errors still terminate the complete bundle" do
-    configure_native_double({:ok, empty_envelope(make_ref())})
+    configure_native_double(NativeDouble.ok(result: make_ref()))
     {:ok, ref} = SmolNet.start_stack()
     pids = Ref.pids(ref)
     monitors = monitor_all(pids)
@@ -104,7 +104,7 @@ defmodule SmolNet.StackSupervisorTest do
     Application.put_env(
       :smolnet,
       :native_shutdown_result,
-      {:counted, shutdown_calls, {:error, :native_panic}}
+      {:counted, shutdown_calls, NativeDouble.error(:native_panic)}
     )
 
     assert :ok = SmolNet.stop_stack(ref)
@@ -113,7 +113,7 @@ defmodule SmolNet.StackSupervisorTest do
   end
 
   test "termination retries one transient shutdown lock collision" do
-    configure_native_double({:ok, empty_envelope(make_ref())})
+    configure_native_double(NativeDouble.ok(result: make_ref()))
     {:ok, ref} = SmolNet.start_stack()
     pids = Ref.pids(ref)
     monitors = monitor_all(pids)
@@ -122,8 +122,8 @@ defmodule SmolNet.StackSupervisorTest do
     Application.put_env(
       :smolnet,
       :native_shutdown_result,
-      {:fail_once, shutdown_calls, {:error, :ownership_invariant_violation},
-       {:ok, empty_envelope(:ok)}}
+      {:fail_once, shutdown_calls, NativeDouble.error(:ownership_invariant_violation),
+       NativeDouble.ok()}
     )
 
     assert :ok = SmolNet.stop_stack(ref)
@@ -146,11 +146,11 @@ defmodule SmolNet.StackSupervisorTest do
   end
 
   test "all init callbacks are cheap and native allocation starts in handle_continue" do
-    configure_native_double({:error, :not_called_during_init})
+    configure_native_double(NativeDouble.error(:not_called_during_init))
     ready_ref = make_ref()
     options = [starter: self(), ready_ref: ready_ref, limits: Stack.default_limits()]
 
-    assert {:ok, state, {:continue, :create_native_stack}} = Stack.init(options)
+    assert {:ok, state, {:continue, :create_backend}} = Stack.init(options)
     refute_received {:native_stack_new, _pid}
 
     assert {:ok, {_flags, children}} = StackSupervisor.init(options)
@@ -158,14 +158,14 @@ defmodule SmolNet.StackSupervisorTest do
     refute_received {:native_stack_new, _pid}
 
     assert {:noreply, _state} =
-             Stack.handle_continue(:create_native_stack, state)
+             Stack.handle_continue(:create_backend, state)
 
     assert_receive {:native_stack_new, _pid}
     assert_receive {:smolnet_stack_error, ^ready_ref, :not_called_during_init}
   end
 
   test "failed handle_continue initialization leaves no child behind" do
-    configure_native_double({:error, :allocation_failed})
+    configure_native_double(NativeDouble.error(:allocation_failed))
 
     assert SmolNet.start_stack() == {:error, :allocation_failed}
     assert_eventually(fn -> DynamicSupervisor.which_children(SmolNet.Supervisor) == [] end)
@@ -187,19 +187,15 @@ defmodule SmolNet.StackSupervisorTest do
     Process.exit(caller, :kill)
     assert_receive {:DOWN, ^caller_monitor, :process, ^caller, :killed}
 
-    send(stack, {:native_test_reply, {:ok, empty_envelope(make_ref())}})
+    send(stack, {:native_test_reply, NativeDouble.ok(result: make_ref())})
 
     assert_eventually(fn -> DynamicSupervisor.which_children(SmolNet.Supervisor) == [] end)
   end
 
   defp configure_native_double(result) do
-    Application.put_env(:smolnet, :native_module, NativeDouble)
+    Application.put_env(:smolnet, :backend, NativeDouble)
     Application.put_env(:smolnet, :native_test_process, self())
     Application.put_env(:smolnet, :native_test_result, result)
-  end
-
-  defp empty_envelope(resource) do
-    %{result: resource, output: [], poll_at: nil, more: false}
   end
 
   defp start_adapter(ref, stack) do

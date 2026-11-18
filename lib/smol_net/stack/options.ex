@@ -2,6 +2,7 @@ defmodule SmolNet.Stack.Options do
   @moduledoc false
 
   alias SmolNet.Stack
+  alias SmolNet.Stack.Backend
 
   @default_mtu 1_500
   @max_limits %{
@@ -30,6 +31,7 @@ defmodule SmolNet.Stack.Options do
     :routes,
     :limits,
     :link_down,
+    :backend,
     :test_tcp_timers
   ]
 
@@ -43,10 +45,12 @@ defmodule SmolNet.Stack.Options do
          {:ok, routes} <- routes(Keyword.get(options, :routes, [])),
          {:ok, limits} <- limits(Keyword.get(options, :limits, %{}), mtu),
          {:ok, link_down} <- link_down(Keyword.get(options, :link_down, :stop)),
+         {:ok, backend} <- backend(Keyword.fetch(options, :backend)),
          {:ok, tcp_timers} <- tcp_timers(Keyword.get(options, :test_tcp_timers)) do
       {:ok,
        %{
          egress: egress,
+         backend: backend,
          link_down: link_down,
          limits: limits,
          native_config: %{
@@ -202,6 +206,19 @@ defmodule SmolNet.Stack.Options do
   defp link_down(:mark_down), do: {:ok, :mark_down}
   defp link_down({:notify, pid}) when is_pid(pid), do: {:ok, {:notify, pid}}
   defp link_down(_policy), do: {:error, :invalid_link_down_policy}
+
+  # Absent, the backend is the application environment's default (see
+  # SmolNet.Stack.Backend.default/0). Given, it must be a backend's name: a
+  # module is accepted only through the environment, for test doubles.
+  defp backend(:error), do: {:ok, Backend.default()}
+
+  defp backend({:ok, name}) do
+    if name in Backend.names() do
+      Backend.resolve(name)
+    else
+      {:error, :invalid_backend}
+    end
+  end
 
   defp tcp_timers(nil), do: {:ok, nil}
 

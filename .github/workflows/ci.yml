@@ -10,13 +10,22 @@ permissions:
 
 jobs:
   compatibility:
-    name: ${{ matrix.os }} / Elixir ${{ matrix.elixir }} / OTP ${{ matrix.otp }}
-    runs-on: ${{ matrix.os }}
+    # The native backend's jobs keep their names, which main's branch
+    # protection requires; another backend's carry it as a suffix.
+    name: >-
+      ${{ matrix.toolchain.os }} / Elixir ${{ matrix.toolchain.elixir }} /
+      OTP ${{ matrix.toolchain.otp }}${{ matrix.backend != 'native'
+      && format(' / {0} backend', matrix.backend) || '' }}
+    runs-on: ${{ matrix.toolchain.os }}
     timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
-        include:
+        # The suite runs once per protocol backend (SmolNet.Stack.Backend);
+        # tests of the NIF itself are tagged :nif or :debug_nif and run only
+        # on `native`. See test/test_helper.exs.
+        backend: [native]
+        toolchain:
           - {os: ubuntu-24.04, elixir: "1.20", otp: "29"}
           - {os: ubuntu-24.04, elixir: "1.20", otp: "28"}
           - {os: ubuntu-24.04, elixir: "1.20", otp: "27"}
@@ -36,8 +45,8 @@ jobs:
       - uses: erlef/setup-beam@54075bcc5e249e4758d363f27d099f55d843f124 # v1
         id: beam
         with:
-          elixir-version: ${{ matrix.elixir }}
-          otp-version: ${{ matrix.otp }}
+          elixir-version: ${{ matrix.toolchain.elixir }}
+          otp-version: ${{ matrix.toolchain.otp }}
 
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
         with:
@@ -54,7 +63,7 @@ jobs:
         with:
           path: deps
           key: >-
-            mix-${{ runner.os }}-${{ matrix.elixir }}-${{ matrix.otp }}-
+            mix-${{ runner.os }}-${{ matrix.toolchain.elixir }}-${{ matrix.toolchain.otp }}-
             ${{ hashFiles('mix.lock', 'native/Cargo.lock') }}
 
       # Compiled Hex dependencies only. Mix builds every dependency with
@@ -90,6 +99,7 @@ jobs:
       - run: mix test --warnings-as-errors
         env:
           SMOLNET_TEST_TIMEOUT_SCALE: "5"
+          SMOLNET_TEST_BACKEND: ${{ matrix.backend }}
 
   quality:
     name: precommit / coverage / package
