@@ -21,4 +21,7 @@
   RACK-TLP, D-SACK and CUBIC. It does not yet act on
   ICMP errors that report a path MTU, nor hold one call's egress to the
   `:output_packets` and `:bytes_copied` limits, and starting it with
-  `:egress_credit` returns `{:error, :not_implemented}`.
+  `:egress_credit` returns `{:error, :not_implemented}`. A stack on the
+  Elixir backend starts its process with a larger heap and binary virtual
+  heap (256 KiB and 8 MiB), so that the binaries its socket buffers hold do
+  not force a garbage collection every few segments.

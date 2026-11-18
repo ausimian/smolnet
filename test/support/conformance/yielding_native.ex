@@ -12,8 +12,9 @@ defmodule SmolNet.Conformance.YieldingNative do
   defdelegate stack_new(limits, config, now), to: Backend
   defdelegate stack_poll(resource, now), to: Backend
 
+  # The NIF asks for no process flags.
   for {name, arity} <- Behaviour.behaviour_info(:callbacks),
-      name not in [:stack_new, :stack_poll] do
+      name not in [:stack_new, :stack_poll, :process_flags] do
     [resource | _rest] = args = Macro.generate_arguments(arity, __MODULE__)
 
     def unquote(name)(unquote_splicing(args)) do

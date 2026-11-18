@@ -124,6 +124,11 @@ defmodule SmolNet.Stack.Backend do
   @callback udp_peername(state(), identity()) :: outcome()
   @callback udp_close(state(), identity(), now()) :: outcome()
 
+  # Process flags for the Stack process that runs the backend, set once
+  # before the backend's state is created: garbage collection settings for
+  # a backend whose state lives on the process heap.
+  @callback process_flags() :: [{:min_heap_size | :min_bin_vheap_size, non_neg_integer()}]
+
   # The NIF's debug hooks, which exist only in a debug build of the NIF and
   # go with it. The first two reply with the NIF's raw result.
   @callback test_contention(state()) :: {term(), state(), [effect()]}
@@ -134,7 +139,8 @@ defmodule SmolNet.Stack.Backend do
   @callback test_socket_close(state(), identity(), wake_direction :: nil | :read | :write) ::
               outcome()
 
-  @optional_callbacks test_contention: 1,
+  @optional_callbacks process_flags: 0,
+                      test_contention: 1,
                       test_bounded_work: 2,
                       test_socket_open: 2,
                       test_socket_wait: 3,

@@ -418,6 +418,8 @@ defmodule SmolNet.Stack do
     egress = Keyword.get(options, :egress)
 
     {egress_pid, link_ref, link_monitor, link_status} = egress_state(egress)
+    backend = Keyword.get_lazy(options, :backend, &Backend.default/0)
+    set_process_flags(backend)
 
     state = %{
       starter: starter,
@@ -425,7 +427,7 @@ defmodule SmolNet.Stack do
       ready_ref: Keyword.fetch!(options, :ready_ref),
       limits: Keyword.fetch!(options, :limits),
       native_config: Keyword.get(options, :native_config, Options.default_native_config()),
-      backend: Keyword.get_lazy(options, :backend, &Backend.default/0),
+      backend: backend,
       backend_state: nil,
       backend_ready: false,
       clock: Application.get_env(:smolnet, :clock_module, SystemClock),
@@ -450,6 +452,14 @@ defmodule SmolNet.Stack do
     }
 
     {:ok, state, {:continue, :create_backend}}
+  end
+
+  defp set_process_flags(backend) do
+    if Code.ensure_loaded?(backend) and function_exported?(backend, :process_flags, 0) do
+      for {flag, value} <- backend.process_flags(), do: Process.flag(flag, value)
+    end
+
+    :ok
   end
 
   @impl true
