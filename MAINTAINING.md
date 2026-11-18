@@ -181,6 +181,14 @@ to regenerate it:
   `SmolNet.Conformance.TcpReplay`. `mix precommit` fails when they are
   stale, so a change to the vendored TCP code or its tests is committed with
   regenerated vectors.
+- `traces/`: what the NIF backend did, call for call, in a set of
+  scenarios, from `MIX_ENV=test mix run scripts/backend_traces.exs`, and
+  replayed on another backend by `SmolNet.Conformance.Trace`. The test suite
+  replays them on its backend, so a change to the NIF's behaviour is
+  committed with re-recorded traces.
+- `SmolNet.Conformance.LinkSim`, two backends over a simulated lossy,
+  reordering and duplicating link in virtual time, and StreamData properties
+  in place of the NIF's fuzz targets.
 
 ## Fixed TCP timers, and the test-only override
 
