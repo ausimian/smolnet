@@ -399,8 +399,6 @@ defmodule SmolNet.UdpTest do
     assert :ok = :gen_udp.close(client)
   end
 
-  # Needs TCP, which the Elixir backend gains in phase 5 of #173.
-  @tag :elixir_phase_5
   test "TCP and UDP coexist on one IPv6 stack without readiness cross-talk" do
     {server_stack, client_stack, _link} = stacks()
     port = 42_005
@@ -435,8 +433,6 @@ defmodule SmolNet.UdpTest do
     assert :ok = SmolNet.close(listener)
   end
 
-  # Needs TCP, which the Elixir backend gains in phase 5 of #173.
-  @tag :elixir_phase_5
   test "non-driving UDP connect preserves a pending TCP timer" do
     {server_stack, client_stack, link} = stacks()
     :ok = RawIpLink.fault(link, :drop)
@@ -496,8 +492,6 @@ defmodule SmolNet.UdpTest do
     assert :ok = :gen_udp.close(socket)
   end
 
-  # Needs TCP, which the Elixir backend gains in phase 5 of #173.
-  @tag :elixir_phase_5
   test "datagram calls on a TCP socket are explicit errors" do
     {server_stack, _client_stack, _link} = stacks()
     {:ok, tcp} = SmolNet.open(:inet6, :stream, :tcp, stack: server_stack)

@@ -68,7 +68,8 @@ defmodule SmolNet.Core.Tcp.Connection do
             rx_buffer: %RecvBuffer{},
             rx_fin_received: false,
             tx_buffer: %SendBuffer{},
-            liveness: %{keep_alive_probes: 0, timeout_abort: false},
+            liveness: %{remote_last_ts: nil, keep_alive_probes: 0, timeout_abort: false},
+            wakes: 0,
             listen_endpoint: {nil, 0},
             tuple: nil,
             local_seq_no: 0,
@@ -82,7 +83,6 @@ defmodule SmolNet.Core.Tcp.Connection do
             remote_has_sack: false,
             remote_mss: @default_mss,
             path_mtu: nil,
-            remote_last_ts: nil,
             local_rx_last_seq: nil,
             recovery: %{
               pending_fast_retransmit: false,
@@ -114,7 +114,7 @@ defmodule SmolNet.Core.Tcp.Connection do
           required(:now) => integer(),
           optional(:ip_mtu) => pos_integer(),
           optional(:addresses) => [binary()],
-          optional(:isn) => Seq.t(),
+          optional(:isn) => Seq.t() | nil,
           optional(:source_address) => (binary() -> binary() | nil) | nil
         }
 
@@ -185,7 +185,7 @@ defmodule SmolNet.Core.Tcp.Connection do
   is due `idle` after the last packet received.
   """
   def set_keep_alive_config(c, keep_alive) do
-    last = c.remote_last_ts || 0
+    last = c.liveness.remote_last_ts || 0
     c = c |> option(:keep_alive, keep_alive) |> liveness(:keep_alive_probes, 0)
     arm_keep_alive(c, keep_alive && last + keep_alive.idle)
   end
@@ -248,9 +248,30 @@ defmodule SmolNet.Core.Tcp.Connection do
   defp recovery(c, key, value), do: %{c | recovery: Map.replace!(c.recovery, key, value)}
   defp liveness(c, key, value), do: %{c | liveness: Map.replace!(c.liveness, key, value)}
 
+  # smoltcp wakes both of a socket's wakers on every state change, made or
+  # not, the receiver when data arrives in order and the sender when data
+  # is acknowledged or a RST is sent. The stack reads these to wake
+  # waiters (`take_wakes/1`).
+  @wake_rx 1
+  @wake_tx 2
+  @wake_both 3
+
+  defp wake(c, mask), do: %{c | wakes: bor(c.wakes, mask)}
+  defp set_state(c, state), do: wake(%{c | state: state}, @wake_both)
+
+  @doc """
+  The wakes since the last call, `{receive?, send?}`, and the connection
+  without them.
+  """
+  @spec take_wakes(t()) :: {{boolean(), boolean()}, t()}
+  def take_wakes(c),
+    do: {{band(c.wakes, @wake_rx) != 0, band(c.wakes, @wake_tx) != 0}, %{c | wakes: 0}}
+
   ## Lifecycle
 
   defp reset(c) do
+    c = wake(c, @wake_both)
+
     %{
       c
       | state: :closed,
@@ -272,8 +293,7 @@ defmodule SmolNet.Core.Tcp.Connection do
         remote_win_shift: win_shift(RecvBuffer.capacity(c.rx_buffer)),
         remote_mss: @default_mss,
         path_mtu: nil,
-        remote_last_ts: nil,
-        liveness: %{keep_alive_probes: 0, timeout_abort: false},
+        liveness: %{remote_last_ts: nil, keep_alive_probes: 0, timeout_abort: false},
         recovery: %{c.recovery | recover: nil, scoreboard: [], recovery_rxt_end: nil},
         rack: Rack.new(),
         nagle_small_segment_end: nil,
@@ -291,7 +311,7 @@ defmodule SmolNet.Core.Tcp.Connection do
     cond do
       open?(c) and c.state == :listen and c.listen_endpoint == endpoint -> {:ok, c}
       open?(c) -> {:error, :invalid_state}
-      true -> {:ok, %{reset(c) | listen_endpoint: endpoint, tuple: nil, state: :listen}}
+      true -> {:ok, set_state(%{reset(c) | listen_endpoint: endpoint, tuple: nil}, :listen)}
     end
   end
 
@@ -307,11 +327,11 @@ defmodule SmolNet.Core.Tcp.Connection do
          true <- local_port != 0 || {:error, :unaddressable},
          {:ok, local_addr} <- local_address(cx, local_addr, remote_addr),
          true <- byte_size(local_addr) == byte_size(remote_addr) || {:error, :unaddressable} do
-      c = %{
-        reset(c)
-        | tuple: %{local: {local_addr, local_port}, remote: remote},
-          state: :syn_sent
-      }
+      c =
+        set_state(
+          %{reset(c) | tuple: %{local: {local_addr, local_port}, remote: remote}},
+          :syn_sent
+        )
 
       {:ok, %{c | local_seq_no: cx.isn, remote_last_seq: cx.isn}}
     end
@@ -336,13 +356,13 @@ defmodule SmolNet.Core.Tcp.Connection do
   @doc "Closes the sending half; a connection that never opened closes at once."
   @spec close(t()) :: t()
   def close(%__MODULE__{state: state} = c) when state in [:listen, :syn_sent],
-    do: %{c | state: :closed}
+    do: set_state(c, :closed)
 
   def close(%__MODULE__{state: state} = c) when state in [:syn_received, :established],
-    do: %{restart_timeout_if_idle(c) | state: :fin_wait_1}
+    do: c |> restart_timeout_if_idle() |> set_state(:fin_wait_1)
 
   def close(%__MODULE__{state: :close_wait} = c),
-    do: %{restart_timeout_if_idle(c) | state: :last_ack}
+    do: c |> restart_timeout_if_idle() |> set_state(:last_ack)
 
   def close(c), do: c
 
@@ -350,13 +370,13 @@ defmodule SmolNet.Core.Tcp.Connection do
   # sent, not from the last packet received.
   defp restart_timeout_if_idle(c) do
     if SendBuffer.empty?(c.tx_buffer),
-      do: liveness(%{c | remote_last_ts: nil}, :keep_alive_probes, 0),
+      do: c |> liveness(:remote_last_ts, nil) |> liveness(:keep_alive_probes, 0),
       else: c
   end
 
   @doc "Aborts: the connection is closed and sends one RST, if it has a peer."
   @spec abort(t()) :: t()
-  def abort(c), do: %{c | state: :closed}
+  def abort(c), do: set_state(c, :closed)
 
   @doc "Forgets the connection at once, sending nothing."
   @spec forget(t()) :: t()
@@ -398,7 +418,9 @@ defmodule SmolNet.Core.Tcp.Connection do
     # A connection idle for long must not count its timeout from the last
     # packet received.
     c =
-      if old_length == 0, do: liveness(%{c | remote_last_ts: nil}, :keep_alive_probes, 0), else: c
+      if old_length == 0,
+        do: c |> liveness(:remote_last_ts, nil) |> liveness(:keep_alive_probes, 0),
+        else: c
 
     # With no time at hand smoltcp arms the probe timer at zero, so the
     # first probe goes out at once.
@@ -1053,10 +1075,10 @@ defmodule SmolNet.Core.Tcp.Connection do
          _acked
        )
        when port != 0,
-       do: {:reject, nil, %{c | tuple: nil, state: :listen}}
+       do: {:reject, nil, set_state(%{c | tuple: nil}, :listen)}
 
   defp transition(_state, :rst, c, _cx, _seg, _acked),
-    do: {:reject, nil, %{c | state: :closed, tuple: nil}}
+    do: {:reject, nil, set_state(%{c | tuple: nil}, :closed)}
 
   defp transition(:listen, :syn, c, cx, seg, _acked) do
     repr = seg.repr
@@ -1074,11 +1096,11 @@ defmodule SmolNet.Core.Tcp.Connection do
     }
 
     c = take_peer_options(c, repr)
-    {:ok, set_for_idle(%{c | state: :syn_received}, cx.now)}
+    {:ok, set_for_idle(set_state(c, :syn_received), cx.now)}
   end
 
   defp transition(:syn_received, :none, c, _cx, _seg, _acked),
-    do: {:ok, %{c | state: :established}}
+    do: {:ok, set_state(c, :established)}
 
   defp transition(:syn_received, :fin, c, _cx, _seg, _acked),
     do: {:ok, fin_received(c, :close_wait)}
@@ -1101,7 +1123,7 @@ defmodule SmolNet.Core.Tcp.Connection do
 
     # A SYN-ACK establishes; a bare SYN is a simultaneous open.
     state = if Tcp.tcp(repr, :ack) != nil, do: :established, else: :syn_received
-    {:ok, %{c | state: state}}
+    {:ok, set_state(c, state)}
   end
 
   defp transition(:established, :none, c, _cx, _seg, _acked), do: {:ok, c}
@@ -1110,7 +1132,7 @@ defmodule SmolNet.Core.Tcp.Connection do
     do: {:ok, fin_received(c, :close_wait)}
 
   defp transition(:fin_wait_1, :none, c, _cx, _seg, {_len, of_fin, _all}),
-    do: {:ok, if(of_fin, do: %{c | state: :fin_wait_2}, else: c)}
+    do: {:ok, if(of_fin, do: set_state(c, :fin_wait_2), else: c)}
 
   defp transition(:fin_wait_1, :fin, c, cx, _seg, {_len, true, _all}),
     do: {:ok, set_for_close(fin_received(c, :time_wait), cx.now)}
@@ -1122,14 +1144,14 @@ defmodule SmolNet.Core.Tcp.Connection do
     do: {:ok, set_for_close(fin_received(c, :time_wait), cx.now)}
 
   defp transition(:closing, :none, c, cx, _seg, {_len, true, _all}),
-    do: {:ok, set_for_close(%{c | state: :time_wait}, cx.now)}
+    do: {:ok, set_for_close(set_state(c, :time_wait), cx.now)}
 
   defp transition(:closing, :none, c, _cx, _seg, _acked), do: {:ok, c}
   defp transition(:close_wait, :none, c, _cx, _seg, _acked), do: {:ok, c}
 
   # Forgets the peer once the FIN is acknowledged, or a RST would go to it.
   defp transition(:last_ack, :none, c, _cx, _seg, {_len, true, _all}),
-    do: {:ok, %{c | state: :closed, tuple: nil}}
+    do: {:ok, set_state(%{c | tuple: nil}, :closed)}
 
   # A duplicate ACK: our FIN is not acknowledged (RFC 9293 3.10.7.4).
   defp transition(:last_ack, :none, c, cx, seg, {0, false, _all}) do
@@ -1141,7 +1163,7 @@ defmodule SmolNet.Core.Tcp.Connection do
   defp transition(_state, _control, c, _cx, _seg, _acked), do: {:reject, nil, c}
 
   defp fin_received(c, state),
-    do: %{c | remote_seq_no: Seq.add(c.remote_seq_no, 1), rx_fin_received: true, state: state}
+    do: set_state(%{c | remote_seq_no: Seq.add(c.remote_seq_no, 1), rx_fin_received: true}, state)
 
   # A zero MSS is as no MSS, as Linux takes it; a tiny one is raised.
   defp take_mss(c, repr) do
@@ -1165,7 +1187,7 @@ defmodule SmolNet.Core.Tcp.Connection do
     now = cx.now
 
     # Any packet answers the keep-alive probes.
-    c = liveness(%{c | remote_last_ts: now}, :keep_alive_probes, 0)
+    c = c |> liveness(:remote_last_ts, now) |> liveness(:keep_alive_probes, 0)
 
     # RFC 7323: the window of every segment but a SYN is scaled.
     scale = if Tcp.tcp(repr, :control) == :syn, do: 0, else: c.remote_win_scale || 0
@@ -1173,7 +1195,11 @@ defmodule SmolNet.Core.Tcp.Connection do
     is_window_update = new_remote_win_len != c.remote_win_len
     c = %{c | remote_win_len: new_remote_win_len}
     c = cc(c, &Cubic.set_remote_window(&1, new_remote_win_len))
-    c = if ack_len > 0, do: %{c | tx_buffer: SendBuffer.dequeue(c.tx_buffer, ack_len)}, else: c
+
+    c =
+      if ack_len > 0,
+        do: wake(%{c | tx_buffer: SendBuffer.dequeue(c.tx_buffer, ack_len)}, @wake_tx),
+        else: c
 
     {c, rack_lost} =
       case Tcp.tcp(repr, :ack) do
@@ -1355,6 +1381,7 @@ defmodule SmolNet.Core.Tcp.Connection do
       {:ok, contig_len, assembler} ->
         {_written, rx_buffer} = RecvBuffer.write(c.rx_buffer, offset, payload)
         c = %{c | assembler: assembler, rx_buffer: RecvBuffer.enqueue(rx_buffer, contig_len)}
+        c = if contig_len != 0, do: wake(c, @wake_rx), else: c
         c = delay_ack(c, cx)
 
         # RFC 5681: out-of-order data, or data filling a hole, is ACKed at
@@ -1395,7 +1422,7 @@ defmodule SmolNet.Core.Tcp.Connection do
   ## Timers and egress
 
   defp timed_out?(c, now) do
-    case {c.remote_last_ts, c.options.timeout} do
+    case {c.liveness.remote_last_ts, c.options.timeout} do
       {last, timeout} when last != nil and timeout != nil ->
         awaits_remote?(c) and now >= last + timeout
 
@@ -1538,14 +1565,14 @@ defmodule SmolNet.Core.Tcp.Connection do
 
   defp expire_timers(c, now) do
     # Quiet until now: the timeout counts from the first segment sent.
-    c = if c.remote_last_ts == nil, do: %{c | remote_last_ts: now}, else: c
+    c = if c.liveness.remote_last_ts == nil, do: liveness(c, :remote_last_ts, now), else: c
 
     # An expired retransmission timer supersedes RACK's timers.
     c = if Timer.should_retransmit?(c.timer, now), do: c, else: poll_rack_timers(c, now)
 
     cond do
       timed_out?(c, now) or keep_alive_exhausted?(c, now) ->
-        %{liveness(c, :timeout_abort, true) | state: :closed}
+        c |> liveness(:timeout_abort, true) |> set_state(:closed)
 
       Timer.should_retransmit?(c.timer, now) ->
         retransmit(c, now)
@@ -1853,7 +1880,7 @@ defmodule SmolNet.Core.Tcp.Connection do
     c = probe_timers(c, now, flags, segment_len)
 
     # An aborted connection forgets its peer once its RST is out.
-    if c.state == :closed, do: %{c | tuple: nil}, else: c
+    if c.state == :closed, do: wake(%{c | tuple: nil}, @wake_tx), else: c
   end
 
   defp small_segment_end(%__MODULE__{nagle_small_segment_end: nil}, seg_end), do: seg_end
@@ -1895,7 +1922,7 @@ defmodule SmolNet.Core.Tcp.Connection do
   def poll_at(%__MODULE__{tuple: nil}, _cx), do: :ingress
 
   # Quiet until now, or aborted with a RST to send.
-  def poll_at(%__MODULE__{remote_last_ts: nil}, _cx), do: :now
+  def poll_at(%__MODULE__{liveness: %{remote_last_ts: nil}}, _cx), do: :now
   def poll_at(%__MODULE__{state: :closed}, _cx), do: :now
 
   def poll_at(c, cx) do
@@ -1916,7 +1943,9 @@ defmodule SmolNet.Core.Tcp.Connection do
     end
   end
 
-  defp timeout_at(%__MODULE__{remote_last_ts: last, options: %{timeout: timeout}} = c)
+  defp timeout_at(
+         %__MODULE__{liveness: %{remote_last_ts: last}, options: %{timeout: timeout}} = c
+       )
        when last != nil and timeout != nil,
        do: if(awaits_remote?(c), do: {:time, last + timeout}, else: :ingress)
 

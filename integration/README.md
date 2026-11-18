@@ -17,6 +17,9 @@ sudo mix run integration/idle.exs --duration 1h --idle-max 30m
 sudo integration/teardown.sh
 ```
 
+`--backend elixir` runs any of them on the pure-Elixir engine instead of
+the NIF; until it has egress credit it needs `--egress-credit infinity`.
+
 The path MTU scenario, `pmtu.exs`, builds a routed path of its own, with
 a hop whose MTU is below SmolNet's, so it runs in a network namespace of
 its own, with its own device, which `pmtu-topology.sh isolate` creates.

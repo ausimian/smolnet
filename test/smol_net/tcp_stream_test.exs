@@ -1,9 +1,6 @@
 defmodule SmolNet.TcpStreamTest do
   use ExUnit.Case, async: false
 
-  # Needs TCP sockets, which the Elixir backend gains in phase 5 of #173.
-  @moduletag :elixir_phase_5
-
   alias SmolNet.Native
   alias SmolNet.Socket
   alias SmolNet.Stack
@@ -499,6 +496,8 @@ defmodule SmolNet.TcpStreamTest do
     assert :ok = SmolNet.cancel(busy_socket, busy_select)
   end
 
+  # Egress credit comes in phase 7 of #173 on the Elixir backend.
+  @tag :elixir_phase_7
   test "a close deadline that expires without egress credit does not spin the stack" do
     {:ok, clock} = ManualClock.start()
     Application.put_env(:smolnet, :clock_module, ManualClock)

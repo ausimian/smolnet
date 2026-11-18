@@ -1,9 +1,6 @@
 defmodule SmolNet.TcpListenerTest do
   use ExUnit.Case, async: false
 
-  # Needs TCP sockets, which the Elixir backend gains in phase 5 of #173.
-  @moduletag :elixir_phase_5
-
   alias SmolNet.Socket
   alias SmolNet.Stack
   alias SmolNet.Test.IPv6Link
@@ -196,17 +193,19 @@ defmodule SmolNet.TcpListenerTest do
     assert_receive {:test_link_egress, :server, _held_syn_ack}, 1_000
     assert {:error, :timeout} = Task.await(first_connect)
     assert :ok = SmolNet.stop_stack(first_client_stack)
+    {:ok, before} = SmolNet.stack_info(server_stack)
 
     :ok = ManualClock.advance(clock, 30_001)
 
-    # Only the NIF reports the expiry, as a refilled pool slot. No kept key
-    # shows it, so on another backend this waits for nothing.
+    # The handshake gives up with a RST, which the held link keeps, and its
+    # slot is free again; the NIF also shows it as a refilled pool slot.
     assert_eventually(fn ->
       {:ok, info} = SmolNet.stack_info(server_stack)
 
-      Snapshot.nif(info, fn native ->
-        native.listener_pool_socket_count == 1 and native.counters.listener_refills >= 1
-      end)
+      info.native.result.counters.emitted_packets > before.native.result.counters.emitted_packets and
+        Snapshot.nif(info, fn native ->
+          native.listener_pool_socket_count == 1 and native.counters.listener_refills >= 1
+        end)
     end)
 
     :ok = IPv6Link.release(server_link)
@@ -332,6 +331,22 @@ defmodule SmolNet.TcpListenerTest do
 
     assert :ok = SmolNet.send(client, "overflow", 1_000)
     assert {:error, :connection_reset} = SmolNet.recv(client, 0, 1_000)
+  end
+
+  test "a closing child keeps its slot against every protocol" do
+    {server_stack, client_stack} = linked_stacks(limits: %{sockets: 2})
+    listener = listener(server_stack, 1, 40_022)
+    _client = connect(client_stack, 40_022)
+    assert {:ok, child} = SmolNet.accept(listener, 1_000)
+
+    # The client never closes, so the child's close waits on its FIN.
+    assert :ok = SmolNet.close(child)
+
+    assert {:ok, %{native: %{result: %{closing_tcp_socket_count: 1, socket_count: 1}}}} =
+             SmolNet.stack_info(server_stack)
+
+    assert {:error, :system_limit} = SmolNet.open(:inet6, :dgram, :udp, stack: server_stack)
+    assert {:error, :system_limit} = SmolNet.open(:inet6, :stream, :tcp, stack: server_stack)
   end
 
   test "listener validation and operation classes are explicit" do

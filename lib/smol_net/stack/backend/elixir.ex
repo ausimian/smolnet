@@ -51,37 +51,61 @@ defmodule SmolNet.Stack.Backend.Elixir do
   @impl true
   def socket_validate(core, identity), do: core |> Core.socket_validate(identity) |> outcome()
 
-  # TCP comes in a later phase of #173.
   @impl true
-  def tcp_open(core, _family, _rcvbuf, _sndbuf), do: not_implemented(core)
+  def tcp_open(core, family, rcvbuf, sndbuf),
+    do: core |> Core.tcp_open(family, rcvbuf, sndbuf) |> outcome()
+
   @impl true
-  def tcp_bind(core, _identity, _endpoint), do: not_implemented(core)
+  def tcp_bind(core, identity, endpoint),
+    do: core |> Core.tcp_bind(identity, endpoint) |> outcome()
+
   @impl true
-  def tcp_listen(core, _identity, _backlog, _now), do: not_implemented(core)
+  def tcp_listen(core, identity, backlog, now),
+    do: core |> Core.tcp_listen(identity, backlog, now) |> outcome()
+
   @impl true
-  def tcp_accept(core, _identity, _pid, _reference, _now), do: not_implemented(core)
+  def tcp_accept(core, identity, pid, reference, now),
+    do: core |> Core.tcp_accept(identity, pid, reference, now) |> outcome()
+
   @impl true
-  def tcp_connect(core, _identity, _endpoint, _pid, _reference, _now), do: not_implemented(core)
+  def tcp_connect(core, identity, endpoint, pid, reference, now),
+    do: core |> Core.tcp_connect(identity, endpoint, pid, reference, now) |> outcome()
+
   @impl true
-  def tcp_send(core, _identity, _data, _pid, _reference, _now), do: not_implemented(core)
+  def tcp_send(core, identity, data, pid, reference, now),
+    do: core |> Core.tcp_send(identity, data, pid, reference, now) |> outcome()
+
   @impl true
-  def tcp_recv(core, _identity, _length, _pid, _reference, _now), do: not_implemented(core)
+  def tcp_recv(core, identity, length, pid, reference, now),
+    do: core |> Core.tcp_recv(identity, length, pid, reference, now) |> outcome()
+
   @impl true
-  def tcp_shutdown(core, _identity, _how, _now), do: not_implemented(core)
+  def tcp_shutdown(core, identity, how, now),
+    do: core |> Core.tcp_shutdown(identity, how, now) |> outcome()
+
   @impl true
-  def tcp_sockname(core, _identity), do: not_implemented(core)
+  def tcp_sockname(core, identity), do: core |> Core.tcp_sockname(identity) |> outcome()
+
   @impl true
-  def tcp_peername(core, _identity), do: not_implemented(core)
+  def tcp_peername(core, identity), do: core |> Core.tcp_peername(identity) |> outcome()
+
   @impl true
-  def tcp_set_nodelay(core, _identity, _nodelay, _now), do: not_implemented(core)
+  def tcp_set_nodelay(core, identity, nodelay, now),
+    do: core |> Core.tcp_set_nodelay(identity, nodelay, now) |> outcome()
+
   @impl true
-  def tcp_nodelay(core, _identity), do: not_implemented(core)
+  def tcp_nodelay(core, identity), do: core |> Core.tcp_nodelay(identity) |> outcome()
+
   @impl true
-  def tcp_set_keepalive(core, _identity, _keepalive, _now), do: not_implemented(core)
+  def tcp_set_keepalive(core, identity, keepalive, now),
+    do: core |> Core.tcp_set_keepalive(identity, keepalive, now) |> outcome()
+
   @impl true
-  def tcp_keepalive(core, _identity), do: not_implemented(core)
+  def tcp_keepalive(core, identity), do: core |> Core.tcp_keepalive(identity) |> outcome()
+
   @impl true
-  def tcp_close(core, _identity, _now), do: not_implemented(core)
+  def tcp_close(core, identity, now), do: core |> Core.tcp_close(identity, now) |> outcome()
+
   @impl true
   def udp_open(core, family), do: core |> Core.udp_open(family) |> outcome()
 
@@ -109,8 +133,6 @@ defmodule SmolNet.Stack.Backend.Elixir do
 
   @impl true
   def udp_close(core, identity, now), do: core |> Core.udp_close(identity, now) |> outcome()
-
-  defp not_implemented(core), do: core |> Core.not_implemented() |> outcome()
 
   defp outcome({{:ok, result}, core, effects}), do: {{:ok, envelope(result, core)}, core, effects}
   defp outcome({{:error, _reason} = error, core, effects}), do: {error, core, effects}

@@ -279,7 +279,7 @@ defmodule SmolNet.Conformance.TcpReplay.Connection do
   @options ~w(timeout keep_alive hop_limit ack_delay nagle tsval_generator)a
   @recovery ~w(pending_fast_retransmit recover recovery_rxt_end scoreboard local_rx_dup_acks
                 local_rx_last_ack)a
-  @liveness ~w(keep_alive_probes timeout_abort)a
+  @liveness ~w(remote_last_ts keep_alive_probes timeout_abort)a
 
   # The connection keeps its options and its loss recovery state as
   # groups of fields.
@@ -518,7 +518,7 @@ defmodule SmolNet.Conformance.TcpReplay.Connection do
       "remote_has_sack" => c.remote_has_sack,
       "remote_mss" => c.remote_mss,
       "path_mtu" => c.path_mtu,
-      "remote_last_ts" => ms.(c.remote_last_ts),
+      "remote_last_ts" => ms.(c.liveness.remote_last_ts),
       "local_rx_last_seq" => c.local_rx_last_seq,
       "local_rx_last_ack" => c.recovery.local_rx_last_ack,
       "local_rx_dup_acks" => c.recovery.local_rx_dup_acks,

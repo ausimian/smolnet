@@ -34,6 +34,7 @@ defmodule SmolNet.Core.Udp do
   alias SmolNet.Core.Iface
   alias SmolNet.Core.PacketBuffer
   alias SmolNet.Core.Sockets
+  alias SmolNet.Core.Tcp
 
   @ring_packets 16
   @ring_bytes 16_384
@@ -68,7 +69,9 @@ defmodule SmolNet.Core.Udp do
   def open(core, family) do
     state = %__MODULE__{family: family, rings: [{nil, new_ring()}]}
 
-    with :ok <- rings_available(core, 1),
+    with :ok <- Tcp.logical_capacity(core),
+         :ok <- rings_available(core, 1),
+         :ok <- Tcp.buffer_capacity(core, @buffer_bytes),
          {:ok, identity, sockets} <- Sockets.open(core.sockets, :udp, state, core.limits.sockets) do
       {{:ok, identity_map(identity)}, %{core | sockets: sockets}, []}
     else
@@ -78,16 +81,17 @@ defmodule SmolNet.Core.Udp do
 
   # The NIF counts each ring, one smoltcp socket for it, against the socket
   # limit, as well as each socket.
-  defp rings_available(core, added) do
-    rings = core.sockets |> Sockets.states(:udp) |> Enum.map(&length(&1.rings)) |> Enum.sum()
-    if rings + added > core.limits.sockets, do: {:error, :system_limit}, else: :ok
-  end
+  defp rings_available(core, added), do: Tcp.native_capacity(core, added)
 
   # A wildcard bind's extra rings; a refusal returns the core, whose
   # ephemeral cursor may have moved.
   defp rings_available_for(core, addresses) do
-    case rings_available(core, length(addresses) - 1) do
-      :ok -> :ok
+    added = length(addresses) - 1
+
+    with :ok <- rings_available(core, added),
+         :ok <- Tcp.buffer_capacity(core, added * @buffer_bytes) do
+      :ok
+    else
       {:error, reason} -> {:error, reason, core}
     end
   end

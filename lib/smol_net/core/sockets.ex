@@ -194,6 +194,21 @@ defmodule SmolNet.Core.Sockets do
     end
   end
 
+  @doc "A live socket's waiter in `direction`, or nil."
+  @spec waiter(Entry.t(), direction()) :: waiter() | nil
+  def waiter(%Entry{read: read}, :read), do: read
+  def waiter(%Entry{write: write}, :write), do: write
+
+  @doc """
+  Takes a socket's waiter in `direction` away, without notifying it,
+  returning it for the caller to abort.
+  """
+  @spec take_waiter(t(), identity(), direction()) :: {waiter() | nil, t()}
+  def take_waiter(table, {id, _generation}, direction) do
+    {waiter, entry} = table.entries |> Map.fetch!(id) |> take(direction)
+    {waiter, %{table | entries: Map.put(table.entries, id, entry)}}
+  end
+
   @doc """
   Cancels a waiter by operation and reference: `:ok` if it was armed,
   `:already_sent` if it was woken, `:not_found` otherwise.
@@ -226,8 +241,6 @@ defmodule SmolNet.Core.Sockets do
   def direction(operation) when operation in [:send, :sendto, :connect], do: {:ok, :write}
   def direction(_operation), do: {:error, :invalid_operation}
 
-  defp waiter(%Entry{read: read}, :read), do: read
-  defp waiter(%Entry{write: write}, :write), do: write
   defp sent(%Entry{read_sent: sent}, :read), do: sent
   defp sent(%Entry{write_sent: sent}, :write), do: sent
   defp take(%Entry{read: read} = entry, :read), do: {read, %{entry | read: nil}}
@@ -260,13 +273,22 @@ defmodule SmolNet.Core.Sockets do
   """
   @spec allocate_port(t(), kind(), family()) ::
           {:ok, 0..0xFFFF, t()} | {:error, :ephemeral_ports_exhausted}
-  def allocate_port(table, protocol, family) do
+  def allocate_port(table, protocol, family),
+    do: allocate_port(table, protocol, family, &Map.has_key?(table.ports, {protocol, family, &1}))
+
+  @doc """
+  The same, with the protocol's own test of a port in use: TCP counts
+  ports that sockets which have left the table still hold.
+  """
+  @spec allocate_port(t(), kind(), family(), (0..0xFFFF -> boolean())) ::
+          {:ok, 0..0xFFFF, t()} | {:error, :ephemeral_ports_exhausted}
+  def allocate_port(table, protocol, _family, in_use?) do
     start = Map.fetch!(table.next_port, protocol)
     count = @ephemeral_last - @ephemeral_first + 1
 
     0..(count - 1)
     |> Enum.map(&(@ephemeral_first + rem(start - @ephemeral_first + &1, count)))
-    |> Enum.find(&(not Map.has_key?(table.ports, {protocol, family, &1})))
+    |> Enum.find(&(not in_use?.(&1)))
     |> case do
       nil ->
         {:error, :ephemeral_ports_exhausted}

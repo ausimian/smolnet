@@ -17,9 +17,6 @@ defmodule SmolNet.Conformance.IngressPropertyTest do
   @local6 <<0xFD00::16, 0::96, 1::16>>
   @peer6 <<0xFD00::16, 0::96, 9::16>>
 
-  # The listener and the UDP socket need the Elixir backend's TCP, which
-  # comes in phase 5 of #173.
-  @tag :elixir_phase_5
   property "ingress never fails on what a peer sends, and the stack still answers" do
     check all(
             packets <-

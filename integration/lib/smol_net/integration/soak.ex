@@ -365,6 +365,9 @@ defmodule SmolNet.Integration.Soak do
       quiet: Keyword.get(config, :quiet, false)
     }
 
+    # Every stack the run starts, the scenario's own included, takes the
+    # backend from the application environment unless it names one.
+    Application.put_env(:smolnet, :backend, options.backend)
     log(context, "#{options.script}: #{describe(context)}, artifacts in #{options.out_dir}")
 
     {setup, context, undo} = set_up(context, options, config)

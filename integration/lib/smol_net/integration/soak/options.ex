@@ -7,6 +7,7 @@ defmodule SmolNet.Integration.Soak.Options do
   """
 
   alias SmolNet.Integration.Soak.Netem
+  alias SmolNet.Stack.Backend
 
   @runs_dir Path.expand("../../../../runs", __DIR__)
   @max_warmup_ms :timer.minutes(10)
@@ -22,6 +23,7 @@ defmodule SmolNet.Integration.Soak.Options do
     self_check: :boolean,
     device: :string,
     egress_credit: :string,
+    backend: :string,
     out: :string,
     pcap: :boolean,
     keep_pcap: :boolean,
@@ -42,6 +44,7 @@ defmodule SmolNet.Integration.Soak.Options do
           netem: String.t() | nil,
           device: String.t(),
           egress_credit: {non_neg_integer(), non_neg_integer()} | :infinity,
+          backend: atom(),
           out_dir: Path.t(),
           pcap: boolean(),
           keep_pcap: boolean(),
@@ -116,6 +119,8 @@ defmodule SmolNet.Integration.Soak.Options do
       --self-check          run SmolNet over the helper's loopback: no device, no root
       --device NAME         the TUN device (default $SMOLNET_TUN, or tun0)
       --egress-credit C     the link's credit, PACKETS:BYTES or infinity (default 64:131072)
+      --backend B           SmolNet's protocol engine: native or elixir (default native);
+                            elixir needs --egress-credit infinity for now
       --out DIR             where artifacts go (default integration/runs/<script>-<time>)
       --no-pcap             do not capture packets on the device
       --keep-pcap           keep the capture when the run passes too
@@ -133,6 +138,7 @@ defmodule SmolNet.Integration.Soak.Options do
       family: "both",
       device: System.get_env("SMOLNET_TUN", "tun0"),
       egress_credit: "64:131072",
+      backend: "native",
       metrics_interval: "10s",
       pcap: true,
       keep_pcap: false,
@@ -152,7 +158,8 @@ defmodule SmolNet.Integration.Soak.Options do
          {:ok, families} <- families(options[:family]),
          {:ok, netem} <- netem(options[:netem], mode),
          {:ok, snaplen} <- snaplen(options[:pcap_snaplen]),
-         {:ok, credit} <- egress_credit(options[:egress_credit]) do
+         {:ok, credit} <- egress_credit(options[:egress_credit]),
+         {:ok, backend} <- backend(options[:backend]) do
       {:ok,
        %{
          script: name,
@@ -163,6 +170,7 @@ defmodule SmolNet.Integration.Soak.Options do
          netem: netem,
          device: options[:device],
          egress_credit: credit,
+         backend: backend,
          out_dir: out_dir(options[:out], name, mode),
          pcap: mode == :smolnet and options[:pcap],
          keep_pcap: options[:keep_pcap],
@@ -173,6 +181,13 @@ defmodule SmolNet.Integration.Soak.Options do
        }}
     else
       {:error, message} -> error(message, config)
+    end
+  end
+
+  defp backend(name) do
+    case Enum.find(Backend.names(), &(Atom.to_string(&1) == name)) do
+      nil -> {:error, "unknown backend #{inspect(name)}"}
+      backend -> {:ok, backend}
     end
   end
 

@@ -110,10 +110,11 @@ defmodule SmolNet do
 
   `:backend` selects the protocol engine: `:native`, the smoltcp NIF, which
   is the default, or `:elixir`, a pure-Elixir engine still in development,
-  which so far answers what a stack answers by itself (echo, Port and
-  Protocol Unreachable, Parameter Problem, a RST for a closed port) and has
-  UDP sockets, but no TCP sockets (opening one returns
-  `{:error, :not_implemented}`) and refuses `:egress_credit` the same way.
+  which answers what a stack answers by itself (echo, Port and Protocol
+  Unreachable, Parameter Problem, a RST for a closed port) and has UDP and
+  TCP sockets, but does not yet act on ICMP errors that report a path MTU,
+  nor hold one call's egress to the `:output_packets` and `:bytes_copied`
+  limits, and refuses `:egress_credit` with `{:error, :not_implemented}`.
   `stack_info/1` reports it as `:backend`.
   Any other value is rejected with `:invalid_backend`.
 
