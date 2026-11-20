@@ -2,7 +2,8 @@
 
 ## Status
 
-Accepted. Records phase 0 of #173.
+Superseded by ADR 0017. Records phase 0 of #173. The real engine did
+not reach this prototype's throughput, and #173 was abandoned.
 
 ## Context
 
